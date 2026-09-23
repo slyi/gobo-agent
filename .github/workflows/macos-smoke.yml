@@ -66,14 +66,11 @@ jobs:
       - name: build
         run: python3 tools/gsdev.py build
 
-      # Windowed, not --headless: GitHub's macOS runners have a GUI session and
-      # Electron's headless behavior on macOS is the one thing we cannot verify
-      # locally, so this exercises the normal path first.
       - name: run
-        run: python3 tools/gsdev.py run --duration 3
+        run: python3 tools/gsdev.py run --headless --duration 3
 
       - name: screenshot
-        run: python3 tools/gsdev.py screenshot --out debug/macos_stage.png
+        run: python3 tools/gsdev.py screenshot --headless --out debug/macos_stage.png
 
       - name: close
         run: python3 tools/gsdev.py close
@@ -140,12 +137,11 @@ jobs:
       - name: build
         run: python3 tools/gsdev.py build
 
-      # Windowed, not --headless: same reasoning as the TurboWarp job.
       - name: run
-        run: python3 tools/gsdev.py run --duration 3
+        run: python3 tools/gsdev.py run --headless --duration 3
 
       - name: screenshot
-        run: python3 tools/gsdev.py screenshot --out debug/macos_scratch_stage.png
+        run: python3 tools/gsdev.py screenshot --headless --out debug/macos_scratch_stage.png
 
       - name: close
         run: python3 tools/gsdev.py close
