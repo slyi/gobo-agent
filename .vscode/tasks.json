@@ -1,0 +1,103 @@
+{
+    "version": "2.0.0",
+    "tasks": [
+        {
+            "label": "gobo-agent: Run (Scratch, build + live logs)",
+            "type": "process",
+            "command": "python3",
+            "windows": { "command": "python" },
+            "args": ["${workspaceFolder}/tools/gsdev.py", "run"],
+            "options": {
+                "cwd": "${workspaceFolder}",
+                "env": { "GSDEV_BACKEND": "scratch" }
+            },
+            "group": { "kind": "build", "isDefault": true },
+            "problemMatcher": [],
+            "presentation": { "reveal": "always", "panel": "dedicated", "clear": true },
+            "runOptions": { "instanceLimit": 1 }
+        },
+        {
+            "label": "gobo-agent: Run (TurboWarp, build + live logs)",
+            "type": "process",
+            "command": "python3",
+            "windows": { "command": "python" },
+            "args": ["${workspaceFolder}/tools/gsdev.py", "run"],
+            "options": {
+                "cwd": "${workspaceFolder}",
+                "env": { "GSDEV_BACKEND": "turbowarp" }
+            },
+            "group": "build",
+            "problemMatcher": [],
+            "presentation": { "reveal": "always", "panel": "dedicated", "clear": true },
+            "runOptions": { "instanceLimit": 1 }
+        },
+        {
+            "label": "gobo-agent: Build",
+            "type": "process",
+            "command": "python3",
+            "windows": { "command": "python" },
+            "args": ["${workspaceFolder}/tools/gsdev.py", "build"],
+            "options": { "cwd": "${workspaceFolder}" },
+            "group": "build",
+            "problemMatcher": []
+        },
+        {
+            "label": "gobo-agent: Screenshot",
+            "type": "process",
+            "command": "python3",
+            "windows": { "command": "python" },
+            "args": ["${workspaceFolder}/tools/gsdev.py", "screenshot"],
+            "options": {
+                "cwd": "${workspaceFolder}",
+                "env": { "GSDEV_BACKEND": "scratch" }
+            },
+            "group": { "kind": "test", "isDefault": true },
+            "problemMatcher": [],
+            "presentation": { "reveal": "always", "panel": "dedicated", "clear": true },
+            "runOptions": { "instanceLimit": 1 }
+        },
+        {
+            "label": "gobo-agent: Screenshot (TurboWarp)",
+            "type": "process",
+            "command": "python3",
+            "windows": { "command": "python" },
+            "args": ["${workspaceFolder}/tools/gsdev.py", "screenshot"],
+            "options": {
+                "cwd": "${workspaceFolder}",
+                "env": { "GSDEV_BACKEND": "turbowarp" }
+            },
+            "group": "test",
+            "problemMatcher": [],
+            "presentation": { "reveal": "always", "panel": "dedicated", "clear": true },
+            "runOptions": { "instanceLimit": 1 }
+        },
+        {
+            "label": "gobo-agent: Stop project",
+            "type": "process",
+            "command": "python3",
+            "windows": { "command": "python" },
+            "args": ["${workspaceFolder}/tools/gsdev.py", "stop"],
+            "options": { "cwd": "${workspaceFolder}" },
+            "problemMatcher": []
+        },
+        {
+            "label": "gobo-agent: Close editor",
+            "type": "process",
+            "command": "python3",
+            "windows": { "command": "python" },
+            "args": ["${workspaceFolder}/tools/gsdev.py", "close"],
+            "options": { "cwd": "${workspaceFolder}" },
+            "problemMatcher": []
+        },
+        {
+            "label": "gobo-agent: Check dependencies",
+            "type": "process",
+            "command": "python3",
+            "windows": { "command": "python" },
+            "args": ["${workspaceFolder}/tools/gsdev.py", "doctor"],
+            "options": { "cwd": "${workspaceFolder}" },
+            "problemMatcher": [],
+            "presentation": { "reveal": "always", "panel": "dedicated", "clear": true }
+        }
+    ]
+}

@@ -1,0 +1,18 @@
+# Build output and local state (machine-generated, never commit)
+*.sb3
+debug/
+tools/turbowarp-profile/
+tools/scratch-profile/
+tools/.gsdev-port
+__pycache__/
+
+# Local Kilo state (agent-manager sessions, local settings)
+/.kilo/
+
+# Local handoff notes (contains local paths / account names)
+handoffplan.md
+
+# OS cruft
+.DS_Store
+Thumbs.db
+desktop.ini

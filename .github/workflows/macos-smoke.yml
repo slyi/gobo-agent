@@ -1,0 +1,86 @@
+name: macOS smoke test
+
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - "tools/**"
+      - "main.gs"
+      - "stage.gs"
+      - ".github/workflows/macos-smoke.yml"
+  pull_request:
+    paths:
+      - "tools/**"
+
+permissions:
+  contents: read
+
+jobs:
+  macos:
+    # macos-14 is Apple Silicon; the workflow picks the matching goboscript build.
+    runs-on: macos-14
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Configure backend
+        run: |
+          echo "GSDEV_BACKEND=turbowarp" >> "$GITHUB_ENV"
+
+      - name: Install goboscript
+        run: |
+          set -eux
+          arch="$(uname -m)"
+          case "$arch" in
+            arm64)  asset="goboscript_Darwin_arm64.tar.gz" ;;
+            x86_64) asset="goboscript_Darwin_x86_64.tar.gz" ;;
+            *) echo "unsupported arch: $arch"; exit 1 ;;
+          esac
+          curl -sSL -o gs.tar.gz \
+            "https://github.com/aspizu/goboscript/releases/download/v3.2.1/${asset}"
+          tar xzf gs.tar.gz
+          chmod +x goboscript
+          sudo mv goboscript /usr/local/bin/goboscript
+          goboscript --version
+
+      - name: Install TurboWarp Desktop
+        run: |
+          set -eux
+          dmg="$RUNNER_TEMP/TurboWarp.dmg"
+          curl -sSL -o "$dmg" \
+            "https://github.com/TurboWarp/desktop/releases/download/v1.16.0/TurboWarp-Setup-1.16.0.dmg"
+          mount="$RUNNER_TEMP/twmount"
+          mkdir -p "$mount"
+          hdiutil attach "$dmg" -nobrowse -mountpoint "$mount"
+          cp -R "$mount/TurboWarp.app" "$RUNNER_TEMP/TurboWarp.app"
+          hdiutil detach "$mount"
+          xattr -dr com.apple.quarantine "$RUNNER_TEMP/TurboWarp.app" || true
+          echo "TURBOWARP_EXE=$RUNNER_TEMP/TurboWarp.app/Contents/MacOS/TurboWarp" >> "$GITHUB_ENV"
+
+      - name: doctor
+        run: python3 tools/gsdev.py doctor
+
+      - name: selftest
+        run: python3 tools/gsdev.py selftest
+
+      - name: build
+        run: python3 tools/gsdev.py build
+
+      # Windowed, not --headless: GitHub's macOS runners have a GUI session and
+      # Electron's headless behavior on macOS is the one thing we cannot verify
+      # locally, so this exercises the normal path first.
+      - name: run
+        run: python3 tools/gsdev.py run --duration 3
+
+      - name: screenshot
+        run: python3 tools/gsdev.py screenshot --out debug/macos_stage.png
+
+      - name: close
+        run: python3 tools/gsdev.py close
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: macos-stage
+          path: debug/*.png
+          if-no-files-found: ignore

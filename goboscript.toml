@@ -1,0 +1,4 @@
+# Configuration reference: https://aspiz.uk/goboscript/docs/configuration.html
+frame_rate = 30
+stage_width = 480
+stage_height = 360
