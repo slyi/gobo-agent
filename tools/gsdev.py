@@ -260,6 +260,10 @@ def scratch_candidates(platform: str | None = None) -> list[Path]:
         if local:
             candidates.append(Path(local) / "Programs" / "Scratch 3" / "Scratch 3.exe")
     elif platform == "darwin":
+        candidates.append(Path("/Applications/Scratch 3.app/Contents/MacOS/Scratch 3"))
+        candidates.append(
+            Path.home() / "Applications" / "Scratch 3.app" / "Contents" / "MacOS" / "Scratch 3"
+        )
         candidates.append(Path("/Applications/Scratch.app/Contents/MacOS/Scratch"))
     else:
         for name in ("scratch-desktop", "scratch"):
@@ -1643,7 +1647,7 @@ def cmd_selftest(args: argparse.Namespace) -> int:
     check(
         "darwin paths",
         "/Applications/TurboWarp.app/Contents/MacOS/TurboWarp" in tw["darwin"]
-        and "/Applications/Scratch.app/Contents/MacOS/Scratch" in sc["darwin"],
+        and "/Applications/Scratch 3.app/Contents/MacOS/Scratch 3" in sc["darwin"],
         "(macOS .app bundles)",
     )
     check(

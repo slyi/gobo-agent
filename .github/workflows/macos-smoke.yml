@@ -126,10 +126,10 @@ jobs:
           mkdir -p "$mount"
           hdiutil attach "$dmg" -nobrowse -mountpoint "$mount"
           ls -la "$mount"
-          cp -R "$mount/Scratch.app" "$RUNNER_TEMP/Scratch.app"
+          cp -R "$mount/Scratch 3.app" "$RUNNER_TEMP/Scratch 3.app"
           hdiutil detach "$mount"
-          xattr -dr com.apple.quarantine "$RUNNER_TEMP/Scratch.app" || true
-          echo "SCRATCH_EXE=$RUNNER_TEMP/Scratch.app/Contents/MacOS/Scratch" >> "$GITHUB_ENV"
+          xattr -dr com.apple.quarantine "$RUNNER_TEMP/Scratch 3.app" || true
+          echo "SCRATCH_EXE=$RUNNER_TEMP/Scratch 3.app/Contents/MacOS/Scratch 3" >> "$GITHUB_ENV"
 
       - name: doctor
         run: python3 tools/gsdev.py doctor
