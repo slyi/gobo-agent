@@ -211,6 +211,10 @@ def turbowarp_candidates(platform: str | None = None) -> list[Path]:
             )
         except OSError:
             pass
+        # Shape-only fallback so the selftest sees the WindowsApps layout on a
+        # non-Windows host; the versioned folder is unknown, so it is filtered
+        # out by existence checks at runtime.
+        candidates.append(store_root / "TurboWarpDesktop" / "app" / "TurboWarp.exe")
         local = os.environ.get("LOCALAPPDATA")
         if local:
             candidates.append(Path(local) / "Programs" / "TurboWarp" / "TurboWarp.exe")
