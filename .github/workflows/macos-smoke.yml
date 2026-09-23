@@ -84,3 +84,75 @@ jobs:
           name: macos-stage
           path: debug/*.png
           if-no-files-found: ignore
+
+  macos-scratch:
+    # Scratch Desktop ships a macOS dmg; the tool's Scratch launch/inject/close
+    # path is platform-neutral, so this exercises the default backend on macOS.
+    runs-on: macos-14
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Configure backend
+        run: |
+          echo "GSDEV_BACKEND=scratch" >> "$GITHUB_ENV"
+
+      - name: Install goboscript
+        run: |
+          set -eux
+          arch="$(uname -m)"
+          case "$arch" in
+            arm64)  asset="goboscript_Darwin_arm64.tar.gz" ;;
+            x86_64) asset="goboscript_Darwin_x86_64.tar.gz" ;;
+            *) echo "unsupported arch: $arch"; exit 1 ;;
+          esac
+          curl -sSL -o gs.tar.gz \
+            "https://github.com/aspizu/goboscript/releases/download/v3.2.1/${asset}"
+          tar xzf gs.tar.gz
+          chmod +x goboscript
+          sudo mv goboscript /usr/local/bin/goboscript
+          goboscript --version
+
+      # The dmg may still be an x86_64 build; arm64 runners need Rosetta for it.
+      - name: Ensure Rosetta 2
+        run: sudo softwareupdate --install-rosetta --agree-to-license || true
+
+      - name: Install Scratch Desktop
+        run: |
+          set -eux
+          dmg="$RUNNER_TEMP/Scratch.dmg"
+          curl -sSL -o "$dmg" "https://downloads.scratch.mit.edu/desktop/Scratch.dmg"
+          mount="$RUNNER_TEMP/scmount"
+          mkdir -p "$mount"
+          hdiutil attach "$dmg" -nobrowse -mountpoint "$mount"
+          ls -la "$mount"
+          cp -R "$mount/Scratch.app" "$RUNNER_TEMP/Scratch.app"
+          hdiutil detach "$mount"
+          xattr -dr com.apple.quarantine "$RUNNER_TEMP/Scratch.app" || true
+          echo "SCRATCH_EXE=$RUNNER_TEMP/Scratch.app/Contents/MacOS/Scratch" >> "$GITHUB_ENV"
+
+      - name: doctor
+        run: python3 tools/gsdev.py doctor
+
+      - name: selftest
+        run: python3 tools/gsdev.py selftest
+
+      - name: build
+        run: python3 tools/gsdev.py build
+
+      # Windowed, not --headless: same reasoning as the TurboWarp job.
+      - name: run
+        run: python3 tools/gsdev.py run --duration 3
+
+      - name: screenshot
+        run: python3 tools/gsdev.py screenshot --out debug/macos_scratch_stage.png
+
+      - name: close
+        run: python3 tools/gsdev.py close
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: macos-scratch-stage
+          path: debug/*.png
+          if-no-files-found: ignore
