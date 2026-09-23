@@ -47,13 +47,12 @@ python tools/gsdev.py doctor
 It prints one line per dependency (`ok` / `warn` / `FAIL`), lists any environment
 overrides, and exits non-zero if something required is missing.
 
-**Platform support:** Windows (Scratch + TurboWarp) and Linux — including
-display-less Linux (TurboWarp) — are smoke-tested. macOS has not been run on
-real hardware: the platform-neutral code and the macOS path/flag logic are
-covered by `selftest`, but launching the `.app` and driving it over CDP is
-unverified. `.github/workflows/macos-smoke.yml` runs
-`doctor`/`selftest`/`build`/`run`/`screenshot` on a `macos-14` runner so you can
-confirm it without owning a Mac.
+**Platform support:** smoke-tested on Windows (Scratch + TurboWarp), Linux
+(including display-less Linux, TurboWarp), and macOS (`macos-14`, headless, both
+Scratch and TurboWarp). `.github/workflows/macos-smoke.yml` runs
+`doctor`/`selftest`/`build`/`run --headless`/`screenshot --headless`/`close` for
+each backend on a `macos-14` runner and uploads the stage image as an artifact,
+so the macOS path can be checked without owning a Mac.
 
 The default backend is **Scratch Desktop**. Set `GSDEV_BACKEND=turbowarp` to use
 TurboWarp instead:
@@ -67,10 +66,12 @@ python tools/gsdev.py run
 
 Scratch installs as a Microsoft Store package (`Scratch 3.exe` exits unless
 launched through its app id) or, preferably, from the direct installer at
-`C:\Program Files (x86)\Scratch 3\Scratch 3.exe`. The tool finds either; override
-with `$env:SCRATCH_EXE`. In a dedicated profile (`tools/scratch-profile/`,
-gitignored) it pre-writes the telemetry opt-out so Scratch's share-data modal
-never covers the stage.
+`C:\Program Files (x86)\Scratch 3\Scratch 3.exe`. On macOS the dmg from
+<https://scratch.mit.edu/download> installs `Scratch 3.app` (binary
+`Contents/MacOS/Scratch 3`), which the tool looks for in `/Applications`. Set
+`SCRATCH_EXE` to override the location on either platform. In a dedicated
+profile (`tools/scratch-profile/`, gitignored) it pre-writes the telemetry
+opt-out so Scratch's share-data modal never covers the stage.
 
 Scratch Desktop cannot load browser extensions (the Scratch Addons debugger
 included), so the tool replicates it: because the app runs with `nodeIntegration`
@@ -132,8 +133,9 @@ python tools/gsdev.py selftest            # check per-platform path/flag logic
 
 `selftest` simulates the win32/darwin/linux branches (install paths and headless
 flags) so you can validate the macOS assumptions without a Mac. For a real macOS
-check, run `doctor`/`selftest`/`build`/`run` on a Mac or a GitHub Actions
-`macos-latest` runner.
+check, run `doctor`/`selftest`/`build`/`run` on a Mac, or use the
+`.github/workflows/macos-smoke.yml` job, which runs that headless for both
+backends on a `macos-14` runner.
 
 ## How log capture works
 
@@ -159,12 +161,12 @@ bridge server: the scripting client talks to TurboWarp directly.
   `Emulation.setCPUThrottlingRate`, e.g. `--cpu 4` for a mid-range phone. It
   throttles the renderer, not the GPU, and Chromium's throttling is approximate.
 - `--headless` launches the editor with no visible window. Electron has no true
-  headless mode: on Windows `--headless` creates the `BrowserWindow` hidden; on
-  Linux the tool adds `--ozone-platform=headless`, and with no
+  headless mode: on Windows and macOS `--headless` creates the `BrowserWindow`
+  hidden; on Linux the tool adds `--ozone-platform=headless`, and with no
   `DISPLAY`/`WAYLAND_DISPLAY` also `--use-angle=swiftshader
   --enable-unsafe-swiftshader` so TurboWarp's WebGL renderer still initializes.
-  Verified headless screenshots on Windows (Scratch and TurboWarp) and on
-  display-less Linux (TurboWarp).
+  Verified headless logs and screenshots on Windows (Scratch and TurboWarp),
+  display-less Linux (TurboWarp), and macOS (Scratch and TurboWarp).
 - Screenshots for TurboWarp use `vm.runtime.renderer.requestSnapshot`, which
   reads the stage back from the GPU and is unaffected by the hidden window's
   layout; Scratch uses `Page.captureScreenshot` clipped to the stage canvas.

@@ -27,6 +27,9 @@ Fastest way to verify a GoboScript change. All commands are
 - **Display-less Linux** (CI/WSL): install `libnss3 libnspr4 libasound2`, set
   `ELECTRON_DISABLE_SANDBOX=1` when running from a tarball; the tool already adds
   `--ozone-platform=headless` + software GL.
+- **macOS is smoke-tested headless for both backends** on a `macos-14` runner in
+  `.github/workflows/macos-smoke.yml`: Scratch Desktop installs as
+  `Scratch 3.app`, TurboWarp from its dmg. `--headless` works on macOS.
 
 `python tools/gsdev.py doctor` prints one `ok`/`warn`/`FAIL` line per dependency
 and exits non-zero if a required one is missing. Install links are in README.md.
@@ -84,7 +87,7 @@ port from `tools/.gsdev-port`).
 
 | Flag | Use |
 | --- | --- |
-| `--headless` | no window (Windows hidden; Linux Ozone headless + software GL) |
+| `--headless` | no window (Windows/macOS hidden; Linux Ozone headless + software GL) |
 | `--port 0` | auto free port, remembered in `tools/.gsdev-port`; parallel-safe |
 | `--cpu N` | emulate an N× slower CPU (e.g. `4` ≈ a phone) |
 | `--duration S` | auto-stop after S seconds — **always bound agent runs** |
