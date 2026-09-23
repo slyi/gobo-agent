@@ -110,6 +110,12 @@ Run **Tasks: Run Task**, or use the shortcuts:
 - **gobo-agent: Close editor** — close the isolated window.
 - **gobo-agent: Check dependencies** — run the `doctor` command.
 
+`python tools/gsdev.py tasks --run` validates these definitions the way VS Code
+resolves them (command, `${workspaceFolder}`, cwd, env, and the
+`windows`/`osx`/`linux` override) and then executes the tasks that do not open an
+editor. It is run headless on a `macos-14` runner by
+`.github/workflows/macos-smoke.yml`.
+
 ## Command line
 
 ```powershell
@@ -129,6 +135,8 @@ python tools/gsdev.py stop
 python tools/gsdev.py close
 python tools/gsdev.py doctor              # check required tools are installed
 python tools/gsdev.py selftest            # check per-platform path/flag logic
+python tools/gsdev.py tasks               # check .vscode tasks resolve here
+python tools/gsdev.py tasks --run         # ... and execute the non-launching ones
 ```
 
 `selftest` simulates the win32/darwin/linux branches (install paths and headless

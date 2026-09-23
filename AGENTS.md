@@ -37,6 +37,11 @@ and exits non-zero if a required one is missing. Install links are in README.md.
 `python tools/gsdev.py selftest` checks the per-platform path and headless-flag
 logic for win32/darwin/linux — a local stand-in when you cannot run on macOS.
 
+`python tools/gsdev.py tasks --run` checks the `.vscode` tasks resolve on this
+platform (VS Code's `windows`/`osx`/`linux` override, `${workspaceFolder}`, cwd,
+env) and executes the non-launching ones; `.github/workflows/macos-smoke.yml`
+runs it headless on macOS.
+
 ## Measured (headless, this machine)
 
 | Step | Time |

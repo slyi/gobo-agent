@@ -146,6 +146,9 @@ jobs:
       - name: close
         run: python3 tools/gsdev.py close
 
+      - name: tasks
+        run: python3 tools/gsdev.py tasks --run
+
       - uses: actions/upload-artifact@v4
         if: always()
         with:

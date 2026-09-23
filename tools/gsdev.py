@@ -31,6 +31,7 @@ Commands:
     status      Print the sprites in the open editor
     doctor      Check that the required tools are installed
     selftest    Check the per-platform path/flag logic (covers macOS)
+    tasks       Check that the .vscode tasks resolve on this platform
 
 Pass --cpu RATE (or set GSDEV_CPU) to emulate a slower device, e.g. --cpu 4
 approximates a mid-range phone. It throttles the editor's renderer through CDP,
@@ -1696,6 +1697,102 @@ def cmd_selftest(args: argparse.Namespace) -> int:
     return 1 if failures else 0
 
 
+def _task_platform_key() -> str:
+    if sys.platform == "win32":
+        return "windows"
+    if sys.platform == "darwin":
+        return "osx"
+    return "linux"
+
+
+def _task_field(task: dict, key: str, platform_key: str, default=None):
+    override = task.get(platform_key) or {}
+    if key in override:
+        return override[key]
+    return task.get(key, default)
+
+
+def _task_substitute(value, root: Path):
+    if isinstance(value, str):
+        return value.replace("${workspaceFolder}", str(root))
+    if isinstance(value, list):
+        return [_task_substitute(item, root) for item in value]
+    if isinstance(value, dict):
+        return {key: _task_substitute(item, root) for key, item in value.items()}
+    return value
+
+
+def cmd_tasks(args: argparse.Namespace) -> int:
+    """Check that the .vscode process tasks resolve on this platform.
+
+    VS Code runs a process task by spawning its command with the configured
+    args/cwd/env after substituting ${workspaceFolder} and applying any
+    windows/osx/linux override. This emulates that resolution, so a task that
+    points at a missing script, a stale subcommand, or an unknown backend fails
+    here instead of in the Tasks UI. With --run it also executes the tasks that
+    do not launch an editor.
+    """
+    failures = 0
+
+    def check(label: str, condition: bool, detail: str = "") -> None:
+        nonlocal failures
+        if not condition:
+            failures += 1
+        suffix = f" - {detail}" if detail else ""
+        print(f"[{'ok' if condition else 'FAIL':4}] {label}{suffix}", flush=True)
+
+    tasks_path = PROJECT_ROOT / ".vscode" / "tasks.json"
+    if not tasks_path.exists():
+        check(".vscode/tasks.json", False, "missing")
+        return 1
+    try:
+        tasks = json.loads(tasks_path.read_text(encoding="utf-8")).get("tasks", [])
+    except (OSError, json.JSONDecodeError) as error:
+        check(".vscode/tasks.json", False, str(error))
+        return 1
+
+    platform_key = _task_platform_key()
+    known = {"build", "status", "doctor", "selftest", "run", "screenshot", "stop", "close"}
+    runnable = {"build", "doctor", "stop", "close"}
+    for task in tasks:
+        label = task.get("label", "<unlabeled>")
+        command = _task_substitute(_task_field(task, "command", platform_key), PROJECT_ROOT)
+        arguments = _task_substitute(_task_field(task, "args", platform_key, []), PROJECT_ROOT)
+        options = _task_substitute(_task_field(task, "options", platform_key, {}), PROJECT_ROOT)
+        resolved = shutil.which(command) if command else None
+        script = arguments[0] if arguments else ""
+        subcommand = arguments[1] if len(arguments) > 1 else ""
+        backend = (options.get("env") or {}).get("GSDEV_BACKEND")
+        cwd = options.get("cwd") or str(PROJECT_ROOT)
+        reasons = []
+        if not resolved:
+            reasons.append(f"command {command!r} not on PATH")
+        if not script or not Path(script).exists():
+            reasons.append(f"script {script!r} missing")
+        if subcommand not in known:
+            reasons.append(f"unknown subcommand {subcommand!r}")
+        if backend is not None and backend not in ("scratch", "turbowarp"):
+            reasons.append(f"bad GSDEV_BACKEND {backend!r}")
+        if not Path(cwd).is_dir():
+            reasons.append(f"cwd {cwd!r} missing")
+        check(label, not reasons, "; ".join(reasons) or f"{subcommand} via {command}")
+
+        if args.run and subcommand in runnable and resolved:
+            env = dict(os.environ)
+            env.update(options.get("env") or {})
+            result = subprocess.run(
+                [resolved, *arguments], cwd=cwd, env=env, capture_output=True, text=True
+            )
+            check(f"{label} (executed)", result.returncode == 0, f"exit {result.returncode}")
+
+    if failures:
+        print(f"[FAIL] tasks - {failures} check(s) failed", flush=True)
+    else:
+        suffix = " and ran" if args.run else ""
+        print(f"[ok  ] tasks - all .vscode tasks resolve{suffix}", flush=True)
+    return 1 if failures else 0
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     subparsers = parser.add_subparsers(dest="command", required=True)
@@ -1728,6 +1825,10 @@ def build_parser() -> argparse.ArgumentParser:
         "selftest", help="check per-platform path/flag logic (incl. macOS)"
     )
     selftest.set_defaults(func=cmd_selftest)
+
+    tasks = subparsers.add_parser("tasks", help="check .vscode tasks resolve on this platform")
+    tasks.add_argument("--run", action="store_true", help="also execute the non-launching tasks")
+    tasks.set_defaults(func=cmd_tasks)
 
     run = subparsers.add_parser("run", help="build, start, and stream logs")
     add_port(run)
