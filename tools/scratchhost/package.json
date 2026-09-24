@@ -1,0 +1,11 @@
+{
+  "name": "gobo-agent-scratchhost",
+  "private": true,
+  "description": "Optional headless upstream scratch-vm host for gobo-agent. AGPL-3.0 dependencies are installed locally and never committed.",
+  "dependencies": {
+    "@scratch/scratch-render": "15.1.1",
+    "@scratch/scratch-storage": "15.1.1",
+    "@scratch/scratch-svg-renderer": "15.1.1",
+    "@scratch/scratch-vm": "15.1.1"
+  }
+}

@@ -3,14 +3,26 @@
 debug/
 tools/turbowarp-profile/
 tools/scratch-profile/
+tools/scratchvm-profile/
+tools/scratchhost/node_modules/
 tools/.gsdev-port
+tools/.scratchvm-port
 __pycache__/
 
 # Local Kilo state (agent-manager sessions, local settings)
 /.kilo/
 
-# Local handoff notes (contains local paths / account names)
+# Local planning/handoff notes (not part of the shipped repo)
 handoffplan.md
+plan-*.md
+handover-*.md
+
+# Staged AGENTS.md content, applied at commit time (avoids per-edit prompts)
+agents_staging.txt
+
+# Local-only fixture/demo projects and test suites (not part of the shipped repo)
+examples/
+tests/
 
 # OS cruft
 .DS_Store

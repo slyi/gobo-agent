@@ -1,0 +1,25 @@
+# Basic end-to-end smoke test for the workspace-root project.
+#   python tools/gsdev.py run --headless --leave-running   # confirms [LOG ...]
+#   python tools/gsdev.py session < smoke.txt              # input + live edit + pixel
+#   python tools/gsdev.py screenshot --headless --out debug/smoke.png
+#   python tools/gsdev.py close
+# `run` confirms logging and `screenshot` confirms rendering; this file confirms
+# injected input, a live `set` (no rebuild), and pixel readback in one connection.
+
+# injected input: space press is counted by the project
+key space down
+waitframe 4
+key space up
+waitframe 4
+expect main.keys >= 1
+
+# get pixel: the 96x96 face is solid #4c97ff at its centre
+expectpixel 0 0 #4c97ff
+
+# live edit: move the sprite with `set` (no rebuild) and re-read the pixel
+set main.tx 120
+waitframe 4
+expectpixel 120 0 #4c97ff
+set main.tx 0
+waitframe 4
+expectpixel 0 0 #4c97ff

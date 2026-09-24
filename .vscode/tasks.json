@@ -2,31 +2,13 @@
     "version": "2.0.0",
     "tasks": [
         {
-            "label": "gobo-agent: Run (Scratch, build + live logs)",
+            "label": "gobo-agent: Run (web, build + live logs)",
             "type": "process",
             "command": "python3",
             "windows": { "command": "python" },
             "args": ["${workspaceFolder}/tools/gsdev.py", "run"],
-            "options": {
-                "cwd": "${workspaceFolder}",
-                "env": { "GSDEV_BACKEND": "scratch" }
-            },
+            "options": { "cwd": "${workspaceFolder}" },
             "group": { "kind": "build", "isDefault": true },
-            "problemMatcher": [],
-            "presentation": { "reveal": "always", "panel": "dedicated", "clear": true },
-            "runOptions": { "instanceLimit": 1 }
-        },
-        {
-            "label": "gobo-agent: Run (TurboWarp, build + live logs)",
-            "type": "process",
-            "command": "python3",
-            "windows": { "command": "python" },
-            "args": ["${workspaceFolder}/tools/gsdev.py", "run"],
-            "options": {
-                "cwd": "${workspaceFolder}",
-                "env": { "GSDEV_BACKEND": "turbowarp" }
-            },
-            "group": "build",
             "problemMatcher": [],
             "presentation": { "reveal": "always", "panel": "dedicated", "clear": true },
             "runOptions": { "instanceLimit": 1 }
@@ -46,27 +28,14 @@
             "type": "process",
             "command": "python3",
             "windows": { "command": "python" },
-            "args": ["${workspaceFolder}/tools/gsdev.py", "screenshot"],
-            "options": {
-                "cwd": "${workspaceFolder}",
-                "env": { "GSDEV_BACKEND": "scratch" }
-            },
+            "args": [
+                "${workspaceFolder}/tools/gsdev.py",
+                "screenshot",
+                "--out",
+                "${workspaceFolder}/debug/check.png"
+            ],
+            "options": { "cwd": "${workspaceFolder}" },
             "group": { "kind": "test", "isDefault": true },
-            "problemMatcher": [],
-            "presentation": { "reveal": "always", "panel": "dedicated", "clear": true },
-            "runOptions": { "instanceLimit": 1 }
-        },
-        {
-            "label": "gobo-agent: Screenshot (TurboWarp)",
-            "type": "process",
-            "command": "python3",
-            "windows": { "command": "python" },
-            "args": ["${workspaceFolder}/tools/gsdev.py", "screenshot"],
-            "options": {
-                "cwd": "${workspaceFolder}",
-                "env": { "GSDEV_BACKEND": "turbowarp" }
-            },
-            "group": "test",
             "problemMatcher": [],
             "presentation": { "reveal": "always", "panel": "dedicated", "clear": true },
             "runOptions": { "instanceLimit": 1 }
@@ -81,7 +50,7 @@
             "problemMatcher": []
         },
         {
-            "label": "gobo-agent: Close editor",
+            "label": "gobo-agent: Close host",
             "type": "process",
             "command": "python3",
             "windows": { "command": "python" },
