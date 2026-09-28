@@ -1,0 +1,32 @@
+#!/bin/sh
+# Thin POSIX launcher for tools/gsdev.py (macOS/Linux), mirroring tools/gsdev.ps1.
+#
+# Resolves a Python 3.10+ ($GSDEV_PYTHON, then the portable .tools/python, then
+# python3/python on PATH) and forwards every argument verbatim, so options like
+# `screenshot --out FILE` are not reinterpreted.
+#
+#   ./tools/gsdev run --headless --duration 3 --leave-running
+#   ./tools/gsdev doctor
+#
+# No admin rights are used or needed: the tools live under the repository
+# (.tools/) and the user's own directories.
+
+set -eu
+
+here=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
+GSDEV_ROOT=$(dirname -- "$here")
+export GSDEV_ROOT
+. "$here/python-env.sh"
+
+if ! python=$(gsdev_find_python); then
+    gsdev_python_hint
+    exit 1
+fi
+
+# UTF-8 for the child Python regardless of the locale: Japanese paths, CJK
+# selectors/values, and log output.
+PYTHONUTF8=1
+: "${PYTHONIOENCODING:=utf-8}"
+export PYTHONUTF8 PYTHONIOENCODING
+
+exec "$python" "$here/gsdev.py" "$@"

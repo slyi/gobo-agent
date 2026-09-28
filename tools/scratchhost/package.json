@@ -1,6 +1,7 @@
 {
   "name": "gobo-agent-scratchhost",
   "private": true,
+  "license": "MIT",
   "description": "Optional headless upstream scratch-vm host for gobo-agent. AGPL-3.0 dependencies are installed locally and never committed.",
   "dependencies": {
     "@scratch/scratch-render": "15.1.1",

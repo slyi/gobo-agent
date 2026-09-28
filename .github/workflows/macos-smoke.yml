@@ -23,34 +23,14 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - uses: actions/setup-node@v4
-        with:
-          node-version: "22"
-
-      - name: Install host deps
-        run: npm install --prefix tools/scratchhost --no-audit --no-fund
+      - name: Install prebuilt tools (goboscript + host bundles)
+        run: python3 tools/gsdev.py setup
 
       - name: Ensure Chrome
         run: |
           if [ ! -d "/Applications/Google Chrome.app" ]; then
             brew install --cask google-chrome
           fi
-
-      - name: Install goboscript
-        run: |
-          set -eux
-          arch="$(uname -m)"
-          case "$arch" in
-            arm64)  asset="goboscript_Darwin_arm64.tar.gz" ;;
-            x86_64) asset="goboscript_Darwin_x86_64.tar.gz" ;;
-            *) echo "unsupported arch: $arch"; exit 1 ;;
-          esac
-          curl -sSL -o gs.tar.gz \
-            "https://github.com/aspizu/goboscript/releases/download/v3.2.1/${asset}"
-          tar xzf gs.tar.gz
-          chmod +x goboscript
-          sudo mv goboscript /usr/local/bin/goboscript
-          goboscript --version
 
       - name: doctor
         run: python3 tools/gsdev.py doctor

@@ -2,15 +2,19 @@
 """gobo-agent: GoboScript dev loop on the real Scratch runtime.
 
 Runs goboscript builds against upstream @scratch/scratch-vm in a plain headless
-browser (tools/scratchhost) — no Scratch Desktop, no TurboWarp Desktop, no
-Electron. The real GPU is used by default, so performance numbers are
+browser (tools/scratchhost) — no desktop app, no Electron. The real GPU is used
+by default, so performance numbers are
 representative; --software forces SwiftShader on boxes without a GPU.
 
 Requires (run `gsdev.py doctor` to check them):
     python 3.10+            the only Python runtime; no pip packages
-    goboscript              the compiler, on PATH
-    node + npm              for the scratch-vm host (one-time npm install)
+    goboscript              the compiler; on PATH, else bundled by `setup`
+    host bundles            @scratch/* browser builds; bundled by `setup` into
+                            tools/scratchhost/vendor, else node+npm (`npm install`)
     Chrome or Edge          the host browser (GSDEV_BROWSER overrides)
+
+`gsdev.py setup` downloads the prebuilt tools into user-writable paths, so a
+clean Windows machine with no admin rights needs no Rust, MSVC, MSYS2, or Node.
 
 On Windows, process and port handling uses the standard library's ctypes
 (Toolhelp32 + GetExtendedTcpTable), so no PowerShell, WMI, taskkill, or netstat
@@ -44,6 +48,10 @@ Commands:
     props       Print a target's properties
     prop        Read or write one target property
     clones      Print the clone count per sprite
+    perf        Print fps / drawcount / drawcalls / rendertime
+    setperf     Enable/disable render-side perf instrumentation
+    logic       Print per-frame block op counts (opt-in)
+    setlogic    Enable/disable logic op-count instrumentation
     errors      Dump captured VM/page errors and error-log count
     expect_no_errors  Assert there are no VM/page or error-log errors
     wait_until  Wait (event-driven) until a variable satisfies a condition
@@ -51,6 +59,7 @@ Commands:
     session     Batch get/set/watch lines from stdin over one connection
     test        Run session files as tests, with a summary or --json report
     doctor      Check that the required tools are installed
+    setup       Download prebuilt goboscript + host bundles (no admin/pip)
     selftest    Check the per-project host files and flags
     tasks       Check that the .vscode tasks resolve on this platform
 
@@ -74,6 +83,7 @@ from __future__ import annotations
 
 import argparse
 import base64
+import io
 import json
 import os
 import platform
@@ -83,7 +93,12 @@ import signal
 import socket
 import subprocess
 import sys
+import tempfile
 import time
+import urllib.error
+import urllib.parse
+import urllib.request
+import uuid
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
@@ -93,6 +108,7 @@ from cdp import (  # noqa: E402
     connect,
     list_targets,
 )
+import bootstrap  # noqa: E402
 
 TOOLS_DIR = Path(__file__).resolve().parent
 PROJECT_ROOT = Path(os.environ.get("GSDEV_PROJECT") or TOOLS_DIR.parent).resolve()
@@ -101,8 +117,80 @@ DEBUG_DIR = PROJECT_ROOT / "debug"
 DEFAULT_PORT = int(os.environ.get("GSDEV_CDP_PORT", "9230"))
 PORT_FILE = TOOLS_DIR / ".gsdev-port"
 HOST_DIR = TOOLS_DIR / "scratchhost"
-HOST_PROFILE_DIR = TOOLS_DIR / "scratchvm-profile"
+HOST_PROFILE_ROOT = TOOLS_DIR / "scratchvm-profiles"
+
+
+def host_profile_dir(port: int) -> Path:
+    """Browser profile directory for a CDP port.
+
+    One profile per port, so two hosts (A/B) can run at once: a shared
+    ``--user-data-dir`` makes the second Chromium launch hand off to the first
+    and exit, and then no second debug port ever appears.
+    """
+    return HOST_PROFILE_ROOT / str(port)
 HOST_SERVER_PORT = int(os.environ.get("GSDEV_HOST_PORT", "8077"))
+VENDOR_DIR = HOST_DIR / "vendor"
+
+# Phase 1: how long a freshly launched browser has to expose a debuggable page.
+# Deliberately short (5s) so a blocked/broken browser fails fast instead of
+# hanging; raise GSDEV_HOST_TIMEOUT for a slow cold start.
+HOST_ATTACH_TIMEOUT = float(os.environ.get("GSDEV_HOST_TIMEOUT", "5"))
+# Phase 2: once the page exists, how long it may take to expose window.__host
+# (parsing the ~5.8 MB VM on a cold start). Raise GSDEV_READY_TIMEOUT if needed.
+HOST_READY_TIMEOUT = float(os.environ.get("GSDEV_READY_TIMEOUT", "20"))
+# Per-attempt CDP timeout inside those windows, so one unresponsive target cannot
+# consume the whole budget.
+CDP_ATTACH_TIMEOUT = float(os.environ.get("GSDEV_CDP_TIMEOUT", "2"))
+
+
+def resolve_goboscript() -> str | None:
+    """The compiler: the user's own install (PATH) first, then the bundled one.
+
+    A goboscript the user already has wins; `.tools/goboscript/` is only the
+    fallback that `setup` installs when none is found.
+    """
+    return bootstrap.resolve_goboscript()
+
+
+def host_bundles_present() -> bool:
+    """True when host.html has a loadable set of @scratch/* bundles."""
+    return bootstrap.host_bundles_present()
+
+
+def _setup_hint() -> str:
+    """A setup command that works even where no `python` is on PATH.
+
+    On Windows the PowerShell script bootstraps Python itself, so it is the only
+    correct hint for a machine without an interpreter (Store App Execution Alias
+    aside, `python tools/gsdev.py setup` cannot run there).
+    """
+    setup_script = TOOLS_DIR.parent / "setup.ps1"
+    if os.name == "nt" and setup_script.exists():
+        return (
+            'run: powershell -NoProfile -ExecutionPolicy Bypass -File '
+            f'"{setup_script}"'
+        )
+    return "run: python tools/gsdev.py setup"
+
+
+def ensure_dependencies(need_bundles: bool = True) -> None:
+    """Auto-install the prebuilt tools when a command needs something missing.
+
+    `setup.ps1`/`gsdev.ps1` obtain Python; this obtains goboscript and the host
+    bundles, so a fresh extract can go straight to `run`. Set
+    ``GSDEV_NO_AUTO_SETUP=1`` to only surface the error/hint instead of
+    downloading.
+    """
+    missing_tools = resolve_goboscript() is None
+    missing_bundles = need_bundles and not host_bundles_present()
+    if not (missing_tools or missing_bundles):
+        return
+    if os.environ.get("GSDEV_NO_AUTO_SETUP", "").strip().lower() in ("1", "true", "yes"):
+        return  # the caller's error path explains what is missing
+    log("dependencies missing; downloading the prebuilt tools (no admin)")
+    bootstrap.run_setup(only="goboscript" if missing_tools and not missing_bundles else None)
+
+
 
 # The host page (tools/scratchhost/host.js) installs the log shim and exposes
 # window.__gsdev; Python drains it and reads errors/state via `window.__host`.
@@ -322,6 +410,8 @@ def _port_owner_pids(port: int) -> list[int]:
             [netstat, "-ano", "-p", "tcp"],
             capture_output=True,
             text=True,
+            encoding="utf-8",
+            errors="replace",
             timeout=20,
         )
         for line in result.stdout.splitlines():
@@ -339,7 +429,8 @@ def _port_owner_pids(port: int) -> list[int]:
             continue
         try:
             result = subprocess.run(
-                [exe, *extra], capture_output=True, text=True, timeout=20
+                [exe, *extra], capture_output=True, text=True,
+                encoding="utf-8", errors="replace", timeout=20
             )
         except (OSError, subprocess.TimeoutExpired):
             continue
@@ -375,7 +466,8 @@ def find_editor_pids(port: int, process_name: str, profile_dir: Path) -> list[in
     needle = str(profile_dir)
     pids: set[int] = set()
     result = subprocess.run(
-        ["ps", "-ax", "-o", "pid=,command="], capture_output=True, text=True
+        ["ps", "-ax", "-o", "pid=,command="], capture_output=True, text=True,
+        encoding="utf-8", errors="replace"
     )
     for line in result.stdout.splitlines():
         stripped = line.strip()
@@ -403,11 +495,14 @@ def terminate_pids(pids: list[int]) -> None:
 # --- Headless scratch-vm host -------------------------------------------------
 
 BROWSER_CANDIDATES = {
+    # Edge is preinstalled on Windows (Chrome usually is not), so prefer it there
+    # to keep the zero-admin path dependency-free. Both are Chromium, so CDP and
+    # --headless=new behave the same; Chrome remains the fallback.
     "win32": [
-        r"C:\Program Files\Google\Chrome\Application\chrome.exe",
-        r"C:\Program Files (x86)\Google\Chrome\Application\chrome.exe",
         r"C:\Program Files (x86)\Microsoft\Edge\Application\msedge.exe",
         r"C:\Program Files\Microsoft\Edge\Application\msedge.exe",
+        r"C:\Program Files\Google\Chrome\Application\chrome.exe",
+        r"C:\Program Files (x86)\Google\Chrome\Application\chrome.exe",
     ],
     "darwin": [
         "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome",
@@ -417,6 +512,27 @@ BROWSER_CANDIDATES = {
 }
 
 
+def _windows_app_path_browser() -> str | None:
+    """Edge/Chrome from the App Paths registry (robust to install dir/arch)."""
+    if os.name != "nt":
+        return None
+    try:
+        import winreg
+    except ImportError:
+        return None
+    base = r"SOFTWARE\Microsoft\Windows\CurrentVersion\App Paths"
+    for exe in ("msedge.exe", "chrome.exe"):
+        for root in (winreg.HKEY_LOCAL_MACHINE, winreg.HKEY_CURRENT_USER):
+            try:
+                with winreg.OpenKey(root, base + "\\" + exe) as key:
+                    value, _ = winreg.QueryValueEx(key, "")
+            except OSError:
+                continue
+            if value and Path(value).exists():
+                return value
+    return None
+
+
 def find_browser() -> str | None:
     override = os.environ.get("GSDEV_BROWSER") or os.environ.get("CHROME_EXE")
     if override and Path(override).exists():
@@ -424,7 +540,15 @@ def find_browser() -> str | None:
     for candidate in BROWSER_CANDIDATES.get(sys.platform, []):
         if Path(candidate).exists():
             return candidate
-    for name in ("google-chrome", "chrome", "chromium", "chromium-browser", "microsoft-edge"):
+    registered = _windows_app_path_browser()
+    if registered:
+        return registered
+    names = (
+        ("msedge", "microsoft-edge", "google-chrome", "chrome", "chromium", "chromium-browser")
+        if sys.platform == "win32"
+        else ("google-chrome", "chrome", "chromium", "chromium-browser", "microsoft-edge")
+    )
+    for name in names:
         found = shutil.which(name)
         if found:
             return found
@@ -437,28 +561,103 @@ def host_url() -> str:
 
 def _detached_kwargs() -> dict:
     if os.name == "nt":
-        return {"creationflags": subprocess.DETACHED_PROCESS | subprocess.CREATE_NEW_PROCESS_GROUP}
+        flags = subprocess.DETACHED_PROCESS | subprocess.CREATE_NEW_PROCESS_GROUP
+        # Opt-in: launch the browser at HIGH_PRIORITY_CLASS. Windows can otherwise
+        # schedule a background-launched Chromium at reduced priority/frequency
+        # (Efficiency Mode), which skews perf runs.
+        if os.environ.get("GSDEV_HIGH_PRIORITY"):
+            flags |= subprocess.HIGH_PRIORITY_CLASS
+        return {"creationflags": flags}
     return {"start_new_session": True}
 
 
+def _host_state_path() -> Path:
+    base = Path(os.environ.get("TEMP", tempfile.gettempdir())) / "kilo"
+    try:
+        base.mkdir(parents=True, exist_ok=True)
+    except OSError:
+        pass
+    return base / f"gsdev_host_{HOST_SERVER_PORT}.json"
+
+
+def read_host_state() -> dict:
+    try:
+        return json.loads(_host_state_path().read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return {}
+
+
+def write_host_state(**fields) -> None:
+    try:
+        _host_state_path().write_text(json.dumps(fields), encoding="utf-8")
+    except OSError:
+        pass
+
+
+def clear_host_state() -> None:
+    try:
+        _host_state_path().unlink()
+    except OSError:
+        pass
+
+
+def probe_host_server(token: str | None = None, timeout: float = 1.0) -> dict | None:
+    """Return {token, pid, dir} if a gsdev host server holds the port, else None.
+
+    `token` filters to a specific server; None accepts any gsdev host server.
+    A foreign listener (no /__gsdev) returns None so callers never treat it as ours.
+    """
+    url = f"http://127.0.0.1:{HOST_SERVER_PORT}/__gsdev"
+    try:
+        with urllib.request.urlopen(url, timeout=timeout) as response:
+            info = json.loads(response.read().decode("utf-8"))
+    except (urllib.error.URLError, OSError, ValueError, TimeoutError):
+        return None
+    if not isinstance(info, dict) or "token" not in info:
+        return None
+    if token is not None and info.get("token") != token:
+        return None
+    return info
+
+
 def ensure_host_server() -> None:
+    state = read_host_state()
     if port_open(HOST_SERVER_PORT):
-        return
+        info = probe_host_server()
+        if info is not None:
+            # A gsdev host server already holds the port (ours, or another
+            # checkout's). Reuse it; we only *close* a server we recorded.
+            if not (state.get("token") and info.get("token") == state["token"]):
+                log(f"host server already on http://127.0.0.1:{HOST_SERVER_PORT} "
+                    f"(pid {info.get('pid')}); reusing")
+            return
+        raise SystemExit(
+            f"port {HOST_SERVER_PORT} is in use by another application (not a gsdev "
+            f"host server). Set GSDEV_HOST_PORT to a free port, or stop that process."
+        )
     if not (HOST_DIR / "host.html").exists():
         raise SystemExit(f"missing {HOST_DIR / 'host.html'}")
-    if not (HOST_DIR / "node_modules").is_dir():
+    if not host_bundles_present():
         raise SystemExit(
-            "host dependencies are not installed; run:\n"
-            f'  npm install --prefix "{HOST_DIR}"'
+            "host bundles are not installed; "
+            f"{_setup_hint()}\n"
+            f'  (or the advanced npm path: cd "{HOST_DIR}" and run npm install)'
         )
+    # hostserver.py (not `python -m http.server`) so responses are no-store: the
+    # stdlib server allows conditional 304s, which served an edited host.js stale.
+    # It is started with a per-session ownership token so a foreign process on the
+    # port is never mistaken for it (and never killed).
+    token = uuid.uuid4().hex
     args = [
-        sys.executable, "-m", "http.server", str(HOST_SERVER_PORT),
-        "--bind", "127.0.0.1", "--directory", str(HOST_DIR),
+        sys.executable, str(TOOLS_DIR / "hostserver.py"),
+        str(HOST_DIR), str(HOST_SERVER_PORT), token,
     ]
     subprocess.Popen(args, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, **_detached_kwargs())
     deadline = time.monotonic() + 10
     while time.monotonic() < deadline:
-        if port_open(HOST_SERVER_PORT):
+        info = probe_host_server(token)
+        if info is not None:
+            write_host_state(token=token, pid=info.get("pid"), port=HOST_SERVER_PORT)
             log(f"host server on http://127.0.0.1:{HOST_SERVER_PORT}")
             return
         time.sleep(0.1)
@@ -476,6 +675,121 @@ def host_target(port: int) -> dict | None:
     return None
 
 
+def prepare_host_profile(profile_dir: Path) -> None:
+    """Mark the reused host profile as cleanly exited.
+
+    We kill the host browser instead of closing it, so Chromium records an
+    unclean exit and the *next visible* launch shows a "restore pages?" bubble
+    over the stage (which also steals input). Edge ignores
+    ``--hide-crash-restore-bubble``, so rewrite the exit flag before launching.
+    """
+    prefs = profile_dir / "Default" / "Preferences"
+    if not prefs.exists():
+        return
+    try:
+        data = json.loads(prefs.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return
+    profile = data.get("profile")
+    if not isinstance(profile, dict):
+        return
+    if profile.get("exit_type") == "Normal" and profile.get("crashed") is False:
+        return
+    profile["exit_type"] = "Normal"
+    profile["crashed"] = False
+    try:
+        prefs.write_text(json.dumps(data), encoding="utf-8")
+    except OSError:
+        pass
+
+
+def is_browser_dialog(url: str) -> bool:
+    parsed = urllib.parse.urlsplit(url)
+    return parsed.scheme in ("edge", "chrome") and parsed.hostname in {
+        "sync-confirmation-dialog", "sync-confirmation",
+        "session-restore", "session-restore-bubble",
+    }
+
+
+def dismiss_browser_dialogs(port: int) -> None:
+    """Close Edge/Chrome internal pages that cover the stage.
+
+    On managed Windows, Edge force-signs in and shows
+    ``edge://sync-confirmation-dialog/`` ("We are now syncing your browsing
+    data…") or a restore bubble over the host page, ignoring ``--disable-sync``
+    and the feature flags. Closing the DevTools target dismisses it.
+    """
+    try:
+        targets = list_targets(port=port, timeout=CDP_ATTACH_TIMEOUT)
+    except (CDPError, OSError, urllib.error.URLError):
+        return
+    for target in targets:
+        url = str(target.get("url", ""))
+        # Internal targets also include Chrome's omnibox UI, which is recreated
+        # when closed. Only dismiss known blocking dialogs.
+        if not is_browser_dialog(url):
+            continue
+        target_id = target.get("id")
+        if not target_id:
+            continue
+        request = urllib.request.Request(
+            f"http://127.0.0.1:{port}/json/close/{target_id}"
+        )
+        try:
+            urllib.request.urlopen(request, timeout=CDP_ATTACH_TIMEOUT).close()
+        except (OSError, urllib.error.URLError):
+            continue
+        log(f"closed browser dialog: {url}")
+
+
+def abort_host(port: int) -> None:
+    """Tear down a failed launch so nothing detached is left behind.
+
+    A failed `run` used to leave the host server (started with the portable
+    Python) alive; that then held `.tools/python`, so a rebuild could not delete
+    it until the interpreter was killed by hand.
+    """
+    try:
+        close_host(port)
+    except (CDPError, OSError, urllib.error.URLError):
+        pass
+
+
+def browser_flags(browser: str, port: int, profile) -> list[str]:
+    """Chromium flags shared by gsdev and the bridge.
+
+    Both launchers must use the same settings or their runs are not comparable
+    (perf numbers, dialog suppression, GPU/occlusion behavior). Callers append
+    their own extras and the target URL.
+    """
+    return [
+        browser, f"--remote-debugging-port={port}", f"--user-data-dir={profile}",
+        "--no-first-run", "--no-default-browser-check",
+        "--disable-background-timer-throttling", "--disable-renderer-backgrounding",
+        "--disable-backgrounding-occluded-windows", "--disable-background-mode",
+        # The host profile is reused and often killed rather than closed cleanly,
+        # so suppress Chrome's "did not shut down correctly / restore pages" bubble
+        # and other dialogs that would sit over the stage and steal input. Edge
+        # ignores the bubble flags, which prepare_host_profile() covers instead.
+        "--noerrdialogs", "--disable-infobars",
+        "--disable-session-crashed-bubble", "--hide-crash-restore-bubble",
+        # Edge (unlike Chrome) opens first-run/sync/restore dialogs as extra
+        # pages that sit over the stage and can stall the host page; disable them.
+        "--disable-sync", "--no-service-autorun", "--disable-component-update",
+        "--disable-features=InfiniteSessionRestore,SessionRestoreBubble,"
+        "msEdgeSyncConfirmation,msEdgeFirstRunExperience,msEdgeIdentityIntegration,"
+        # Windows native window-occlusion detection throttles a headed window that
+        # is not foreground; keep the host stepping at full rate either way.
+        "CalculateNativeWinOcclusion,",
+        # Hardware GL is the production path (scratch.mit.edu runs on the GPU);
+        # don't silently fall back to a software/blocklisted renderer.
+        "--ignore-gpu-blocklist",
+        # Disable Chromium's field-trial testing config where supported. This
+        # does not disable all Finch experiments in branded Chrome/Edge.
+        "--disable-field-trial-config",
+    ]
+
+
 def ensure_host(port: int, headless: bool, software: bool) -> tuple[CDP, bool]:
     # GSDEV_SOFTWARE=1 forces software GL without threading --software through
     # every command (CI sets it once so the test suites can run on GPU-less boxes).
@@ -484,23 +798,30 @@ def ensure_host(port: int, headless: bool, software: bool) -> tuple[CDP, bool]:
     )
     target = host_target(port) if port_open(port) else None
     if target is not None:
-        return connect(target), False
+        conn = connect(target, timeout=CDP_ATTACH_TIMEOUT)
+        try:
+            version = conn.call("Browser.getVersion", timeout=CDP_ATTACH_TIMEOUT)
+            actual_headless = "HeadlessChrome/" in version.get("userAgent", "")
+            if actual_headless != headless:
+                actual = "headless" if actual_headless else "headed"
+                wanted = "headless" if headless else "headed"
+                raise SystemExit(
+                    f"host on port {port} is {actual}, but this command requests {wanted}; "
+                    f"run `close --port {port}` first, or choose another --port"
+                )
+            dismiss_browser_dialogs(port)
+            return conn, False
+        except BaseException:
+            conn.close()
+            raise
     browser = find_browser()
     if browser is None:
         raise SystemExit("no Chrome/Edge found; set GSDEV_BROWSER to the executable")
     ensure_host_server()
-    HOST_PROFILE_DIR.mkdir(parents=True, exist_ok=True)
-    flags = [
-        browser, f"--remote-debugging-port={port}", f"--user-data-dir={HOST_PROFILE_DIR}",
-        "--no-first-run", "--no-default-browser-check",
-        "--disable-background-timer-throttling", "--disable-renderer-backgrounding",
-        # The host profile is reused and often killed rather than closed cleanly,
-        # so suppress Chrome's "did not shut down correctly / restore pages" bubble
-        # and other dialogs that would sit over the stage and steal input.
-        "--noerrdialogs", "--disable-infobars",
-        "--disable-session-crashed-bubble", "--hide-crash-restore-bubble",
-        "--disable-features=InfiniteSessionRestore,SessionRestoreBubble",
-    ]
+    profile = host_profile_dir(port)
+    profile.mkdir(parents=True, exist_ok=True)
+    prepare_host_profile(profile)
+    flags = browser_flags(browser, port, profile)
     if headless:
         flags.append("--headless=new")
         if software:
@@ -508,29 +829,79 @@ def ensure_host(port: int, headless: bool, software: bool) -> tuple[CDP, bool]:
     flags.append(host_url())
     log(f"launching {Path(browser).name}{' headless' if headless else ''}")
     subprocess.Popen(flags, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, **_detached_kwargs())
-    deadline = time.monotonic() + 60
+    # Two phases so a browser that never attaches fails fast, while a slow cold
+    # page load still gets time: HOST_ATTACH_TIMEOUT for a debuggable page to
+    # appear, then HOST_READY_TIMEOUT for window.__host to come up.
+    attach_deadline = time.monotonic() + HOST_ATTACH_TIMEOUT
+    ready_deadline: float | None = None
     conn: CDP | None = None
-    while time.monotonic() < deadline:
+    while True:
+        now = time.monotonic()
+        if ready_deadline is None:
+            if now >= attach_deadline:
+                abort_host(port)
+                raise SystemExit(
+                    f"no debuggable {Path(browser).name} page appeared within "
+                    f"{HOST_ATTACH_TIMEOUT:g}s; is the browser blocked by policy? "
+                    "(raise GSDEV_HOST_TIMEOUT for a slow cold start)"
+                )
+        elif now >= ready_deadline:
+            break
+        dismiss_browser_dialogs(port)
         target = host_target(port)
         if target is not None:
+            if ready_deadline is None:
+                ready_deadline = now + HOST_READY_TIMEOUT
             try:
                 if conn is None:
-                    conn = connect(target)
-                if conn.evaluate("!!(window.__host && window.__marks && window.__marks.ready)"):
+                    conn = connect(target, timeout=CDP_ATTACH_TIMEOUT)
+                if conn.evaluate(
+                    "!!(window.__host && window.__marks && window.__marks.ready)",
+                    timeout=CDP_ATTACH_TIMEOUT,
+                ):
                     log("host ready")
+                    try:
+                        info = conn.evaluate(
+                            "window.__host.gpu ? window.__host.gpu() : null",
+                            timeout=CDP_ATTACH_TIMEOUT,
+                        )
+                        if info and info.get("renderer"):
+                            log(f"gl {info['renderer']}")
+                            if info.get("software"):
+                                log(
+                                    "WARNING: GL looks like software (SwiftShader); "
+                                    "perf is not GPU-representative"
+                                )
+                    except (CDPError, TimeoutError, OSError):
+                        pass
                     return conn, True
             except (CDPError, TimeoutError, OSError):
                 pass
         time.sleep(0.2)
-    raise SystemExit("scratch-vm host did not become ready")
+    detail = ""
+    try:
+        if conn is not None:
+            error = conn.evaluate("window.__hostBundlesError || ''", timeout=CDP_ATTACH_TIMEOUT)
+            if error:
+                detail = f" (host page: {error})"
+    except (CDPError, TimeoutError, OSError):
+        pass
+    abort_host(port)
+    raise SystemExit(
+        f"scratch-vm host page did not finish loading within {HOST_READY_TIMEOUT:g}s"
+        f"{detail}; {_setup_hint()}"
+    )
 
 
 def open_host(port: int) -> CDP | None:
-    target = host_target(port) if port_open(port) else None
+    if not port_open(port):
+        log(f"no scratch-vm host on port {port}; start the project with run first")
+        return None
+    target = host_target(port)
     if target is None:
         log(f"no scratch-vm host on port {port}; start the project with run first")
         return None
-    return connect(target)
+    return connect(target, timeout=CDP_ATTACH_TIMEOUT)
 
 
 def apply_cpu_throttle(cdp: CDP, rate: float) -> None:
@@ -560,16 +931,30 @@ def stop_host(cdp: CDP) -> None:
 
 def close_host(port: int) -> None:
     process_name = Path(find_browser() or "chrome.exe").name.lower()
-    pids = find_editor_pids(port, process_name, HOST_PROFILE_DIR)
+    pids = find_editor_pids(port, process_name, host_profile_dir(port))
     if pids:
         terminate_pids(pids)
         log(f"killed host browser (pid {', '.join(str(p) for p in pids)})")
     else:
         log("no host browser to close")
-    server_pids = _port_owner_pids(HOST_SERVER_PORT)
+    # Only stop the host server if we started it (recorded token) and it is still
+    # the same process -- never a foreign application that happens to hold the port.
+    state = read_host_state()
+    token = state.get("token")
+    if not token:
+        return
+    if not port_open(HOST_SERVER_PORT):
+        clear_host_state()
+        return
+    info = probe_host_server(token)
+    if info is None:
+        log("host server on this port is not ours; leaving it running")
+        return
+    server_pids = sorted({p for p in (info.get("pid"), state.get("pid")) if isinstance(p, int)})
     if server_pids:
         terminate_pids(server_pids)
         log(f"stopped host server (pid {', '.join(str(p) for p in server_pids)})")
+    clear_host_state()
 
 
 def capture_stage_png(cdp: CDP) -> bytes:
@@ -592,9 +977,12 @@ def host_stage_rect(cdp: CDP) -> dict:
 
 
 def build_project_at(root: Path) -> Path:
-    goboscript = shutil.which("goboscript")
+    goboscript = resolve_goboscript()
     if goboscript is None:
-        raise SystemExit("goboscript is not on PATH. Install the GoboScript compiler.")
+        raise SystemExit(
+            "goboscript is not on PATH. "
+            f"{_setup_hint()} (or install the GoboScript compiler)."
+        )
     log(f"building {root}")
     sb3_path = root / (root.name + ".sb3")
     # Rely on cwd for the input: newer goboscript uses -i/--input and rejects a
@@ -602,7 +990,12 @@ def build_project_at(root: Path) -> Path:
     command = [goboscript, "build", "-o", str(sb3_path)]
     if JSON_MODE:
         # Keep stdout clean for the JSON report.
-        result = subprocess.run(command, cwd=str(root), capture_output=True, text=True)
+        # goboscript emits UTF-8 diagnostics; decode explicitly so a CP932/Japanese
+        # Windows locale cannot corrupt them or raise UnicodeDecodeError.
+        result = subprocess.run(
+            command, cwd=str(root), capture_output=True, text=True,
+            encoding="utf-8", errors="replace",
+        )
         print((result.stdout or "") + (result.stderr or ""), end="", file=sys.stderr, flush=True)
     else:
         result = subprocess.run(command, cwd=str(root))
@@ -626,19 +1019,26 @@ def print_event(event: dict) -> None:
 
 
 def cmd_build(args: argparse.Namespace) -> int:
+    ensure_dependencies(need_bundles=False)
     build_project()
     log(f"built {SB3_PATH.name}")
     return 0
 
 
 def cmd_run(args: argparse.Namespace) -> int:
+    ensure_dependencies(need_bundles=True)
     if not args.no_build and not args.no_reload:
         build_project()
     t0 = time.monotonic()
     cdp, launched = ensure_host(args.port, args.headless, args.software)
+    dismiss_browser_dialogs(args.port)
     ready = time.monotonic() - t0
     apply_cpu_throttle(cdp, getattr(args, "cpu", 0.0))
     try:
+        if getattr(args, "perf", None) is not None:
+            enabled = args.perf == "on"
+            cdp.evaluate(f"window.__host.setPerf({json.dumps(enabled)})")
+            log(f"render instrumentation {args.perf}")
         if args.no_reload:
             log(
                 f"host {'launched' if launched else 'warm'}: browser {ready:.2f}s, "
@@ -653,8 +1053,14 @@ def cmd_run(args: argparse.Namespace) -> int:
         log("running; press Ctrl+C to stop")
         deadline = time.monotonic() + args.duration if args.duration else None
         errors_seen = 0
+        next_dialog_check = time.monotonic()
         try:
             while True:
+                # A force-sign-in dialog can appear a little after startup; keep
+                # dismissing Edge/Chrome internal pages so they never cover the stage.
+                if time.monotonic() >= next_dialog_check:
+                    dismiss_browser_dialogs(args.port)
+                    next_dialog_check = time.monotonic() + 2.0
                 poll = poll_host(cdp, errors_seen)
                 for event in poll.get("logs", []):
                     if event is None:
@@ -685,12 +1091,14 @@ def cmd_run(args: argparse.Namespace) -> int:
 
 
 def cmd_screenshot(args: argparse.Namespace) -> int:
+    ensure_dependencies(need_bundles=True)
     if not args.no_build:
         build_project()
     out_path = Path(args.out).expanduser() if args.out else DEBUG_DIR / "stage.png"
     if not out_path.is_absolute():
         out_path = PROJECT_ROOT / out_path
     cdp, _ = ensure_host(args.port, args.headless, args.software)
+    dismiss_browser_dialogs(args.port)
     apply_cpu_throttle(cdp, getattr(args, "cpu", 0.0))
     try:
         load_host_project(cdp, SB3_PATH)
@@ -757,6 +1165,8 @@ def parse_selector(selector: str) -> tuple[str, str, int | None]:
     may carry a ``#N`` clone suffix (``main#1.variable``), resolved by the
     host's ``findTarget``.
     """
+    if selector.startswith("@"):
+        return "@perf", selector[1:], None
     index = None
     base = selector
     if selector.endswith("]") and "[" in selector:
@@ -776,6 +1186,19 @@ _UNSET = object()
 
 
 def _var_js(target: str, name: str, index: int | None = None, value=_UNSET) -> str:
+    if target == "@perf":
+        if value is not _UNSET:
+            return "({error: 'read-only: @' + " + json.dumps(name) + "})"
+        return (
+            "(() => {"
+            " const _host = window.__host;"
+            " if (!_host || !_host.perfValue) return {error: 'no host (open the project with run first)'};"
+            " const _want = " + json.dumps(name) + ";"
+            " const _out = _host.perfValue(_want);"
+            " if (typeof _out === 'undefined') return {error: 'unknown perf metric: ' + _want};"
+            " return {value: _out, target: '@perf', name: _want, index: null};"
+            "})()"
+        )
     idx = "null" if index is None else str(int(index))
     if value is _UNSET:
         mutate = ""
@@ -833,6 +1256,7 @@ def _watch_install_js(specs: list[tuple], labels: list[str], interval_ms: int) -
         " const _specs = " + spec_list + ";"
         " const _refs = [];"
         " for (const _s of _specs) {"
+        "   if (_s.target === '@perf') { _refs.push({label: _s.label, ref: {__perf: _s.name}, index: null}); continue; }"
         "   const _t = _host.findTarget(_s.target);"
         "   if (!_t) return {error: 'target not found: ' + _s.target};"
         "   let _v = null;"
@@ -840,9 +1264,11 @@ def _watch_install_js(specs: list[tuple], labels: list[str], interval_ms: int) -
         "   if (!_v) return {error: 'variable not found: ' + _s.name};"
         "   _refs.push({label: _s.label, ref: _v, index: _s.index});"
         " }"
-        " const _read = (_r) => (_r.index === null)"
-        "   ? _r.ref.value"
-        "   : (Array.isArray(_r.ref.value) ? _r.ref.value[_r.index - 1] : undefined);"
+        " const _read = (_r) => (_r.ref.__perf)"
+        "   ? window.__host.perfValue(_r.ref.__perf)"
+        "   : ((_r.index === null)"
+        "     ? _r.ref.value"
+        "     : (Array.isArray(_r.ref.value) ? _r.ref.value[_r.index - 1] : undefined));"
         " const _fmt = (x) => {"
         "   if (Array.isArray(x)) { const s = JSON.stringify(x);"
         "     return s.length > 200 ? s.slice(0, 200) + '...(' + x.length + ')' : s; }"
@@ -900,11 +1326,11 @@ def cmd_set(args: argparse.Namespace) -> int:
     if cdp is None:
         return 1
     try:
-        result = cdp.evaluate(_var_js(target, name, index, value))
+        result = cdp.evaluate(_var_js(target, name, index, value)) or {}
         log(json.dumps({"selector": args.selector, **result}))
+        return 1 if result.get("error") else 0
     finally:
         cdp.close()
-    return 0
 
 
 def apply_batch(cdp: CDP, tokens: list[str]) -> None:
@@ -1187,6 +1613,18 @@ def run_session_lines(cdp: CDP, lines, quiet: bool = False) -> dict:
                     record(False, f"prop {parts[1]} {parts[2]}: {result['error']}")
             elif op == "clones":
                 log(json.dumps({"clones": cdp.evaluate("window.__host.clones()")}))
+            elif op == "perf":
+                log(json.dumps(cdp.evaluate("window.__host.perf()")))
+            elif op == "setperf" and len(parts) >= 2:
+                enabled = parts[1].lower() in ("on", "true", "1")
+                result = cdp.evaluate(f"window.__host.setPerf({str(enabled).lower()})")
+                log(json.dumps({"perf": bool(result)}))
+            elif op == "logic":
+                log(json.dumps(cdp.evaluate("window.__host.logic()")))
+            elif op == "setlogic" and len(parts) >= 2:
+                enabled = parts[1].lower() in ("on", "true", "1")
+                result = cdp.evaluate(f"window.__host.setLogic({str(enabled).lower()})")
+                log(json.dumps({"logic": bool(result)}))
             elif op == "errors":
                 log(json.dumps(get_errors(cdp)))
             elif op == "expect_no_errors":
@@ -1263,7 +1701,17 @@ def cmd_session(args: argparse.Namespace) -> int:
     if cdp is None:
         return 1
     try:
-        result = run_session_lines(cdp, sys.stdin, quiet=JSON_MODE)
+        source = getattr(args, "file", None)
+        if source:
+            # UTF-8 file input: PowerShell 5.1 pipes native-command input as the
+            # legacy code page and destroys CJK before Python can read it.
+            stream = io.StringIO(Path(source).read_text(encoding="utf-8"))
+        else:
+            stream = sys.stdin
+            if os.name == "nt":
+                log("[hint] PowerShell 5.1 pipes are not UTF-8; use `session --file PATH` "
+                    "for non-ASCII (CJK) selectors/values")
+        result = run_session_lines(cdp, stream, quiet=JSON_MODE)
     finally:
         cdp.close()
     if JSON_MODE:
@@ -1643,6 +2091,286 @@ def cmd_render(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_perf(args: argparse.Namespace) -> int:
+    cdp = open_live_cdp(args.port)
+    if cdp is None:
+        return 1
+    try:
+        log(json.dumps(cdp.evaluate("window.__host.perf()")))
+    finally:
+        cdp.close()
+    return 0
+
+
+def cmd_gpu(args: argparse.Namespace) -> int:
+    cdp = open_live_cdp(args.port)
+    if cdp is None:
+        return 1
+    try:
+        result = cdp.evaluate(
+            "window.__host.gpu ? window.__host.gpu() : {error: 'host has no gpu()'}"
+        )
+        log(json.dumps(result))
+    finally:
+        cdp.close()
+    return 0
+
+
+def cmd_setperf(args: argparse.Namespace) -> int:
+    cdp = open_live_cdp(args.port)
+    if cdp is None:
+        return 1
+    try:
+        enabled = args.mode == "on"
+        result = cdp.evaluate(f"window.__host.setPerf({str(enabled).lower()})")
+        log(json.dumps({"perf": bool(result)}))
+    finally:
+        cdp.close()
+    return 0
+
+
+def cmd_logic(args: argparse.Namespace) -> int:
+    cdp = open_live_cdp(args.port)
+    if cdp is None:
+        return 1
+    try:
+        log(json.dumps(cdp.evaluate("window.__host.logic()")))
+    finally:
+        cdp.close()
+    return 0
+
+
+def cmd_setlogic(args: argparse.Namespace) -> int:
+    cdp = open_live_cdp(args.port)
+    if cdp is None:
+        return 1
+    try:
+        enabled = args.mode == "on"
+        result = cdp.evaluate(f"window.__host.setLogic({str(enabled).lower()})")
+        log(json.dumps({"logic": bool(result)}))
+    finally:
+        cdp.close()
+    return 0
+
+
+def cmd_setprofiling(args: argparse.Namespace) -> int:
+    cdp = open_live_cdp(args.port)
+    if cdp is None:
+        return 1
+    try:
+        enabled = args.mode == "on"
+        result = cdp.evaluate(f"window.__host.setProfiling({str(enabled).lower()})")
+        log(json.dumps({"profiling": bool(result)}))
+    finally:
+        cdp.close()
+    return 0
+
+
+def cmd_profilereset(args: argparse.Namespace) -> int:
+    """Start a fresh profiling window while instrumentation stays on."""
+    cdp = open_live_cdp(args.port)
+    if cdp is None:
+        return 1
+    try:
+        ok = bool(cdp.evaluate("window.__host.profileReset()"))
+        log(json.dumps({"profileReset": ok}))
+        return 0 if ok else 1
+    finally:
+        cdp.close()
+
+
+def cmd_profiling(args: argparse.Namespace) -> int:
+    """Print the current profiling report without starting a new capture."""
+    cdp = open_live_cdp(args.port)
+    if cdp is None:
+        return 1
+    try:
+        report = cdp.evaluate("window.__host.profile()")
+        if not isinstance(report, dict) or not report.get("enabled"):
+            log("profiling is off: enable with `setprofiling on`, or run `profile`")
+            return 1
+        _print_profile(report, args.top)
+        _print_profile_steps(report, args.steps)
+        if args.json:
+            out = Path(args.json).expanduser()
+            out.parent.mkdir(parents=True, exist_ok=True)
+            out.write_text(json.dumps(report, indent=2), encoding="utf-8")
+            log(f"wrote {out}")
+    finally:
+        cdp.close()
+    return 0
+
+
+def _short_proc(name: str) -> str:
+    """Elide typed-procedure argument signatures for the table (JSON keeps the key)."""
+    idx = name.find(": %s")
+    if idx < 0:
+        return name
+    head = name[:idx]
+    space = head.rfind(" ")
+    return (head[:space] if space > 0 else head) + "..."
+
+
+def _print_profile(report: dict, top: int) -> None:
+    """Print the project summary line and ranked procedure table for a report."""
+    steps = int(report.get("steps") or 0)
+    total = int(report.get("total_ops") or 0)
+    unattributed = int(report.get("unattributed") or 0)
+    self_total = int(report.get("self_total") or 0)
+    window_ms = float(report.get("window_ms") or 0.0)
+    rate = steps / (window_ms / 1000) if window_ms else 0.0
+    step_ms = float(report.get("step_ms_mean") or 0.0)
+    draws = float(report.get("draws_per_step") or 0.0)
+    blocks = float(report.get("ops_per_step_mean") or 0.0)
+    log(f"profiling: {steps} observed steps in {window_ms:.0f} ms ({rate:.1f} steps/s)")
+    log(f"summary: VM steps/s={rate:.1f} | Step ms={step_ms:.3f} | "
+        f"Draws/step={draws:.2f} | Blocks/step={blocks:.1f}")
+    log(f"operations: total={total} self={self_total} unattributed={unattributed} "
+        f"mean/step={blocks:.1f} max/step={int(report.get('ops_per_step_max') or 0)}")
+    if report.get("per_step_capped"):
+        log("note: per-step series capped (earliest steps retained)")
+    invariant = "ok" if self_total + unattributed == total else "MISMATCH"
+    log(f"invariant sum(self)+unattributed == total: {invariant}")
+    rows = report.get("procedures") or []
+    log(f"{'procedure':40} {'calls':>7} {'calls/step':>10} {'self/step':>10} "
+        f"{'incl/step':>10} {'self%':>7}")
+    for row in rows[: max(0, top)]:
+        calls = int(row.get("calls") or 0)
+        calls_per_step = (calls / steps) if steps else 0.0
+        per_step = (int(row.get("self") or 0) / steps) if steps else 0.0
+        incl = (int(row.get("inclusive") or 0) / steps) if steps else 0.0
+        share = 100.0 * float(row.get("share") or 0.0)
+        label = _short_proc(str(row.get("key", "?")))
+        if len(label) > 40:
+            label = label[:37] + "..."
+        log(f"{label:40} {calls:7d} "
+            f"{calls_per_step:10.2f} {per_step:10.2f} {incl:10.2f} {share:6.1f}%")
+    if len(rows) > top:
+        log(f"... {len(rows) - top} more procedure(s) in the JSON report")
+
+
+def _print_profile_steps(report: dict, count: int) -> None:
+    """Print the last N per-step lines from the in-page series."""
+    series = report.get("step_series") or []
+    if not series or count <= 0:
+        return
+    tail = series[-count:]
+    base = len(series) - len(tail)
+    prev_t = float(series[base - 1].get("t") or 0.0) if base > 0 else None
+    for row in tail:
+        t = float(row.get("t") or 0.0)
+        rate = (1000.0 / (t - prev_t)) if (prev_t and t > prev_t) else 0.0
+        if t:
+            prev_t = t
+        log(f"frame {int(row.get('frame') or 0)} | VM steps/s={rate:.1f} | "
+            f"Step ms={float(row.get('step_ms') or 0.0):.3f} | "
+            f"Draws/step={float(row.get('draws') or 0.0):.0f} | "
+            f"Blocks/step={int(row.get('blocks') or 0)}")
+
+
+def _follow_profile(cdp: CDP, args: argparse.Namespace) -> None:
+    """Stream one line per completed VM step while the capture window runs."""
+    deadline = time.monotonic() + max(0.0, args.seconds)
+    seen = 0
+    prev_t: float | None = None
+    while time.monotonic() < deadline:
+        try:
+            batch = cdp.evaluate(f"window.__host.profileSteps({seen})") or {}
+        except (CDPError, TimeoutError, OSError):
+            break
+        base = int(batch.get("series_start") or 0)
+        for i, row in enumerate(batch.get("steps") or []):
+            seen = base + i + 1
+            t = float(row.get("t") or 0.0)
+            rate = (1000.0 / (t - prev_t)) if (prev_t and t > prev_t) else 0.0
+            if t:
+                prev_t = t
+            log(f"frame {int(row.get('frame') or 0)} | VM steps/s={rate:.1f} | "
+                f"Step ms={float(row.get('step_ms') or 0.0):.3f} | "
+                f"Draws/step={float(row.get('draws') or 0.0):.0f} | "
+                f"Blocks/step={int(row.get('blocks') or 0)}")
+        time.sleep(max(0.02, args.follow_interval))
+
+
+def cmd_profile(args: argparse.Namespace) -> int:
+    """Capture a bounded profiling window and print the procedure hotspot report.
+
+    Counts first, attribution second (plan-procedure-hotspots.md): this prints the
+    project summary and ranked procedure table; it does not measure per-opcode cost.
+    """
+    ensure_dependencies(need_bundles=True)
+    if not args.no_build and not args.no_reload:
+        build_project()
+    cdp, launched = ensure_host(args.port, args.headless, args.software)
+    dismiss_browser_dialogs(args.port)
+    apply_cpu_throttle(cdp, getattr(args, "cpu", 0.0))
+    try:
+        if getattr(args, "perf", None) not in (None, "keep"):
+            # Draws/step counts pen drawLine + penStamp submission, which only
+            # happens while render instrumentation is on.
+            cdp.evaluate(f"window.__host.setPerf({json.dumps(args.perf == 'on')})")
+        if args.no_reload:
+            log("reusing the running project (--no-reload)")
+        else:
+            info = load_host_project(cdp, SB3_PATH)
+            log(f"loaded in {info['load']:.0f} ms")
+        cdp.evaluate("window.__host.setProfiling(true)")
+        if args.warmup > 0:
+            time.sleep(args.warmup)
+        if args.wait_until:
+            # Event-gated capture: run the scenario, wait for the start event, then
+            # open the window, so loading/setup work is excluded.
+            if not args.no_restart:
+                cdp.evaluate("window.__host.restart()")
+            spec = _spec(args.wait_until)
+            value = parse_value(args.wait_value)
+            script = (f"window.__host.waitUntil({json.dumps(spec)}, "
+                      f"{json.dumps(args.wait_op)}, {json.dumps(value)}, "
+                      f"{int(args.wait_timeout)})")
+            result = cdp.evaluate(script, await_promise=True,
+                                  timeout=args.wait_timeout / 1000.0 + 10) or {}
+            if not result.get("ok"):
+                log(f"wait-until {args.wait_until} {args.wait_op} {args.wait_value} "
+                    f"failed: {result.get('error') or 'timed out'}")
+                return 1
+            log(f"event: {args.wait_until} {args.wait_op} {args.wait_value} "
+                f"at frame {result.get('frame')}")
+            cdp.evaluate("window.__host.profileReset()")
+        else:
+            cdp.evaluate("window.__host.profileReset()")
+            if not args.no_restart:
+                # Start the scenario inside the capture window so one-shot setup
+                # work is attributed too (instrument before scenario start).
+                cdp.evaluate("window.__host.restart()")
+        if args.follow:
+            _follow_profile(cdp, args)
+        else:
+            time.sleep(max(0.0, args.seconds))
+        report = cdp.evaluate("window.__host.profile()")
+        if not isinstance(report, dict):
+            log("no profiling report (is the host page up to date?)")
+            return 1
+        if not bool(cdp.evaluate("window.__host.perf().enabled")):
+            log("draw counter: render instrumentation is OFF - Draws/step reads 0 "
+                "(pass --perf on to count pen/stamp submission)")
+        _print_profile(report, args.top)
+        if args.json:
+            out = Path(args.json).expanduser()
+            out.parent.mkdir(parents=True, exist_ok=True)
+            out.write_text(json.dumps(report, indent=2), encoding="utf-8")
+            log(f"wrote {out}")
+        if not args.leave_running:
+            cdp.evaluate("window.__host.setProfiling(false)")
+    finally:
+        if not args.leave_running:
+            try:
+                stop_host(cdp)
+            except (CDPError, TimeoutError, OSError):
+                pass
+        cdp.close()
+    return 0
+
+
 def cmd_record(args: argparse.Namespace) -> int:
     cdp = open_live_cdp(args.port)
     if cdp is None:
@@ -1928,7 +2656,8 @@ def cmd_wait_pixel(args: argparse.Namespace) -> int:
 
 def _tool_version(command: list[str]) -> str:
     try:
-        result = subprocess.run(command, capture_output=True, text=True, timeout=15)
+        result = subprocess.run(command, capture_output=True, text=True,
+                                encoding="utf-8", errors="replace", timeout=15)
     except (OSError, subprocess.TimeoutExpired):
         return ""
     output = (result.stdout or result.stderr).strip().splitlines()
@@ -1963,23 +2692,41 @@ def cmd_doctor(args: argparse.Namespace) -> int:
     else:
         fail("python", f"{platform.python_version()} is too old; install 3.10+")
 
-    goboscript = shutil.which("goboscript")
+    goboscript = resolve_goboscript()
     if goboscript:
-        ok("goboscript", _tool_version([goboscript, "--version"]) or goboscript)
+        detail = _tool_version([goboscript, "--version"])
+        bundled = bootstrap.bundled_goboscript()
+        is_bundled = bundled is not None and Path(goboscript).resolve() == bundled.resolve()
+        if detail:
+            ok("goboscript", f"{detail} ({'bundled' if is_bundled else 'system'})")
+        else:
+            # A resolved path that cannot run is a broken install; don't report ok.
+            fail("goboscript", f"{goboscript} is not runnable; {_setup_hint()}")
     else:
-        fail("goboscript", "not on PATH; install from github.com/aspizu/goboscript")
+        fail("goboscript", f"not found; {_setup_hint()} (or install from github.com/aspizu/goboscript)")
 
-    node = shutil.which("node")
-    if node:
-        ok("node", _tool_version([node, "--version"]) or node)
+    if host_bundles_present():
+        where = VENDOR_DIR if bootstrap.vendor_present() else (HOST_DIR / "node_modules")
+        ok("host bundles", str(where))
     else:
-        fail("node", "not on PATH (needed by the scratch-vm host)")
+        fail("host bundles", f"not installed; {_setup_hint()}")
 
-    npm = shutil.which("npm")
-    if npm:
-        ok("npm", _tool_version([npm, "--version"]) or npm)
+    # node/npm are only the advanced way to fetch the host bundles; once the
+    # bundles are present (vendored by setup, or via npm) they are optional.
+    if host_bundles_present():
+        if shutil.which("node") or shutil.which("npm"):
+            ok("node/npm", "present (optional)")
     else:
-        fail("npm", "not on PATH")
+        node = shutil.which("node")
+        if node:
+            ok("node", _tool_version([node, "--version"]) or node)
+        else:
+            warn("node", "not on PATH")
+        npm = shutil.which("npm")
+        if npm:
+            ok("npm", _tool_version([npm, "--version"]) or npm)
+        else:
+            warn("npm", "not on PATH")
 
     browser = find_browser()
     if browser:
@@ -1987,13 +2734,13 @@ def cmd_doctor(args: argparse.Namespace) -> int:
     else:
         fail("browser", "no Chrome/Edge found; set GSDEV_BROWSER to the executable")
 
-    if (HOST_DIR / "node_modules").is_dir():
-        ok("host deps", str(HOST_DIR / "node_modules"))
-    else:
-        warn("host deps", f'not installed; run: npm install --prefix "{HOST_DIR}"')
-
     if port_open(HOST_SERVER_PORT):
-        ok("host server", f"http://127.0.0.1:{HOST_SERVER_PORT}")
+        info = probe_host_server()
+        if info is not None:
+            ok("host server", f"http://127.0.0.1:{HOST_SERVER_PORT} (pid {info.get('pid')})")
+        else:
+            warn("host port", f"port {HOST_SERVER_PORT} is used by another application; "
+                              f"set GSDEV_HOST_PORT to a free port")
     else:
         ok("host server", "not running (started on demand)")
 
@@ -2005,6 +2752,11 @@ def cmd_doctor(args: argparse.Namespace) -> int:
     else:
         print("[ok  ] doctor - all dependencies found", flush=True)
     return 1 if failures else 0
+
+
+def cmd_setup(args: argparse.Namespace) -> int:
+    """Download the prebuilt tools (goboscript + host bundles) with no admin."""
+    return bootstrap.run_setup(only=args.only, force=args.force, offline=args.offline)
 
 
 def cmd_selftest(args: argparse.Namespace) -> int:
@@ -2023,15 +2775,51 @@ def cmd_selftest(args: argparse.Namespace) -> int:
         str(HOST_DIR),
     )
     check(
+        "bundle entry table",
+        set(bootstrap.ENTRY_FILES) == set(bootstrap.PACKAGES),
+        f"{len(bootstrap.PACKAGES)} pinned packages",
+    )
+    asset_cases = {
+        ("Windows", "AMD64"): "goboscript_Windows_x86_64.zip",
+        ("Windows", "ARM64"): "goboscript_Windows_x86_64.zip",
+        ("Darwin", "arm64"): "goboscript_Darwin_arm64.tar.gz",
+        ("Darwin", "x86_64"): "goboscript_Darwin_x86_64.tar.gz",
+        ("Linux", "aarch64"): "goboscript_Linux_arm64.tar.gz",
+        ("Linux", "x86_64"): "goboscript_Linux_x86_64.tar.gz",
+    }
+    check(
+        "goboscript asset mapping",
+        all(
+            bootstrap._goboscript_asset(system, machine)[0] == expected
+            for (system, machine), expected in asset_cases.items()
+        ),
+        "win/mac/linux x64+arm64",
+    )
+    get_python = TOOLS_DIR / "get-python.ps1"
+    python_text = get_python.read_text(encoding="utf-8").lower() if get_python.exists() else ""
+    check(
+        "portable Python arches",
+        "arm64" in python_text and "amd64" in python_text,
+        "x64 + arm64 embed zips",
+    )
+    host_html = (HOST_DIR / "host.html")
+    html_text = host_html.read_text(encoding="utf-8") if host_html.exists() else ""
+    check(
+        "host page resolves bundles",
+        "./vendor/@scratch" in html_text and "./node_modules/@scratch" in html_text,
+        "vendor first, node_modules fallback",
+    )
+    check(
         "browser candidates",
         bool(BROWSER_CANDIDATES.get("win32")) and bool(BROWSER_CANDIDATES.get("darwin")),
         "chrome/edge paths",
     )
     check("host port", isinstance(HOST_SERVER_PORT, int) and HOST_SERVER_PORT > 0, str(HOST_SERVER_PORT))
     check(
-        "host profile",
-        HOST_PROFILE_DIR.name == "scratchvm-profile",
-        str(HOST_PROFILE_DIR),
+        "per-port host profile",
+        host_profile_dir(9240) != host_profile_dir(9241)
+        and host_profile_dir(9240).parent == HOST_PROFILE_ROOT,
+        str(HOST_PROFILE_ROOT),
     )
 
     if failures:
@@ -2066,6 +2854,37 @@ def _task_substitute(value, root: Path):
     return value
 
 
+def _task_entrypoint(command: str, arguments: list) -> tuple[str, str]:
+    """(script, subcommand) for a task, across the launcher shapes.
+
+    POSIX tasks go through the shell launchers: ``<repo>/tools/gsdev <subcommand>``
+    and ``<repo>/setup.sh``. Windows tasks go through the PowerShell launchers:
+    ``powershell -File <script.ps1> <subcommand>``, where ``setup.ps1`` has no
+    subcommand (installing is its whole job). Plain Python tasks are
+    ``python <script.py> <subcommand>``.
+    """
+    name = Path(command or "").name.lower()
+    if name in {"powershell", "powershell.exe", "pwsh", "pwsh.exe"}:
+        positions = [i for i, arg in enumerate(arguments) if str(arg).lower() == "-file"]
+        if positions:
+            index = positions[0]
+            script = arguments[index + 1] if len(arguments) > index + 1 else ""
+            subcommand = arguments[index + 2] if len(arguments) > index + 2 else ""
+            if script and Path(script).name.lower() == "setup.ps1":
+                subcommand = "setup"
+            return script, subcommand
+        return "", ""
+    if name == "gsdev":
+        # POSIX launcher: the shim resolves Python itself, so the first argument
+        # is the subcommand (the Windows path is gsdev.ps1 above).
+        return command, (arguments[0] if arguments else "")
+    if name == "setup.sh":
+        return command, "setup"
+    script = arguments[0] if arguments else ""
+    subcommand = arguments[1] if len(arguments) > 1 else ""
+    return script, subcommand
+
+
 def cmd_tasks(args: argparse.Namespace) -> int:
     """Check that the .vscode process tasks resolve on this platform.
 
@@ -2096,27 +2915,30 @@ def cmd_tasks(args: argparse.Namespace) -> int:
         return 1
 
     platform_key = _task_platform_key()
-    known = {"build", "status", "doctor", "selftest", "run", "screenshot", "stop", "close"}
+    known = {"build", "status", "doctor", "selftest", "setup", "run", "screenshot", "stop", "close"}
     runnable = {"build", "doctor", "stop", "close"}
+    labels = {task.get("label", "<unlabeled>") for task in tasks}
     for task in tasks:
         label = task.get("label", "<unlabeled>")
         command = _task_substitute(_task_field(task, "command", platform_key), PROJECT_ROOT)
         arguments = _task_substitute(_task_field(task, "args", platform_key, []), PROJECT_ROOT)
         options = _task_substitute(_task_field(task, "options", platform_key, {}), PROJECT_ROOT)
         resolved = shutil.which(command) if command else None
-        script = arguments[0] if arguments else ""
-        subcommand = arguments[1] if len(arguments) > 1 else ""
-        backend = (options.get("env") or {}).get("GSDEV_BACKEND")
+        script, subcommand = _task_entrypoint(command, arguments)
         cwd = options.get("cwd") or str(PROJECT_ROOT)
+        depends = task.get("dependsOn") or []
+        if isinstance(depends, str):
+            depends = [depends]
         reasons = []
         if not resolved:
             reasons.append(f"command {command!r} not on PATH")
-        if not script or not Path(script).exists():
+        if script and not Path(script).exists():
             reasons.append(f"script {script!r} missing")
         if subcommand not in known:
             reasons.append(f"unknown subcommand {subcommand!r}")
-        if backend is not None and backend not in ("scratch", "turbowarp"):
-            reasons.append(f"bad GSDEV_BACKEND {backend!r}")
+        missing = [name for name in depends if name not in labels]
+        if missing:
+            reasons.append(f"unknown dependsOn {missing!r}")
         if not Path(cwd).is_dir():
             reasons.append(f"cwd {cwd!r} missing")
         check(label, not reasons, "; ".join(reasons) or f"{subcommand} via {command}")
@@ -2125,7 +2947,8 @@ def cmd_tasks(args: argparse.Namespace) -> int:
             env = dict(os.environ)
             env.update(options.get("env") or {})
             result = subprocess.run(
-                [resolved, *arguments], cwd=cwd, env=env, capture_output=True, text=True
+                [resolved, *arguments], cwd=cwd, env=env, capture_output=True, text=True,
+                encoding="utf-8", errors="replace",
             )
             check(f"{label} (executed)", result.returncode == 0, f"exit {result.returncode}")
 
@@ -2175,6 +2998,16 @@ def build_parser() -> argparse.ArgumentParser:
     add_port(doctor)
     doctor.set_defaults(func=cmd_doctor)
 
+    setup = subparsers.add_parser(
+        "setup", help="download prebuilt goboscript + host bundles (no admin/pip)"
+    )
+    setup.add_argument(
+        "--only", choices=["goboscript", "vendor"], help="install just one piece"
+    )
+    setup.add_argument("--force", action="store_true", help="re-download even if present")
+    setup.add_argument("--offline", action="store_true", help="never touch the network")
+    setup.set_defaults(func=cmd_setup)
+
     selftest = subparsers.add_parser(
         "selftest", help="check per-platform path/flag logic (incl. macOS)"
     )
@@ -2187,6 +3020,10 @@ def build_parser() -> argparse.ArgumentParser:
     run = subparsers.add_parser("run", help="build, start, and stream logs")
     add_port(run)
     add_cpu(run)
+    run.add_argument(
+        "--perf", choices=["on", "off"],
+        help="set render instrumentation before execution (default: keep host setting)",
+    )
     run.add_argument("--no-build", action="store_true", help="skip goboscript build")
     run.add_argument(
         "--no-reload",
@@ -2247,10 +3084,15 @@ def build_parser() -> argparse.ArgumentParser:
     watch.set_defaults(func=cmd_watch)
 
     session = subparsers.add_parser(
-        "session", help="run a batch of get/set/input/expect lines from stdin"
+        "session", help="run a batch of get/set/input/expect lines (stdin or --file)"
     )
     add_port(session)
     add_json(session)
+    session.add_argument(
+        "--file",
+        help="read the session script from this UTF-8 file instead of stdin "
+             "(recommended on PowerShell 5.1, whose pipes are not UTF-8)",
+    )
     session.set_defaults(func=cmd_session)
 
     test = subparsers.add_parser(
@@ -2407,6 +3249,100 @@ def build_parser() -> argparse.ArgumentParser:
     clones = subparsers.add_parser("clones", help="print the clone count per sprite")
     add_port(clones)
     clones.set_defaults(func=cmd_clones)
+
+    perf = subparsers.add_parser(
+        "perf", help="print fps / drawcount / drawcalls / rendertime"
+    )
+    add_port(perf)
+    perf.set_defaults(func=cmd_perf)
+
+    gpu = subparsers.add_parser(
+        "gpu", help="print the host GL renderer (GPU vs software)"
+    )
+    add_port(gpu)
+    gpu.set_defaults(func=cmd_gpu)
+
+    setperf = subparsers.add_parser(
+        "setperf", help="enable/disable render-side perf instrumentation"
+    )
+    add_port(setperf)
+    setperf.add_argument("mode", choices=["on", "off"])
+    setperf.set_defaults(func=cmd_setperf)
+
+    logic = subparsers.add_parser(
+        "logic", help="print per-frame block op counts (var/list/param/control)"
+    )
+    add_port(logic)
+    logic.set_defaults(func=cmd_logic)
+
+    setlogic = subparsers.add_parser(
+        "setlogic", help="enable/disable logic op-count instrumentation (opt-in)"
+    )
+    add_port(setlogic)
+    setlogic.add_argument("mode", choices=["on", "off"])
+    setlogic.set_defaults(func=cmd_setlogic)
+
+    setprof = subparsers.add_parser(
+        "setprofiling", help="enable/disable procedure profiling (opt-in, intrusive)"
+    )
+    add_port(setprof)
+    setprof.add_argument("mode", choices=["on", "off"])
+    setprof.set_defaults(func=cmd_setprofiling)
+
+    profread = subparsers.add_parser(
+        "profiling", help="print the current profiling report (no new capture)"
+    )
+    add_port(profread)
+    profread.add_argument("--top", type=int, default=15, help="procedure rows to print")
+    profread.add_argument("--steps", type=int, default=20,
+                          help="also print the last N per-step lines (0 disables)")
+    profread.add_argument("--json", default="", help="write the full report to this path")
+    profread.set_defaults(func=cmd_profiling)
+
+    profreset = subparsers.add_parser(
+        "profilereset", help="start a fresh profiling window (instrumentation stays on)"
+    )
+    add_port(profreset)
+    profreset.set_defaults(func=cmd_profilereset)
+
+    profile = subparsers.add_parser(
+        "profile", help="capture a bounded window and print procedure hotspots"
+    )
+    add_port(profile)
+    add_cpu(profile)
+    profile.add_argument("--seconds", type=float, default=2.0,
+                         help="capture window in seconds (default 2)")
+    profile.add_argument("--warmup", type=float, default=0.5,
+                         help="seconds to run before the capture window is reset")
+    profile.add_argument("--top", type=int, default=15, help="procedure rows to print")
+    profile.add_argument("--json", default="", help="write the full report to this path")
+    profile.add_argument("--no-build", action="store_true", help="skip goboscript build")
+    profile.add_argument("--no-reload", action="store_true",
+                         help="reuse the running project (no build, no reload)")
+    profile.add_argument("--no-restart", action="store_true",
+                         help="do not re-run the green-flag scripts inside the capture window")
+    profile.add_argument("--follow", dest="follow", action="store_true", default=True,
+                         help=argparse.SUPPRESS)
+    profile.add_argument("--no-follow", dest="follow", action="store_false",
+                         help="do not stream per-step lines during the capture")
+    profile.add_argument("--follow-interval", type=float, default=0.2,
+                         help="streaming poll interval (seconds, default 0.2)")
+    profile.add_argument("--perf", choices=["on", "off", "keep"], default="on",
+                         help="render instrumentation for the capture; default on so "
+                              "Draws/step is real (keep/off inherit or disable it)")
+    profile.add_argument("--wait-until", default="",
+                         help="event-gated start: begin the capture once this variable "
+                              "condition is met (excludes load/setup)")
+    profile.add_argument("--wait-op", default=">",
+                         choices=["==", "!=", ">", "<", ">=", "<="])
+    profile.add_argument("--wait-value", default="0")
+    profile.add_argument("--wait-timeout", type=float, default=60000.0,
+                         help="event wait timeout in ms (default 60000)")
+    profile.add_argument("--leave-running", action="store_true",
+                         help="keep profiling enabled and the host running")
+    profile.add_argument("--headless", action="store_true", help="no visible browser window")
+    add_software(profile)
+    profile.set_defaults(func=cmd_profile)
 
     errors = subparsers.add_parser("errors", help="dump captured VM/page errors")
     add_port(errors)

@@ -1,0 +1,5 @@
+# POSIX launchers must keep LF endings: a shebang followed by CR would break
+# `#!/bin/sh` on macOS/Linux (and under WSL). Windows launchers (.cmd/.ps1) are
+# unaffected by this rule.
+*.sh text eol=lf
+tools/gsdev text eol=lf

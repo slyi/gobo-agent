@@ -1,253 +1,142 @@
-# gobo-agent: agent TLDR (build & test loop)
+# Quick iteration guide
 
-Fastest way to verify a GoboScript change. The runtime is a **headless local
-scratch-vm web host** driven by `tools/gsdev.py` — there is no Scratch/TurboWarp
-desktop app to install. Everything runs through `tools/gsdev.py`.
+`gobo-agent` builds a GoboScript project, runs it on the **vanilla Scratch VM** in a
+real browser, and lets you drive, inspect, and profile it — so you can change code and
+see what it actually does in a tight loop. No Scratch desktop app, Electron, Node,
+Rust, or compiler toolchain required.
 
-- **Agents always run the host `--headless`.**
-- **VS Code tasks run the host non-headless** (visible window, real GPU) for humans.
+- `tools/gsdev.py` — local build/run loop, unit and functional tests, live tuning,
+  input injection, and profiling.
+- `tools/gsbridge.py` — the same style of verbs against a live Scratch site.
 
-## TLDR
+Command reference: [README.md](README.md). On macOS/Linux, `./tools/gsdev` and
+`./setup.sh` mirror the PowerShell launchers (same arguments, no admin needed; a
+Chromium-based browser is assumed, Safari is out of scope).
 
-1. **Keep the host open for the whole session (warm). Do not `close` between
-   edits.** Cold start is a **once-per-session** cost: start it once, then both
-   live value edits *and* logic rebuilds reuse the same warm host, so you never
-   pay cold start again during a vibe-coding session.
-2. **Per change (agent):** `python tools/gsdev.py run --headless --duration 2`
-   (~1 s to running warm) or `screenshot --headless` for visuals.
-3. **VS Code tasks (human):** Run/Screenshot/Stop/Close use the host without
-   `--headless`; Build and Check dependencies use `gsdev.py`.
-4. **Cold-start only twice:** once to start the session, once at the end to
-   validate from scratch.
+## Ground rules
 
-## Dependencies (verify with `doctor`)
+- Run browsers **headless** unless a visible investigation is explicitly requested.
+- **Bound** every `run` with `--duration`; add `--leave-running` when later commands
+  must observe scripts still running.
+- **Keep the host warm** between edits; do not `close` after every command.
+- **Rebuild/reload after source changes** (`run` does this). `set`/`set_batch` change
+  data only — they never replace code.
+- **Relaunch after editing `host.js`**: a warm page keeps the previous JavaScript.
+- Never reuse a personal browser profile; never treat an unknown port owner as ours.
 
-- **Python 3.10+** — stdlib only; no pip step.
-- **`goboscript`** on `PATH` — the compiler (`build`).
-- **Node/npm + Chrome or Edge** — for the scratch-vm host. One-time:
-  `npm install --prefix tools/scratchhost` (the `@scratch/*` packages are
-  AGPL-3.0-only and gitignored). `GSDEV_BROWSER` overrides the browser;
-  `GSDEV_SOFTWARE=1` forces software GL (SwiftShader) for every command.
-- No Scratch Desktop or TurboWarp Desktop; no Electron.
-
-`python tools/gsdev.py doctor` prints one `ok`/`warn`/`FAIL` line per dependency.
-
-`python tools/gsdev.py selftest` checks the per-platform browser path/flag logic.
-
-`python tools/gsdev.py tasks --run` checks the `.vscode` tasks resolve and runs the
-non-launching ones.
-
-## Measured (headless, this machine)
-
-| Step | Time |
-| --- | --- |
-| `build` only (incl. Python startup) | ~0.4 s (compiler itself ~15 ms) |
-| Cold: host launch → running | ~3–5 s (browser + 5.8 MB VM parse) |
-| Warm: `run` → running | ~1 s |
-| Warm: `run` → first `[LOG]` | ~1–2 s |
-
-## The loop
+## Fast iteration
 
 ```powershell
-# once per session: start the host and leave it running
-python tools/gsdev.py run --headless --leave-running
-
-# per change (same host, no cold start):
-python tools/gsdev.py run --headless --duration 2   # behavior + logs
+python tools/gsdev.py run --headless --duration 2 --leave-running   # keep the host warm
+python tools/gsdev.py get main.tx main.ty
+python tools/gsdev.py set_batch main.tx=120 main.ty=0               # one evaluation
 python tools/gsdev.py screenshot --headless --out debug/check.png
-python tools/gsdev.py run --headless --duration 3 --cpu 4   # phone-speed
 ```
 
-`--headless` is for agents. Omitting it (as the VS Code tasks do) opens a visible
-browser window using the real GPU.
+- **Prefer live variable edits for iteration.** Tune values with `set` and read the
+  effect on the next frame — no rebuild, reload, or browser restart. Only
+  rebuild/reload when the *code* changed (new/edited blocks, costumes, or `host.js`),
+  never just to try a new value.
+- **Prefer `set_batch` when changing several related values.** It evaluates them in
+  one go, so the VM cannot step between the writes; separate `set` calls are separate
+  evaluations and the VM can observe a half-updated state (a race).
+- `GSDEV_PROJECT=DIR` runs another project with the same host page.
+- `--no-build` only when source is unchanged; `run --no-reload` observes the loaded
+  project without building or loading. `stop` ends scripts; `close` ends the session
+  and its owned server.
+- Use explicit ports for independent hosts (CDP default 9230, HTTP 8077). `--port 0`
+  remembers its choice. A warm host with the wrong headed/headless mode must be
+  closed or moved to another port; inspect conflicts, never kill unrelated listeners.
 
-## Live tuning (fast iteration)
+## Repeatable unit tests
 
-Poke values into an already-running project and read the effect on the next frame
-— no rebuild, no reload. This is data injection (variables/lists), not code.
+- `test FILE...` builds/reloads each file's project, collects assertions and errors,
+  exits non-zero on failure, and saves a failure screenshot. `--artifacts DIR`
+  redirects images; `--json` gives a structured report.
+- `session --file PATH` runs verbs against an existing host (one command per line).
+  Use **UTF-8** files: PowerShell 5.1 pipes are not UTF-8, so use `--file` for CJK.
+  Quote `@` selectors in PowerShell.
+- Selectors: `sprite.variable`, `sprite.list[index]` (1-based), bare name = Stage
+  global; `sprite#N` = clone (indices stable only within a frame).
+- Prefer event-driven `wait_frame` / `wait_until` / `wait_pixel` (session spellings
+  `waitframe` / `waituntil` / `waitpixel`) to sleeps; condition waits fail on timeout.
+- `pause` / `step N` / `resume` control logical steps, not elapsed time: timer and
+  `wait` blocks still need real time. The host uses 30-Hz compatibility mode.
+- Input is VM-level: coordinates are Scratch coordinates (centre `0,0`, +x right,
+  +y up). Hold/release keys across frames for polling scripts.
+- Check `errors` / `expect_no_errors`, not just the log stream — captured errors
+  include VM/page exceptions and goboscript `error` logs. Yield in logging loops.
+- The root project and `smoke.txt` are the portable baseline. `examples/` and
+  `tests/` are local fixtures — do not assume they exist in a fresh checkout.
+
+## Inspection and debugging
+
+`inspect`, `props`, `prop`, and `clones` expose target state. `broadcast` starts
+hats; `broadcast_wait` waits for their threads (runtime must be running).
+`record` / `trace` capture frame-by-frame values and report overflow; `until …
+--pause` captures a matching frame. Prefer the `gsdev:frame` / `gsdev:render`
+events over repeated CDP polling.
+
+Pixel checks must account for sprite visibility, costume silhouettes, and renderer
+pixel alignment: pen widths 1 and 3 have a half-pixel rule, so do not apply a blanket
+offset; canvas-edge clicks are not equivalent to clicks strictly inside the stage.
+
+## Live-site checks
 
 ```powershell
-python tools/gsdev.py run --headless --duration 1 --leave-running
-python tools/gsdev.py get QuadFiller.res
-python tools/gsdev.py set QuadFiller.res 4
-python tools/gsdev.py set_batch main.dotx=0 main.doty=0   # several at once, atomically
-python tools/gsdev.py watch QuadFiller.drawcount --duration 2
+python tools/gsbridge.py run --target github --project . --headless --duration 6 --leave-running
+python tools/gsbridge.py get main.tx "@fps" "@gpu"
+python tools/gsbridge.py expect_no_errors
+python tools/gsbridge.py targets      # confirms the loaded project replaced the page's own
+python tools/gsbridge.py close
 ```
 
-`set_batch` applies all assignments in **one evaluate**, so the VM cannot step between
-them — use it instead of several `set`s whenever values must change together (there
-is a race with separate `set`s). Lists and `list[index]` work too.
+Targets are `localhost`, `github`, `editor`, `production` (`--project-id N`), and
+`url`. `--project DIR` / `--sb3 FILE` load a build; production loads what is already
+on the page. The bridge uses fresh isolated profiles (CDP 9400 default) and exposes a
+**subset** of gsdev — no `watch`/`record`/`until`/`step`/property tools. Per-draw
+profiling is off by default (`--perf on` enables it). Keep one session open only while
+needed, then `close`.
 
-Each command pays ~0.5 s of Python startup, so batch a sweep over one attach:
+`run` waits for the page's own project to load before replacing it, so the session is
+never a merge of the two: `targets` should list exactly `Stage` plus your sprites
+(re-load, never sprite deletion, if a page applies its project late). Live variable
+edits work on `github`/`editor`; key injection can depend on page focus, so verify with
+`get` rather than assuming it landed.
 
-```powershell
-@"
-set QuadFiller.res 2
-sleep 400
-watch 600 QuadFiller.drawcount QuadFiller.rendertime
-set QuadFiller.res 8
-sleep 400
-watch 600 QuadFiller.drawcount QuadFiller.rendertime
-"@ | python tools/gsdev.py session
-```
+## Measuring without fooling yourself
 
-Selectors are `sprite.variable`, `sprite.list[index]` (1-based), or a bare name
-for a Stage (global) variable. `set` replaces a whole variable/list, or a single
-element with an index. `watch` prints `[WATCH +Nms] name=value` samples plus a
-summary line. stdio is UTF-8, so non-ASCII (CJK) selectors/values round-trip
-through `set`/lists and piped `session`/`test` files (JSON escapes them as
-`\uXXXX`, which decodes to the original text).
+- `profile` counts executed-primitive operations per VM step and attributes them per
+  procedure and top-level script (`sum(self) + unattributed == total_ops`). It uses the
+  same wrapper as `setlogic on`, so it is intrusive: use it to find hotspots, never as
+  a timing verdict. `profile` streams one line per step by default (`--no-follow` for
+  the summary), `profiling` reprints the current report, `setprofiling on|off` is a
+  silent toggle, `profile --wait-until SEL --wait-op OP --wait-value V` starts the
+  window at an event, and `profilereset` opens one manually.
+- `@fps` / `@renderfps` are smoothed renderer-call rates, not physical display FPS or
+  elapsed time; `@stepfps` is the VM step rate. Pen/stamp times are **CPU
+  submission**, not GPU completion. `--software` is for behaviour, not performance.
+- Keep conditions equal when comparing runs (browser and version, headed vs headless,
+  GPU, stage size, inputs, background load) and discard modal-obscured runs rather than
+  trusting them. One machine's browser ranking generalises to nothing.
 
-Policy: use live edits for **small value/list changes**; **big logic changes
-require a full rebuild + reload** (structural script edits are not injected).
-Both reuse the same warm host — only the session's first start is cold.
+## Scratch compatibility
 
-## Performance runs
+Scratch 3 commonly stores bitmaps at **2×** with `bitmap_resolution = 2` (Scratch 2
+used `1`); scratch-vm honours it, so do not "fix" a rendering discrepancy by
+downsampling assets — check the actual project. TurboWarp-only options such as
+`high_quality_pen`, `frame_interpolation`, and custom clone limits must not be assumed
+to work on production Scratch.
 
-The **real GPU is used by default** so perf is representative; `--software` forces
-SwiftShader on GPU-less headless boxes, and `--cpu N` emulates an Nx slower CPU
-(e.g. `--cpu 4` ~ a phone; measured fps decays 30 → 13 with rendertime ~180 ms).
+## Fidelity notes
 
-## Input injection & tests
+- Semantics are upstream Scratch's (interpreter, no compiler).
+- The real GPU is used by default, including `--headless`; `--software` forces
+  ANGLE/SwiftShader (much slower) — trust behaviour there, not performance.
+- The host steps at 30-Hz compatibility. The audio engine is not attached, so
+  projects that use sound may need `scratch-audio`.
 
-Drive the running project like a test. Injection is VM-level (`postIOData`), so it
-is deterministic and works headless. Coordinates are Scratch stage coordinates
-(0,0 centre, +x right, +y up).
+## Cleanup
 
-```powershell
-python tools/gsdev.py mouse 0 0 --down   # press and hold
-python tools/gsdev.py mouse 0 0 --up
-python tools/gsdev.py click 0 0
-python tools/gsdev.py key space          # press and release
-python tools/gsdev.py key space --down   # hold
-```
-
-Batch a test over one connection with `session`; `expect` prints
-`[ASSERT ok|FAIL]` and the command exits non-zero if any expectation fails, so a
-session file doubles as a unit test:
-
-```powershell
-@"
-expect QuadFiller.res == 2
-click 0 0
-key space press
-set QuadFiller.res 4
-sleep 200
-expect QuadFiller.res == 4
-"@ | python tools/gsdev.py session
-```
-
-`expect` operators: `==`, `!=`, `>`, `<`, `>=`, `<=` (numeric when both sides
-parse as numbers, otherwise string). Needs the project running (`run --leave-running`).
-`set_batch a=1 b=2` writes several variables in **one** evaluate, so the VM cannot step
-between them (use it instead of two `set`s when a pair must change together).
-
-Colour checks: `pixel X Y` prints the stage colour at Scratch coords
-(`{"hex":"#000000","rgba":[...]}`); in `session`, `expectpixel X Y #rrggbb` asserts
-it. Accuracy is **exact (0 px error)**. Known pen offset: `scratch-render`'s
-`PenSkin` adds **+0.5 px** to pen widths **1 and 3** (Scratch 2.0 pixel-alignment;
-`PenSkin.js drawLine`), so a pen 1-px dot needs `hide` + a `-1` y compensation and
-a *zero-length* stroke (`pen_down; pen_up`), else it draws a 2-px line. A 1x1
-costume instead needs `+0.5` (it is centred on a pixel corner).
-
-Click hats: an `onclick` on both the stage and the sprite confirms the sprite hat
-fires on the button, the stage hat outside it (the stage is the fallback when
-nothing is hit), and `mouse_x()`/`mouse_y()` match the injected coords. Hit tests
-use the costume **silhouette**, not the bounding box. Clicks exactly on the canvas
-edge (±240, ±180) fire nothing — `mouse.js` requires the pixel to be strictly
-inside.
-
-`examples/` and `tests/` are **gitignored, local-only** fixture/demo material; the
-tracked end-to-end check is the root project plus `smoke.txt` (below). `GSDEV_PROJECT=DIR`
-runs another project with the same tools.
-
-## Deterministic time
-
-Prefer frames over sleeps: `frame` (counter), `wait_frame N [--timeout ms]`,
-`step N` (pauses and advances exactly N), `pause`, `resume`, `restart` (green flag
-again, keeps variables). Session verbs: `waitframe N [ms]`, `step N`, `pause`,
-`resume`, `restart`, `frame`. Manual stepping does not advance wall-clock, so
-`wait`/timer blocks need real time (`run`/`watch`).
-
-Prefer **events over polling**: the host dispatches `gsdev:frame` (step entry) and
-`gsdev:render` (draw complete) every frame. `record SELECTOR...` captures
-`[frame, ...values]` for every frame (contiguous; `--max` stops with an explicit
-`overflow` instead of dropping); `trace [--clear]` drains the rows; `until SELECTOR
-OP VALUE --pause` records the exact hit frame and optionally freezes there;
-`render` prints `{frame, rendered, frameEvents, renderEvents}`. `wait_frame` /
-`waitframe` resolve on the frame event (no polling), and the example tests use
-`waitframe` instead of `sleep`. In-page code can
-`window.addEventListener('gsdev:frame' | 'gsdev:render', …)`. Local-only unit
-tests (all headless): `python tests/test_time.py`, `tests/test_events.py`.
-
-`wait_until SELECTOR OP VALUE [--timeout ms]` and `wait_pixel X Y #rrggbb
-[--timeout ms]` resolve from `gsdev:render` (event-driven, no poll); a timeout
-exits 1. `wait_pixel` samples the pixel with one `gl.readPixels` per frame (not a
-full-stage snapshot). Session verbs: `waituntil sel op value [ms]`,
-`waitpixel x y #hex [ms]`. In `session --json`, `watch` returns its samples in the
-JSON result instead of printing `[WATCH]` rows.
-
-## Broadcasts, introspection & errors
-
-A broadcast is `runtime.startHats` — fire a message without a script:
-`broadcast NAME` starts the `on "NAME"` hats; `broadcast_wait NAME [ms]` fires and
-waits (event-driven, on `gsdev:render`) until every started thread finishes (needs
-the runtime running; a timeout exits 1). Session verbs: `broadcast NAME`,
-`broadcast_wait NAME [ms]`.
-
-Targets are named with an optional clone suffix: `main`, `main#1` (clone #1;
-indices are stable only within a frame). `inspect [TARGET]` dumps targets,
-variables, costumes, sounds, extensions; `props TARGET` prints properties;
-`prop TARGET NAME [VALUE]` reads/writes one (`x`,`y`,`direction`,`size`,`visible`,
-`costume`,`rotationStyle`,`draggable`,`layer front|back`); `clones` counts clones
-per sprite. The `#N` form works in `get`/`set`/`watch`/`expect` too.
-
-Errors: scratch-vm fires no error event, so the host wraps `_step` and listens for
-`window.onerror`/`unhandledrejection`. `errors` dumps `{count, logErrors, errors}`;
-`expect_no_errors` exits 1 if either is non-zero. `run` prints `[ERROR vm …]` for a
-thrown thread and `[ERROR <sprite> …]` for a goboscript `error` block.
-`run --no-reload` reuses the project already on the page (no build, no reload) to
-keep watching a live project. (Local-only fixtures/tests that exercise these live
-under the gitignored `examples/` and `tests/`.)
-
-## Test runner
-
-`python tools/gsdev.py test FILE... [--headless] [--json]` runs session files,
-reloading the project before each (the project is inferred from the file's
-directory when it has `goboscript.toml`, else `GSDEV_PROJECT` is used), collects
-asserts + errors, saves a screenshot to `debug/` on failure, prints a summary, and
-exits non-zero on failure. `--json` prints one report
-`{files:[{path,asserts,failures,errors,screenshot?}], totals:{files,asserts,failures}}`.
-`--artifacts DIR` redirects the screenshots. The tracked end-to-end check is the
-root project + `smoke.txt`: `run --leave-running` (logs), `session < smoke.txt`
-(injected input, pixel readback, and a live `set` observed via `expectpixel`),
-`pixel X Y` (CLI read), and `screenshot` (rendering). `tests/test_runner.py` is
-local-only.
-
-## Reading output
-
-- Log lines: `[LOG HH:MM:SS sprite] message`, plus `[WARN …]` / `[ERROR …]`.
-- `project stopped` means all threads ended.
-- Screenshots land in `debug/*.png` (stage only, gitignored).
-
-## Options that matter
-
-| Flag | Use |
-| --- | --- |
-| `--headless` | no browser window; **agents always pass this** |
-| `--duration S` | auto-stop after S seconds — **always bound agent runs** |
-| `--leave-running` | keep the project running for `get`/`set`/`watch` |
-| `--cpu N` | emulate an N× slower CPU (e.g. `4` ≈ a phone) |
-| `--software` | force software GL on headless boxes without a GPU |
-| `--no-build` | reuse the existing `.sb3` (only when `.gs` didn't change) |
-| `--no-reload` | `run`: reuse the project already on the page (no build/reload) |
-| `--json` | `session`/`test`: print one JSON object instead of human text |
-| `--artifacts DIR` | `test`: where to write failure screenshots (default `debug/`) |
-| `--port 0` | auto free port; parallel-safe |
-
-## Don'ts
-
-- Don't `close` between iterations — you pay the cold start again.
-- Don't run unbounded `run` as an agent; use `--duration` or it hangs.
-- Don't run agents non-headless; the visible window is for VS Code tasks only.
-- Keep a `wait` in any `log` loop, or the stream floods.
+Close the sessions you own when you are done; leave a host running if something else
+still needs it.

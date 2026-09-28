@@ -3,9 +3,9 @@
 Only the Python standard library is used, so screenshots and runtime inspection
 work on Windows and macOS without Node, Bun, or any pip package.
 
-The TurboWarp Desktop editor is a Chromium app; when it is started with
---remote-debugging-port it exposes a CDP HTTP endpoint and a per-page WebSocket.
-This module talks to that WebSocket directly.
+Chrome/Edge (any Chromium browser) exposes a CDP HTTP endpoint and a per-page
+WebSocket when started with --remote-debugging-port. This module talks to that
+WebSocket directly.
 """
 
 from __future__ import annotations

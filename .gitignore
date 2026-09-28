@@ -1,21 +1,33 @@
 # Build output and local state (machine-generated, never commit)
 *.sb3
 debug/
-tools/turbowarp-profile/
-tools/scratch-profile/
 tools/scratchvm-profile/
+tools/scratchvm-profiles/
 tools/scratchhost/node_modules/
+tools/scratchhost/vendor/
+/.tools/
 tools/.gsdev-port
-tools/.scratchvm-port
 __pycache__/
 
 # Local Kilo state (agent-manager sessions, local settings)
 /.kilo/
 
-# Local planning/handoff notes (not part of the shipped repo)
-handoffplan.md
-plan-*.md
+# Local planning/handoff notes (not part of the shipped repo).
+# Listed explicitly rather than with a blanket `*.md`: that pattern silently
+# dropped shipped docs such as tools/BENCHMARKS.md, and would swallow a future
+# LICENSE.md / CONTRIBUTING.md / docs/**. README.md, AGENTS.md and tools/*.md
+# are intended to ship.
+handoff*.md
 handover-*.md
+plan-*.md
+rtcfinding.md
+AGENTS-internal.md
+agents_staging.txt
+*_review.txt
+
+# Local perf-investigation reference screenshots
+rtc-cost.png
+write-test.png
 
 # Staged AGENTS.md content, applied at commit time (avoids per-edit prompts)
 agents_staging.txt
@@ -23,6 +35,32 @@ agents_staging.txt
 # Local-only fixture/demo projects and test suites (not part of the shipped repo)
 examples/
 tests/
+
+# Local investigation harnesses, kept on disk for further local work but never
+# shipped. None of these is referenced by the shipped docs or by gsdev/gsbridge:
+#   tools/blockcost          op-execution-cost inventory + RTC bench harness
+#   test_block_inventory     its offline drift check
+#   gsbench (+ tests)        fixed-work before/after benchmark; its verdicts
+#                            proved not actionable in practice
+#   benchmarks/assignment    the gsbench reference scenario
+tools/blockcost/
+tools/test_block_inventory.py
+tools/gsbench.py
+tools/gsbench.js
+tools/BENCHMARKS.md
+tools/test_gsbench.py
+tools/test_gsbench_js.cjs
+tools/benchmarks/assignment*
+
+# Maintainer-only checks, not used by end users or by agents iterating a project
+# (run them locally when changing the harness itself):
+#   test_perf_controls      perf-run setup (dialogs/occlusion/ports), no browser
+#   test_procedure_profile  profiler attribution invariant, end to end
+#   benchmarks/profiling    the fixture that test needs
+tools/test_perf_controls.py
+tools/test_procedure_profile.py
+tools/test_bridge_targets.py
+tools/benchmarks/profiling/
 
 # OS cruft
 .DS_Store

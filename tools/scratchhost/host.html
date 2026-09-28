@@ -2,14 +2,78 @@
 <html lang="en">
 <head>
   <meta charset="utf-8">
-  <title>scratch host</title>
+  <title>gsdev scratch host</title>
+  <style>
+    body { margin: 0; font: 13px/1.5 system-ui, sans-serif; background: #1e1e1e; color: #ddd; }
+    #hud { padding: 6px 10px; background: #111; border-bottom: 1px solid #333; }
+    #hud.error { background: #4a1010; color: #ffb4b4; }
+    #stage { display: block; margin: 10px; background: #fff; }
+  </style>
 </head>
 <body>
+  <div id="hud">gsdev host: loading&hellip;</div>
   <canvas id="stage" width="480" height="360"></canvas>
-  <script src="./node_modules/@scratch/scratch-vm/dist/web/scratch-vm.js"></script>
-  <script src="./node_modules/@scratch/scratch-render/dist/web/scratch-render.min.js"></script>
-  <script src="./node_modules/@scratch/scratch-storage/dist/web/scratch-storage.min.js"></script>
-  <script src="./node_modules/@scratch/scratch-svg-renderer/dist/web/scratch-svg-renderer.js"></script>
-  <script src="./host.js"></script>
+  <!--
+    The @scratch/* browser bundles are loaded at run time, not by the repo.
+    `python tools/gsdev.py setup` downloads them into ./vendor/@scratch; the
+    older npm install path puts them under ./node_modules/@scratch. Try vendor
+    first and fall back to node_modules, so either install works. The four
+    scripts must load in order (scratch-vm defines VirtualMachine, then
+    render/storage/svg, then host.js wires them together).
+  -->
+  <script>
+  (() => {
+    const hud = (text, isError) => {
+      const el = document.getElementById('hud');
+      if (!el) return;
+      el.textContent = text;
+      el.classList.toggle('error', !!isError);
+    };
+    window.__hostHud = hud;
+
+    const files = [
+      "/scratch-vm/dist/web/scratch-vm.js",
+      "/scratch-render/dist/web/scratch-render.min.js",
+      "/scratch-storage/dist/web/scratch-storage.min.js",
+      "/scratch-svg-renderer/dist/web/scratch-svg-renderer.js",
+    ];
+
+    const load = (src) => new Promise((resolve, reject) => {
+      const script = document.createElement('script');
+      script.src = src;
+      script.onload = resolve;
+      script.onerror = () => reject(new Error('failed to load ' + src));
+      document.head.appendChild(script);
+    });
+
+    const loadAll = async (base) => {
+      for (const file of files) await load(base + file);
+    };
+
+    (async () => {
+      const bases = ['./vendor/@scratch', './node_modules/@scratch'];
+      const errors = [];
+      let loaded = false;
+      for (const base of bases) {
+        try {
+          await loadAll(base);
+          loaded = true;
+          break;
+        } catch (error) {
+          errors.push(`${base}: ${error.message}`);
+        }
+      }
+      if (!loaded) {
+        // Report every location tried, not just the last, so a missing install
+        // reads as "no bundles anywhere" rather than "node_modules is broken".
+        window.__hostBundlesError =
+          `no @scratch/* bundles found (${errors.join('; ')}); run "setup.ps1"`;
+        hud(window.__hostBundlesError, true);
+        throw new Error(window.__hostBundlesError);
+      }
+      await load('./host.js');
+    })();
+  })();
+  </script>
 </body>
 </html>

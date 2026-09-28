@@ -2,12 +2,30 @@
     "version": "2.0.0",
     "tasks": [
         {
+            "label": "gobo-agent: Setup (download prebuilt tools, no admin)",
+            "type": "process",
+            "command": "${workspaceFolder}/setup.sh",
+            "args": [],
+            "windows": {
+                "command": "powershell",
+                "args": ["-NoProfile", "-ExecutionPolicy", "Bypass", "-File", "${workspaceFolder}/setup.ps1"]
+            },
+            "options": { "cwd": "${workspaceFolder}" },
+            "problemMatcher": [],
+            "presentation": { "reveal": "always", "panel": "dedicated", "clear": true }
+        },
+        {
             "label": "gobo-agent: Run (web, build + live logs)",
             "type": "process",
-            "command": "python3",
-            "windows": { "command": "python" },
-            "args": ["${workspaceFolder}/tools/gsdev.py", "run"],
+            "command": "${workspaceFolder}/tools/gsdev",
+            "args": ["run"],
+            "windows": {
+                "command": "powershell",
+                "args": ["-NoProfile", "-ExecutionPolicy", "Bypass", "-File", "${workspaceFolder}/tools/gsdev.ps1", "run"]
+            },
             "options": { "cwd": "${workspaceFolder}" },
+            "dependsOn": ["gobo-agent: Setup (download prebuilt tools, no admin)"],
+            "dependsOrder": "sequence",
             "group": { "kind": "build", "isDefault": true },
             "problemMatcher": [],
             "presentation": { "reveal": "always", "panel": "dedicated", "clear": true },
@@ -16,25 +34,37 @@
         {
             "label": "gobo-agent: Build",
             "type": "process",
-            "command": "python3",
-            "windows": { "command": "python" },
-            "args": ["${workspaceFolder}/tools/gsdev.py", "build"],
+            "command": "${workspaceFolder}/tools/gsdev",
+            "args": ["build"],
+            "windows": {
+                "command": "powershell",
+                "args": ["-NoProfile", "-ExecutionPolicy", "Bypass", "-File", "${workspaceFolder}/tools/gsdev.ps1", "build"]
+            },
             "options": { "cwd": "${workspaceFolder}" },
+            "dependsOn": ["gobo-agent: Setup (download prebuilt tools, no admin)"],
+            "dependsOrder": "sequence",
             "group": "build",
             "problemMatcher": []
         },
         {
             "label": "gobo-agent: Screenshot",
             "type": "process",
-            "command": "python3",
-            "windows": { "command": "python" },
+            "command": "${workspaceFolder}/tools/gsdev",
             "args": [
-                "${workspaceFolder}/tools/gsdev.py",
                 "screenshot",
                 "--out",
                 "${workspaceFolder}/debug/check.png"
             ],
+            "windows": {
+                "command": "powershell",
+                "args": [
+                    "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", "${workspaceFolder}/tools/gsdev.ps1",
+                    "screenshot", "--out", "${workspaceFolder}/debug/check.png"
+                ]
+            },
             "options": { "cwd": "${workspaceFolder}" },
+            "dependsOn": ["gobo-agent: Setup (download prebuilt tools, no admin)"],
+            "dependsOrder": "sequence",
             "group": { "kind": "test", "isDefault": true },
             "problemMatcher": [],
             "presentation": { "reveal": "always", "panel": "dedicated", "clear": true },
@@ -43,27 +73,36 @@
         {
             "label": "gobo-agent: Stop project",
             "type": "process",
-            "command": "python3",
-            "windows": { "command": "python" },
-            "args": ["${workspaceFolder}/tools/gsdev.py", "stop"],
+            "command": "${workspaceFolder}/tools/gsdev",
+            "args": ["stop"],
+            "windows": {
+                "command": "powershell",
+                "args": ["-NoProfile", "-ExecutionPolicy", "Bypass", "-File", "${workspaceFolder}/tools/gsdev.ps1", "stop"]
+            },
             "options": { "cwd": "${workspaceFolder}" },
             "problemMatcher": []
         },
         {
             "label": "gobo-agent: Close host",
             "type": "process",
-            "command": "python3",
-            "windows": { "command": "python" },
-            "args": ["${workspaceFolder}/tools/gsdev.py", "close"],
+            "command": "${workspaceFolder}/tools/gsdev",
+            "args": ["close"],
+            "windows": {
+                "command": "powershell",
+                "args": ["-NoProfile", "-ExecutionPolicy", "Bypass", "-File", "${workspaceFolder}/tools/gsdev.ps1", "close"]
+            },
             "options": { "cwd": "${workspaceFolder}" },
             "problemMatcher": []
         },
         {
             "label": "gobo-agent: Check dependencies",
             "type": "process",
-            "command": "python3",
-            "windows": { "command": "python" },
-            "args": ["${workspaceFolder}/tools/gsdev.py", "doctor"],
+            "command": "${workspaceFolder}/tools/gsdev",
+            "args": ["doctor"],
+            "windows": {
+                "command": "powershell",
+                "args": ["-NoProfile", "-ExecutionPolicy", "Bypass", "-File", "${workspaceFolder}/tools/gsdev.ps1", "doctor"]
+            },
             "options": { "cwd": "${workspaceFolder}" },
             "problemMatcher": [],
             "presentation": { "reveal": "always", "panel": "dedicated", "clear": true }

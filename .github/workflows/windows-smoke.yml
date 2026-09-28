@@ -1,0 +1,236 @@
+name: Windows smoke test
+
+# Clean-checkout, zero-admin install path: `setup` downloads prebuilt goboscript +
+# the @scratch/* browser bundles, so no Rust/MSVC/MSYS2/Node is needed. The
+# Node toolchain is removed from PATH for the run to prove the vendor path does
+# not touch it. The runner's preinstalled Edge is used as the host browser (no
+# browser install step).
+#
+# Three jobs: x64 (`windows`), the no-Python seamless path (`windows-no-python`),
+# and Windows on ARM64 (`windows-arm`), where the portable Python is native arm64
+# and goboscript's x64 build runs under Windows 11 x64 emulation.
+#
+# Caveat: GitHub-hosted Windows runners are administrators, so this approximates
+# a non-admin user rather than reproducing one. The steps assert that no
+# admin-only toolchain (VM compiler, Node) is used; a true non-admin check needs
+# a VM or Windows Sandbox.
+
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - "tools/**"
+      - "main.gs"
+      - "stage.gs"
+      - ".github/workflows/windows-smoke.yml"
+  pull_request:
+    paths:
+      - "tools/**"
+
+permissions:
+  contents: read
+
+jobs:
+  windows:
+    runs-on: windows-latest
+    timeout-minutes: 30
+    defaults:
+      run:
+        shell: pwsh
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Start from a clean, uninstalled checkout
+        run: |
+          Remove-Item -Recurse -Force .tools, tools/scratchhost/vendor -ErrorAction SilentlyContinue
+          if (Test-Path .tools) { throw ".tools should not exist" }
+          if (Test-Path tools/scratchhost/vendor) { throw "vendor should not exist" }
+
+      - name: Remove Node/npm (and Rust) from PATH
+        run: |
+          $filtered = ($env:PATH -split ';' | Where-Object {
+            $_ -and $_ -notmatch 'nodejs' -and $_ -notmatch 'npm' -and
+            $_ -notmatch '\\rust\\' -and $_ -notmatch 'cargo'
+          }) -join ';'
+          "PATH=$filtered" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+          if (Get-Command node -ErrorAction SilentlyContinue) { throw "node is still on PATH" }
+          if (Get-Command npm -ErrorAction SilentlyContinue) { throw "npm is still on PATH" }
+          if (Get-Command rustc -ErrorAction SilentlyContinue) { throw "rustc is still on PATH" }
+          Write-Output "node/npm/rustc are not on PATH"
+
+      - name: setup (downloads prebuilt tools)
+        run: python tools/gsdev.py setup
+
+      - name: doctor
+        run: python tools/gsdev.py doctor
+
+      - name: selftest
+        run: python tools/gsdev.py selftest
+
+      - name: build
+        run: python tools/gsdev.py build
+
+      - name: run + confirm logs
+        run: |
+          python tools/gsdev.py run --headless --software --duration 3 --leave-running |
+            Tee-Object -FilePath run.log
+          if (-not (Select-String -Path run.log -Pattern '\[LOG' -Quiet)) {
+            throw "no [LOG] lines in run.log"
+          }
+
+      - name: input + live edit + pixel (smoke.txt)
+        run: Get-Content smoke.txt | python tools/gsdev.py session
+
+      - name: get pixel (CLI)
+        run: |
+          python tools/gsdev.py pixel 0 0 | Tee-Object -FilePath pixel.json
+          if (-not (Select-String -Path pixel.json -Pattern '#4c97ff' -Quiet)) {
+            throw "unexpected stage colour"
+          }
+
+      - name: screenshot + confirm size
+        run: |
+          python tools/gsdev.py screenshot --headless --software --out debug/smoke.png
+          python -c "import struct; d=open('debug/smoke.png','rb').read(); assert d[:8]==b'\x89PNG\r\n\x1a\n'; w,h=struct.unpack('>II', d[16:24]); assert (w,h)==(480,360), (w,h); print('screenshot ok', w, h)"
+
+      - name: close
+        run: python tools/gsdev.py close
+
+      - name: tasks
+        run: python tools/gsdev.py tasks --run
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: windows-stage
+          path: |
+            debug/*.png
+            run.log
+          if-no-files-found: ignore
+
+  # The truly seamless path: no Python, no Node, nothing but the OS. `setup.ps1`
+  # fetches the portable Python (official embeddable zip) and then the tools;
+  # `gsdev.ps1` runs the loop with that interpreter. PowerShell (not .cmd) is
+  # used because group policy often blocks the command processor, so this is the
+  # path a locked-down machine takes.
+  windows-no-python:
+    runs-on: windows-latest
+    timeout-minutes: 30
+    defaults:
+      run:
+        shell: pwsh
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Remove Python, Node, and Rust from PATH
+        run: |
+          $filtered = ($env:PATH -split ';' | Where-Object {
+            $_ -and $_ -notmatch 'Python' -and $_ -notmatch 'pythoncore' -and
+            $_ -notmatch 'WindowsApps' -and
+            $_ -notmatch 'nodejs' -and $_ -notmatch 'npm' -and
+            $_ -notmatch '\\rust\\' -and $_ -notmatch 'cargo'
+          }) -join ';'
+          "PATH=$filtered" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+          foreach ($tool in 'python', 'node', 'npm', 'rustc') {
+            if (Get-Command $tool -ErrorAction SilentlyContinue) { throw "$tool is still on PATH" }
+          }
+          Write-Output "python/node/npm/rustc are not on PATH"
+
+      - name: Install the portable Python explicitly
+        run: |
+          powershell -NoProfile -ExecutionPolicy Bypass -File tools\get-python.ps1
+          $portable = Join-Path $env:GITHUB_WORKSPACE ".tools\python\python.exe"
+          if (-not (Test-Path $portable)) { throw "portable Python missing: $portable" }
+          "GSDEV_PYTHON=$portable" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+
+      - name: setup.ps1 installs the tools (portable Python)
+        run: powershell -NoProfile -ExecutionPolicy Bypass -File setup.ps1
+
+      - name: gsdev.ps1 runs on the portable Python
+        run: powershell -NoProfile -ExecutionPolicy Bypass -File tools\gsdev.ps1 doctor
+
+      - name: run headless
+        run: |
+          powershell -NoProfile -ExecutionPolicy Bypass -File tools\gsdev.ps1 run --headless --software --duration 3 |
+            Tee-Object -FilePath run-portable.log
+          if (-not (Select-String -Path run-portable.log -Pattern '\[LOG' -Quiet)) {
+            throw "no [LOG] lines from the portable-Python run"
+          }
+          powershell -NoProfile -ExecutionPolicy Bypass -File tools\gsdev.ps1 close
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: windows-portable
+          path: run-portable.log
+          if-no-files-found: ignore
+
+  # Windows on ARM64: the portable Python is the native arm64 embed build, and
+  # goboscript's x64 release runs under Windows 11's x64 emulation (goboscript
+  # publishes no Windows arm64 asset). Edge ARM64 is the host browser.
+  windows-arm:
+    runs-on: windows-11-arm
+    timeout-minutes: 30
+    defaults:
+      run:
+        shell: pwsh
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Show architecture
+        run: |
+          Write-Output "PROCESSOR_ARCHITECTURE=$env:PROCESSOR_ARCHITECTURE"
+          [Runtime.InteropServices.RuntimeInformation]::OSArchitecture
+
+      - name: Remove Python, Node, and Rust from PATH
+        run: |
+          $filtered = ($env:PATH -split ';' | Where-Object {
+            $_ -and $_ -notmatch 'Python' -and $_ -notmatch 'pythoncore' -and
+            $_ -notmatch 'WindowsApps' -and
+            $_ -notmatch 'nodejs' -and $_ -notmatch 'npm' -and
+            $_ -notmatch '\\rust\\' -and $_ -notmatch 'cargo'
+          }) -join ';'
+          "PATH=$filtered" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+          foreach ($tool in 'python', 'node', 'npm', 'rustc') {
+            if (Get-Command $tool -ErrorAction SilentlyContinue) { throw "$tool is still on PATH" }
+          }
+
+      - name: Install the portable (native arm64) Python explicitly
+        run: |
+          powershell -NoProfile -ExecutionPolicy Bypass -File tools\get-python.ps1
+          $portable = Join-Path $env:GITHUB_WORKSPACE ".tools\python\python.exe"
+          if (-not (Test-Path $portable)) { throw "portable Python missing: $portable" }
+          "GSDEV_PYTHON=$portable" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+
+      - name: Assert the portable interpreter is native arm64
+        run: |
+          $machine = (& $env:GSDEV_PYTHON -c "import platform;print(platform.machine())").Trim()
+          Write-Output "portable Python machine: $machine"
+          if ($machine -ne "ARM64") { throw "expected a native ARM64 Python, got '$machine'" }
+
+      - name: setup.ps1 (arm64 Python, x64 goboscript via emulation)
+        run: powershell -NoProfile -ExecutionPolicy Bypass -File setup.ps1
+
+      - name: doctor
+        run: powershell -NoProfile -ExecutionPolicy Bypass -File tools\gsdev.ps1 doctor
+
+      - name: build + run headless
+        run: |
+          powershell -NoProfile -ExecutionPolicy Bypass -File tools\gsdev.ps1 run --headless --software --duration 3 |
+            Tee-Object -FilePath run-arm.log
+          if (-not (Select-String -Path run-arm.log -Pattern '\[LOG' -Quiet)) {
+            throw "no [LOG] lines from the Windows arm64 run"
+          }
+          powershell -NoProfile -ExecutionPolicy Bypass -File tools\gsdev.ps1 close
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: windows-arm
+          path: run-arm.log
+          if-no-files-found: ignore
+
