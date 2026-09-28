@@ -48,13 +48,16 @@ function Get-GsdevPython {
         [pscustomobject]@{ Exe = "python"; Prefix = @() },
         [pscustomobject]@{ Exe = "py"; Prefix = @("-3") }
     )
-    foreach ($candidate in $candidates) {
-        if (-not (Get-Command $candidate.Exe -ErrorAction SilentlyContinue)) { continue }
-        if (Test-Python3 $candidate.Exe $candidate.Prefix) { return $candidate }
-    }
+    # A repo-local portable interpreter is pinned and CI-proven, so prefer it over
+    # whatever happens to be on PATH (this mirrors tools/python-env.sh; set
+    # GSDEV_PYTHON to force a different interpreter).
     $portable = Join-Path (Get-GsdevPythonDir) "python.exe"
     if (Test-Python3 $portable) {
         return [pscustomobject]@{ Exe = $portable; Prefix = @() }
+    }
+    foreach ($candidate in $candidates) {
+        if (-not (Get-Command $candidate.Exe -ErrorAction SilentlyContinue)) { continue }
+        if (Test-Python3 $candidate.Exe $candidate.Prefix) { return $candidate }
     }
     return $null
 }

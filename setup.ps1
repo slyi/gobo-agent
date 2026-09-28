@@ -57,6 +57,12 @@ if ($Offline) { $bootstrapArgs += "--offline" }
 $env:PYTHONUTF8 = "1"
 if (-not $env:PYTHONIOENCODING) { $env:PYTHONIOENCODING = "utf-8" }
 
-Write-Host ("[setup] using {0} {1}" -f $python.Exe, ($python.Prefix -join " "))
+# Show the interpreter that will actually run, resolving a bare PATH name.
+$shown = $python.Exe
+if ($python.Exe -notmatch '[\\/]') {
+    $found = Get-Command $python.Exe -ErrorAction SilentlyContinue
+    if ($found) { $shown = $found.Source }
+}
+Write-Host ("[setup] using {0} {1}" -f $shown, ($python.Prefix -join " "))
 & $python.Exe @($python.Prefix) $bootstrap @bootstrapArgs
 exit $LASTEXITCODE

@@ -57,6 +57,9 @@ jobs:
             $_ -notmatch '\\rust\\' -and $_ -notmatch 'cargo'
           }) -join ';'
           "PATH=$filtered" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+          # GITHUB_ENV only affects later steps, so mirror the filter here: the
+          # assertions below must check what the following steps will actually see.
+          $env:PATH = $filtered
           if (Get-Command node -ErrorAction SilentlyContinue) { throw "node is still on PATH" }
           if (Get-Command npm -ErrorAction SilentlyContinue) { throw "npm is still on PATH" }
           if (Get-Command rustc -ErrorAction SilentlyContinue) { throw "rustc is still on PATH" }
@@ -135,6 +138,9 @@ jobs:
             $_ -notmatch '\\rust\\' -and $_ -notmatch 'cargo'
           }) -join ';'
           "PATH=$filtered" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+          # GITHUB_ENV only affects later steps, so mirror the filter here: the
+          # assertions below must check what the following steps will actually see.
+          $env:PATH = $filtered
           foreach ($tool in 'python', 'node', 'npm', 'rustc') {
             if (Get-Command $tool -ErrorAction SilentlyContinue) { throw "$tool is still on PATH" }
           }
@@ -195,6 +201,9 @@ jobs:
             $_ -notmatch '\\rust\\' -and $_ -notmatch 'cargo'
           }) -join ';'
           "PATH=$filtered" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+          # GITHUB_ENV only affects later steps, so mirror the filter here: the
+          # assertions below must check what the following steps will actually see.
+          $env:PATH = $filtered
           foreach ($tool in 'python', 'node', 'npm', 'rustc') {
             if (Get-Command $tool -ErrorAction SilentlyContinue) { throw "$tool is still on PATH" }
           }
