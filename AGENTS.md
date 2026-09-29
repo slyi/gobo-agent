@@ -51,8 +51,13 @@ python tools/gsdev.py screenshot --headless --out debug/check.png
 ## Repeatable unit tests
 
 - `test FILE...` builds/reloads each file's project, collects assertions and errors,
-  exits non-zero on failure, and saves a failure screenshot. `--artifacts DIR`
-  redirects images; `--json` gives a structured report.
+  exits non-zero on failure, and writes a failure bundle under `--artifacts DIR`
+  (manifest, failures with captured state, events, reproduction, optional stage image);
+  `--json` gives a structured report including each bundle path.
+- `session --events PATH` writes versioned assertion records as JSONL and
+  `session --bundle` assembles the same failure bundle from a standing host. A
+  `capture SELECTOR...` line reads that state together with the next `expect` in one
+  evaluation, so a bundle shows assertion-time state, never a later re-read.
 - `session --file PATH` runs verbs against an existing host (one command per line).
   Use **UTF-8** files: PowerShell 5.1 pipes are not UTF-8, so use `--file` for CJK.
   Quote `@` selectors in PowerShell.

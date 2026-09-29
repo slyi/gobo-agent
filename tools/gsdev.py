@@ -1427,33 +1427,68 @@ def cmd_watch(args: argparse.Namespace) -> int:
     return 0
 
 
-def run_session_lines(cdp: CDP, lines, quiet: bool = False) -> dict:
+SESSION_SCHEMA = 1
+
+
+def run_session_lines(cdp: CDP, lines, quiet: bool = False,
+                      event_sink=None) -> dict:
     """Run session lines over one open CDP connection.
 
     Prints the same ``[ASSERT ...]`` / ``[gsdev] ...`` output as the ``session``
     command and returns ``{"asserts": [{"ok", "msg"}], "failures": N}`` where
     ``failures`` counts every failed assertion and every timeout/error verb.
+
+    ``event_sink`` (a callable) receives one versioned structured record per
+    assertion plus a final ``session_end``, written as the run proceeds, so a parent
+    can assemble a failure bundle without scraping stdout or re-reading the page.
+
+    A ``capture SELECTOR...`` line declares extra state to read together with the
+    following ``expect``, in the same synchronous in-page evaluation, so a bundle
+    shows assertion-time state rather than a later (drifting) re-read.
     """
     failures = 0
     asserts = []
     watches = []
+    captures = []
+    started = time.time()
+    current_line = 0
 
-    def record(ok: bool, message: str) -> None:
+    def emit(rec: dict) -> None:
+        if event_sink is None:
+            return
+        rec.setdefault("schema", SESSION_SCHEMA)
+        try:
+            event_sink(rec)
+        except (OSError, TypeError, ValueError):
+            pass
+
+    def record(ok: bool, message: str, **extra) -> None:
         nonlocal failures
         if not ok:
             failures += 1
         if not quiet:
             print(f"[ASSERT {'ok' if ok else 'FAIL'}] {message}", flush=True)
         asserts.append({"ok": ok, "msg": message})
+        rec = {"kind": "assert", "ok": ok, "msg": message, "ts": time.time(),
+               "seq": len(asserts)}
+        rec.update(extra)
+        rec.setdefault("line", current_line)
+        emit(rec)
 
     try:
-        for raw in lines:
+        for lineno, raw in enumerate(lines, 1):
+            current_line = lineno
             line = raw.strip()
             if not line or line.startswith("#"):
                 continue
             parts = line.split()
             op = parts[0].lower()
-            if op == "set" and len(parts) >= 3:
+            if op == "capture" and len(parts) >= 2:
+                for selector in parts[1:]:
+                    if selector not in captures:
+                        captures.append(selector)
+                log(json.dumps({"capture": captures}))
+            elif op == "set" and len(parts) >= 3:
                 target, name, index = parse_selector(parts[1])
                 value = parse_value(" ".join(parts[2:]))
                 result = cdp.evaluate(_var_js(target, name, index, value))
@@ -1502,10 +1537,22 @@ def run_session_lines(cdp: CDP, lines, quiet: bool = False) -> dict:
             elif op == "expect" and len(parts) >= 4:
                 selector, operator = parts[1], parts[2]
                 expected = parse_value(" ".join(parts[3:]))
-                actual = cdp.evaluate(select_js(selector)).get("value")
+                extra_selectors = [s for s in captures if s != selector]
+                if extra_selectors:
+                    # One synchronous evaluation: assertion + declared state together.
+                    res = cdp.evaluate(
+                        _assert_capture_js(selector, extra_selectors)) or {}
+                    actual = (res.get("actual") or {}).get("value")
+                    capture = {"source": res.get("actual")}
+                    capture.update(res.get("capture") or {})
+                else:
+                    actual = cdp.evaluate(select_js(selector)).get("value")
+                    capture = None
                 record(
                     compare(actual, operator, expected),
                     f"{selector} {operator} {expected!r} (actual {actual!r})",
+                    selector=selector, operator=operator, expected=expected,
+                    actual=actual, capture=capture,
                 )
             elif op == "pixel" and len(parts) >= 3:
                 result = json.loads(
@@ -1517,9 +1564,19 @@ def run_session_lines(cdp: CDP, lines, quiet: bool = False) -> dict:
                 actual = json.loads(
                     cdp.evaluate(pixel_js(float(parts[1]), float(parts[2])), await_promise=True, timeout=30)
                 ).get("hex", "")
+                ok = actual.lower() == expected
+                capture = None
+                atomic = None
+                if not ok and captures:
+                    # A pixel read is a promise, so pixel-failure captures are read
+                    # separately; label that they are not simultaneous.
+                    capture = cdp.evaluate(_capture_js(captures)) or {}
+                    atomic = False
                 record(
-                    actual.lower() == expected,
+                    ok,
                     f"pixel {parts[1]} {parts[2]} == {expected} (actual {actual})",
+                    selector=f"pixel {parts[1]} {parts[2]}", expected=expected,
+                    actual=actual, capture=capture, capture_atomic=atomic,
                 )
             elif op == "frame" and len(parts) == 1:
                 log(json.dumps({"frame": current_frame(cdp)}))
@@ -1658,12 +1715,132 @@ def run_session_lines(cdp: CDP, lines, quiet: bool = False) -> dict:
                                   f"{parts[3].lower()} timed out")
             else:
                 log(f"session: unknown command {line!r}")
+        emit({"kind": "session_end", "failures": failures, "asserts": len(asserts),
+              "elapsed": round(time.time() - started, 3)})
     finally:
         try:
             cdp.evaluate(STOP_WATCH_JS)
         except (CDPError, TimeoutError, OSError):
             pass
     return {"asserts": asserts, "failures": failures, "watches": watches}
+
+
+def _capture_js(selectors) -> str:
+    entries = ", ".join(f"{json.dumps(s)}: {select_js(s)}" for s in selectors)
+    return f"({{ {entries} }})"
+
+
+def _assert_capture_js(selector: str, extra_selectors) -> str:
+    caps = ", ".join(f"{json.dumps(s)}: {select_js(s)}" for s in extra_selectors)
+    return f"(() => ({{ actual: {select_js(selector)}, capture: {{ {caps} }} }}))()"
+
+
+def _event_writer(path: str):
+    """Open a JSONL sink that flushes each record, for crash/timeout survival."""
+    handle = open(path, "w", encoding="utf-8")
+
+    def write(record: dict) -> None:
+        handle.write(json.dumps(record, separators=(",", ":")) + "\n")
+        handle.flush()
+
+    write.close = handle.close
+    return write
+
+
+def _read_events(path: str) -> list[dict]:
+    records = []
+    try:
+        text = Path(path).read_text(encoding="utf-8")
+    except OSError:
+        return records
+    for line in text.splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            records.append(json.loads(line))
+        except ValueError:
+            # An interrupted final write is expected after a timeout or crash.
+            continue
+    return records
+
+
+def _atomic_write(path: Path, data: bytes) -> None:
+    tmp = path.with_name(path.name + ".tmp")
+    tmp.write_bytes(data)
+    os.replace(tmp, path)
+
+
+BUNDLE_SCHEMA = 1
+
+
+def assemble_bundle(*, artifacts: Path, label: str, events, session_path: str,
+                    project_root: Path, sb3_path: Path | None,
+                    screenshot: bytes | None = None, errors: int = 0,
+                    partial: bool = False) -> Path:
+    """Write a failure bundle from the session's structured records.
+
+    Built only from records captured at assertion time; never re-reads the page. An
+    incomplete trailing record (timeout/crash) is tolerated, and a truncated event
+    stream marks the bundle ``partial``.
+    """
+    stamp = time.strftime("%Y%m%d-%H%M%S")
+    bundle = artifacts / f"{label}-failure-{stamp}"
+    suffix = 1
+    while bundle.exists():
+        bundle = artifacts / f"{label}-failure-{stamp}-{suffix}"
+        suffix += 1
+    bundle.mkdir(parents=True)
+    asserts = [e for e in events if isinstance(e, dict) and e.get("kind") == "assert"]
+    failed = [e for e in asserts if not e.get("ok")]
+    ends = [e for e in events if isinstance(e, dict) and e.get("kind") == "session_end"]
+    if ends and int(ends[-1].get("failures") or 0) != len(failed):
+        partial = True
+    state = {}
+    for e in failed:
+        capture = e.get("capture")
+        if isinstance(capture, dict):
+            state.update(capture)
+    build = {}
+    if sb3_path and sb3_path.exists():
+        try:
+            build = {"sb3": sb3_path.name, "bytes": sb3_path.stat().st_size,
+                     "sha256": hashlib.sha256(sb3_path.read_bytes()).hexdigest()[:16]}
+        except OSError:
+            build = {"sb3": sb3_path.name}
+    manifest = {
+        "schema": BUNDLE_SCHEMA, "kind": "failure-bundle",
+        "created": time.strftime("%Y-%m-%dT%H:%M:%S"), "partial": bool(partial),
+        "category": "assertion" if failed else ("error" if errors else "unknown"),
+        "session": session_path, "project": str(project_root), "build": build,
+        "failures": len(failed), "errors": int(errors), "asserts": len(asserts),
+        "artifacts": {"manifest": "manifest.json", "failures": "failures.json",
+                      "state": "state.json", "events": "events.jsonl",
+                      "reproduction": "reproduction.txt"},
+    }
+    _atomic_write(bundle / "failures.json",
+                  (json.dumps(failed, indent=2) + "\n").encode("utf-8"))
+    _atomic_write(bundle / "state.json",
+                  (json.dumps(state, indent=2) + "\n").encode("utf-8"))
+    _atomic_write(bundle / "events.jsonl",
+                  "".join(json.dumps(e, separators=(",", ":")) + "\n"
+                          for e in events).encode("utf-8"))
+    _atomic_write(bundle / "reproduction.txt", (
+        f"# reproduction\nproject: {project_root}\nsession: {session_path}\n"
+        f"build:   {build.get('sb3', 'n/a')}\n\n"
+        "# warm host:\n"
+        "python tools/gsdev.py run --headless --leave-running\n"
+        f"python tools/gsdev.py session --file \"{session_path}\"\n"
+    ).encode("utf-8"))
+    if screenshot:
+        try:
+            _atomic_write(bundle / "stage.png", screenshot)
+            manifest["artifacts"]["stage"] = "stage.png"
+        except OSError:
+            manifest["stage_capture_error"] = True
+    _atomic_write(bundle / "manifest.json",
+                  (json.dumps(manifest, indent=2) + "\n").encode("utf-8"))
+    return bundle
 
 
 def cmd_session(args: argparse.Namespace) -> int:
@@ -1688,11 +1865,23 @@ def cmd_session(args: argparse.Namespace) -> int:
     fails, so a session file doubles as a unit test. `--json` prints a structured
     result instead of the per-line logs.
     """
+    artifacts = Path(args.artifacts).expanduser() if getattr(args, "artifacts", "") else DEBUG_DIR
+    if not artifacts.is_absolute():
+        artifacts = PROJECT_ROOT / artifacts
+    want_bundle = bool(getattr(args, "bundle", False))
+    events_path = getattr(args, "events", "") or ""
+    if want_bundle and not events_path:
+        artifacts.mkdir(parents=True, exist_ok=True)
+        events_path = str(artifacts / f"session-{os.getpid()}.events.jsonl")
+    sink = _event_writer(events_path) if events_path else None
+    source = getattr(args, "file", None)
     cdp = open_live_cdp(args.port)
     if cdp is None:
+        if sink:
+            sink.close()
         return 1
+    bundle_path = None
     try:
-        source = getattr(args, "file", None)
         if source:
             # UTF-8 file input: PowerShell 5.1 pipes native-command input as the
             # legacy code page and destroys CJK before Python can read it.
@@ -1702,11 +1891,38 @@ def cmd_session(args: argparse.Namespace) -> int:
             if os.name == "nt":
                 log("[hint] PowerShell 5.1 pipes are not UTF-8; use `session --file PATH` "
                     "for non-ASCII (CJK) selectors/values")
-        result = run_session_lines(cdp, stream, quiet=JSON_MODE)
+        result = run_session_lines(cdp, stream, quiet=JSON_MODE, event_sink=sink)
+        if sink:
+            sink.close()
+        if want_bundle and result["failures"]:
+            src = Path(source) if source else None
+            root = project_for_test(src) if src else PROJECT_ROOT
+            try:
+                screenshot = capture_stage_png(cdp)
+            except Exception:  # noqa: BLE001
+                screenshot = None
+            try:
+                bundle_path = assemble_bundle(
+                    artifacts=artifacts, label=(src.stem if src else "session"),
+                    events=_read_events(events_path),
+                    session_path=str(src) if src else "<stdin>",
+                    project_root=root, sb3_path=root / (root.name + ".sb3"),
+                    screenshot=screenshot)
+                log(f"bundle: {bundle_path}")
+            except OSError as error:
+                log(f"bundle: capture failed ({error}); original failure stands")
     finally:
+        if sink is not None:
+            try:
+                sink.close()
+            except OSError:
+                pass
         cdp.close()
     if JSON_MODE:
-        print(json.dumps({"session": result}, separators=(",", ":")), flush=True)
+        payload = {"session": result}
+        if bundle_path:
+            payload["bundle"] = str(bundle_path)
+        print(json.dumps(payload, separators=(",", ":")), flush=True)
     return 1 if result["failures"] else 0
 
 
@@ -1758,8 +1974,13 @@ def cmd_test(args: argparse.Namespace) -> int:
         finally:
             cdp.close()
         env = dict(os.environ, GSDEV_PROJECT=str(root))
+        artifacts.mkdir(parents=True, exist_ok=True)
+        events_path = artifacts / (
+            f"{path.stem}-{hashlib.sha1(str(path.resolve()).encode('utf-8')).hexdigest()[:8]}"
+            ".events.jsonl")
         proc = subprocess.run(
-            [sys.executable, str(Path(__file__).resolve()), "session", "--port", str(args.port)],
+            [sys.executable, str(Path(__file__).resolve()), "session",
+             "--port", str(args.port), "--events", str(events_path)],
             input=path.read_text(encoding="utf-8"),
             capture_output=True, text=True, encoding="utf-8", errors="replace",
             env=env, timeout=args.timeout,
@@ -1767,7 +1988,14 @@ def cmd_test(args: argparse.Namespace) -> int:
         output = (proc.stdout or "") + (proc.stderr or "")
         if not JSON_MODE:
             print(output, end="", flush=True)
-        entry["asserts"] = parse_asserts(output)
+        events = _read_events(str(events_path))
+        records = [e for e in events if e.get("kind") == "assert"]
+        if records:
+            entry["asserts"] = [{"ok": bool(e.get("ok")), "msg": e.get("msg", "")}
+                                for e in records]
+        else:
+            # No event stream (older session, or none written): fall back to text.
+            entry["asserts"] = parse_asserts(output)
         entry["failures"] = sum(1 for item in entry["asserts"] if not item["ok"])
         cdp = open_host(args.port)
         if cdp is None:
@@ -1782,11 +2010,25 @@ def cmd_test(args: argparse.Namespace) -> int:
                     "step_ms": round(float(perf.get("steptimeAvg") or 0.0), 2),
                 }
                 failed = entry["failures"] > 0 or entry["errors"] > 0 or proc.returncode != 0
-                if failed and not args.no_screenshots:
-                    artifacts.mkdir(parents=True, exist_ok=True)
-                    screenshot = artifacts / f"{path.stem}-fail.png"
-                    screenshot.write_bytes(capture_stage_png(cdp))
-                    entry["screenshot"] = str(screenshot)
+                if failed:
+                    screenshot = None
+                    if not args.no_screenshots:
+                        try:
+                            screenshot = capture_stage_png(cdp)
+                        except Exception:  # noqa: BLE001
+                            screenshot = None
+                    try:
+                        bundle = assemble_bundle(
+                            artifacts=artifacts, label=path.stem, events=events,
+                            session_path=str(path), project_root=root,
+                            sb3_path=sb3_path, screenshot=screenshot,
+                            errors=entry["errors"])
+                        entry["bundle"] = str(bundle)
+                        if screenshot:
+                            entry["screenshot"] = str(bundle / "stage.png")
+                    except OSError as error:
+                        # The original failure must stay the headline.
+                        entry["bundle_error"] = str(error)
             finally:
                 cdp.close()
         any_failed = any_failed or failed
@@ -3333,6 +3575,18 @@ def build_parser() -> argparse.ArgumentParser:
         "--file",
         help="read the session script from this UTF-8 file instead of stdin "
              "(recommended on PowerShell 5.1, whose pipes are not UTF-8)",
+    )
+    session.add_argument(
+        "--events", default="",
+        help="write versioned structured assertion records (JSONL) to this path",
+    )
+    session.add_argument(
+        "--bundle", action="store_true",
+        help="assemble a failure bundle under --artifacts when an assertion fails",
+    )
+    session.add_argument(
+        "--artifacts", default="",
+        help="artifact root for --bundle (default debug/)",
     )
     session.set_defaults(func=cmd_session)
 

@@ -118,6 +118,7 @@ expect_no_errors
 ```powershell
 python tools/gsdev.py run --headless --duration 2 --leave-running
 python tools/gsdev.py session --file tests.txt          # exits non-zero on failure
+python tools/gsdev.py session --file tests.txt --bundle # + failure bundle under debug/
 python tools/gsdev.py test tests.txt --headless --json  # builds each file's project
 ```
 
