@@ -71,6 +71,7 @@
         hud(window.__hostBundlesError, true);
         throw new Error(window.__hostBundlesError);
       }
+      await load('./profiler.js');
       await load('./host.js');
     })();
   })();

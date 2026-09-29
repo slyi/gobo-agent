@@ -12,9 +12,14 @@ __pycache__/
 # Local Kilo state (agent-manager sessions, local settings)
 /.kilo/
 
+# Archived local-only plans, handoffs and deprecated investigation harnesses
+# (moved out of the working tree; never shipped)
+archive/
+
+
 # Local planning/handoff notes (not part of the shipped repo).
 # Listed explicitly rather than with a blanket `*.md`: that pattern silently
-# dropped shipped docs such as tools/BENCHMARKS.md, and would swallow a future
+# dropped shipped docs such as tools/*.md, and would swallow a future
 # LICENSE.md / CONTRIBUTING.md / docs/**. README.md, AGENTS.md and tools/*.md
 # are intended to ship.
 handoff*.md
@@ -22,35 +27,16 @@ handover-*.md
 plan-*.md
 rtcfinding.md
 AGENTS-internal.md
-agents_staging.txt
 *_review.txt
 
-# Local perf-investigation reference screenshots
-rtc-cost.png
-write-test.png
-
-# Staged AGENTS.md content, applied at commit time (avoids per-edit prompts)
-agents_staging.txt
+# Local perf-investigation reference screenshots now live in archive/ (see above).
 
 # Local-only fixture/demo projects and test suites (not part of the shipped repo)
 examples/
 tests/
 
-# Local investigation harnesses, kept on disk for further local work but never
-# shipped. None of these is referenced by the shipped docs or by gsdev/gsbridge:
-#   tools/blockcost          op-execution-cost inventory + RTC bench harness
-#   test_block_inventory     its offline drift check
-#   gsbench (+ tests)        fixed-work before/after benchmark; its verdicts
-#                            proved not actionable in practice
-#   benchmarks/assignment    the gsbench reference scenario
-tools/blockcost/
-tools/test_block_inventory.py
-tools/gsbench.py
-tools/gsbench.js
-tools/BENCHMARKS.md
-tools/test_gsbench.py
-tools/test_gsbench_js.cjs
-tools/benchmarks/assignment*
+# Deprecated investigation harnesses (blockcost, gsbench, benchmarks/assignment)
+# now live under archive/ above; keep them out of the working tree.
 
 # Maintainer-only checks, not used by end users or by agents iterating a project
 # (run them locally when changing the harness itself):
@@ -60,9 +46,16 @@ tools/benchmarks/assignment*
 tools/test_perf_controls.py
 tools/test_procedure_profile.py
 tools/test_bridge_targets.py
+tools/test_profiler_aggregation.py
+tools/measure_overhead.py
 tools/benchmarks/profiling/
+tools/benchmarks/hatsAgg/
+tools/benchmarks/cloneAgg/
 
 # OS cruft
 .DS_Store
 Thumbs.db
 desktop.ini
+tools/benchmarks/waitsAgg/
+tools/test_profiler_waits.py
+profiler-handover.md

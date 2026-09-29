@@ -11,12 +11,12 @@ Targets:
 A React-fiber walk discovers the VM on every page, then a small bridge is
 injected that mirrors the capability surface of tools/scratchhost/host.js:
 live variable/list edits, mouse/key input, screenshots, getpixel, and goboscript
-log/warn/error capture -- plus a frame counter and a small perf snapshot.
-
-Per-draw profiling is OPT-IN (`run --perf on`): it wraps every pen/stamp call, so
-it is off by default to keep overhead equal across targets (and never stacks on the
-localhost host's own profiling, which is turned off for the run). `errors` and
-`expect_no_errors` count goboscript `error` blocks, not only VM exceptions.
+log/warn/error capture -- plus a frame counter and a small perf snapshot (fps and
+steptime). It also wires the shared procedure profiler (`profile`, `profiling`,
+`setprofiling`, `profilereset`) from `scratchhost/profiler.js`, the same module the
+local host loads, so per-procedure attribution and Draws/step work here too.
+`errors` and `expect_no_errors` count goboscript `error` blocks, not only VM
+exceptions.
 
 A `run` refuses a port that already has a host (no silent reuse of a previous
 session), and `close` only shuts down the browser the bridge launched -- never the
@@ -63,7 +63,7 @@ from gsdev import (  # noqa: E402
     dismiss_browser_dialogs,
     ensure_host_server,
     free_port,
-    is_browser_dialog,
+    input_key_name,
     list_targets,
 )
 
@@ -113,13 +113,7 @@ BRIDGE_JS = r"""
   const st = { frame: 0, frameEvents: 0, renderEvents: 0, logs: [], errors: [], stopped: false,
                projectLoaded: 0,
                lastStepAt: 0, stepInterval: 0, lastRenderAt: 0, renderInterval: 0, stepAt: 0,
-               rendertime: 0, steptime: 0, marks: [],
-               pen: 0, stamps: 0, penMs: 0, stampMs: 0, logSeq: 0, logErrors: 0 };
-  // Per-draw (pen/stamp) profiling is opt-in: it adds a timing call around every
-  // draw, which is unequal overhead across targets and would stack on top of a
-  // localhost host that already profiles. Set window.__bridgeOpts.perf = true
-  // (gsbridge `run --perf on`) BEFORE the bridge is first injected.
-  const perfOn = !!(window.__bridgeOpts && window.__bridgeOpts.perf);
+               rendertime: 0, steptime: 0, rendered: 0, marks: [], logSeq: 0, logErrors: 0 };
 
   // --- goboscript log/warn/error capture (same proccode trick as host.js) ---
   try {
@@ -165,7 +159,6 @@ BRIDGE_JS = r"""
       const now = performance.now();
       if (st.lastStepAt) { const dt = now - st.lastStepAt; st.stepInterval = st.stepInterval ? st.stepInterval * 0.9 + dt * 0.1 : dt; }
       st.lastStepAt = now; st.stepAt = now;
-      st.pen = 0; st.stamps = 0; st.penMs = 0; st.stampMs = 0;
       try { window.dispatchEvent(new CustomEvent('gsbridge:frame', { detail: { frame: st.frame } })); } catch (e) {}
       try { return orig.apply(this, a); }
       catch (e) { recordError('vm', (e && e.stack) || e); return undefined; }
@@ -182,38 +175,23 @@ BRIDGE_JS = r"""
       st.lastRenderAt = now;
       st.rendertime = st.stepAt ? now - st.stepAt : 0;
       st.renderEvents += 1;
+      st.rendered = st.frame;
       try { window.dispatchEvent(new CustomEvent('gsbridge:render', { detail: { frame: st.frame } })); } catch (e) {}
       return r;
     };
     wrapped.__bridge = true; renderer.draw = wrapped;
   }
-  // pen/stamp counters (mirror host.js): stamp = penStamp call, pen = PenSkin.drawLine.
-  // Only installed when profiling is opted in, so default runs carry no per-draw
-  // overhead (and don't stack on the localhost host's own profiling).
-  if (perfOn) {
-    const wrapSkin = skin => {
-      if (!skin || typeof skin.drawLine !== 'function' || skin.drawLine.__bridgePen) return;
-      const o = skin.drawLine;
-      const w = function (...a) { const t = performance.now(); const r = o.apply(this, a); st.pen += 1; st.penMs += performance.now() - t; return r; };
-      w.__bridgePen = true; skin.drawLine = w;
-    };
-    try {
-      if (renderer && typeof renderer.penStamp === 'function' && !renderer.penStamp.__bridgeStamp) {
-        const o = renderer.penStamp;
-        const w = function (...a) { const t = performance.now(); const r = o.apply(this, a); st.stamps += 1; st.stampMs += performance.now() - t; return r; };
-        w.__bridgeStamp = true; renderer.penStamp = w;
-      }
-      if (renderer && typeof renderer.createPenSkin === 'function' && !renderer.createPenSkin.__bridge) {
-        const o = renderer.createPenSkin;
-        const w = function (...a) { const id = o.apply(this, a); wrapSkin(this._allSkins && this._allSkins[id]); return id; };
-        w.__bridge = true; renderer.createPenSkin = w;
-      }
-      if (renderer) { for (const skin of (renderer._allSkins || [])) wrapSkin(skin); }
-    } catch (e) {}
-  }
 
   try { vm.on('PROJECT_RUN_STOP', () => { st.stopped = true; st.logs.push({ seq: ++st.logSeq, sprite: 'vm', level: 'stop', value: 'project stopped', frame: st.frame }); }); } catch (e) {}
   try { vm.on('PROJECT_LOADED', () => { st.projectLoaded += 1; }); } catch (e) {}
+
+  // Procedure profiling reuses the shared module (scratchhost/profiler.js, injected
+  // just before this bridge). It installs its own runtime/primitive/pen hooks, so the
+  // bridge only re-exposes the API below.
+  let profiler = null;
+  try {
+    if (window.GsdevProfiler && renderer) profiler = window.GsdevProfiler({ runtime: rt, renderer });
+  } catch (e) {}
 
   const findTarget = name => {
     if (name === null || name === undefined) return null;
@@ -268,19 +246,22 @@ BRIDGE_JS = r"""
       gpu = gl ? String(ext ? gl.getParameter(ext.UNMASKED_RENDERER_WEBGL) : gl.getParameter(gl.RENDERER)) : '';
       software = /swiftshader|software|llvmpipe|basic render|mesa offscreen/i.test(gpu);
     } catch (e) {}
-    return { frame: st.frame, fps: st.renderInterval ? 1000 / st.renderInterval : 0,
+    return { frame: st.frame, rendered: st.rendered,
+             fps: st.renderInterval ? 1000 / st.renderInterval : 0,
              stepfps: st.stepInterval ? 1000 / st.stepInterval : 0,
              rendertime: st.rendertime, steptime: st.steptime,
-             drawcount: st.pen, stamps: st.stamps, pentime: st.penMs, stamptime: st.stampMs,
-             penus: st.pen ? (st.penMs * 1000) / st.pen : 0,
-             stampus: st.stamps ? (st.stampMs * 1000) / st.stamps : 0,
-             profiling: perfOn,
              logErrors: st.errors.length + st.logErrors, gpu, software };
   };
 
   window.__bridge = {
     __installed: true, vm, rt,
-    frame: () => st.frame, stopped: () => st.stopped,
+    frame: () => st.frame, rendered: () => st.rendered, stopped: () => st.stopped,
+    setProfiling: on => (profiler ? profiler.setEnabled(on) : false),
+    profilingOn: () => !!(profiler && profiler.enabled()),
+    profile: () => (profiler ? profiler.report() : null),
+    profileReset: () => (profiler ? profiler.reset() : false),
+    profileSteps: since => (profiler ? profiler.steps(since) : { series_start: 0, steps: [] }),
+    profileValue: name => (profiler ? profiler.value(name) : undefined),
     logs: () => st.logs.slice(),
     logsSince: n => st.logs.filter(x => x.seq > n),
     logErrors: () => st.logErrors,
@@ -296,9 +277,8 @@ BRIDGE_JS = r"""
     get: spec => {
       if (typeof spec === 'string' && spec.startsWith('@')) {
         const p = perf(); const k = spec.slice(1).toLowerCase();
-        // Aliases mirror host.js perfValue so @fps/@renderfps/@drawcalls mean the
-        // same thing in gsdev and the bridge.
-        const alias = { renderfps: 'fps', drawcalls: 'drawcount', pen: 'drawcount' }[k] || k;
+        // Alias so @renderfps means the same thing in gsdev and the bridge.
+        const alias = { renderfps: 'fps' }[k] || k;
         return alias in p ? p[alias] : null;
       }
       const r = resolve(spec);
@@ -355,6 +335,10 @@ BRIDGE_JS = r"""
 """
 
 BOOT_WAIT_JS = "!!(window.__bridge && window.__bridge.__installed)"
+# The profiler module is shared with the local host (scratchhost/profiler.js), so the
+# bridge and host run one implementation. Injected before BRIDGE_JS, which wires it up.
+PROFILER_JS = (Path(__file__).resolve().parent / "scratchhost" / "profiler.js").read_text(
+    encoding="utf-8")
 STATE_JS = "(() => ({ origin: location.origin, bridge: !!(window.__bridge && window.__bridge.__installed), frame: window.__bridge ? window.__bridge.frame() : -1 }))()"
 
 
@@ -393,16 +377,13 @@ def bridge_target_names(cdp) -> list[str]:
         return []
 
 
-def inject_bridge(cdp, timeout: float = 30.0, perf: bool = False) -> bool:
-    # Set the options on every attempt: the page may still be navigating when we
-    # start, and window.__bridgeOpts must exist when the bridge actually installs.
-    opts = f"window.__bridgeOpts = {{ perf: {'true' if perf else 'false'} }}"
+def inject_bridge(cdp, timeout: float = 30.0) -> bool:
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
         try:
             if cdp.evaluate(BOOT_WAIT_JS, timeout=10):
                 return True
-            cdp.evaluate(opts)
+            cdp.evaluate(PROFILER_JS, timeout=10)
             if cdp.evaluate(BRIDGE_JS, timeout=10) and cdp.evaluate(BOOT_WAIT_JS, timeout=10):
                 return True
         except (CDPError, TimeoutError, OSError):
@@ -602,14 +583,8 @@ def cmd_run(args) -> int:
                    profile=str(profile), token=token)
     write_state(port, **session)
     try:
-        # Turn the localhost host's own per-draw profiling OFF before injecting the
-        # bridge: a `--perf on` bridge must wrap the clean calls, otherwise it wraps
-        # the host's wrappers and they can no longer be removed (leaving overhead).
-        if cdp.evaluate("!!(window.__host && window.__host.setPerf)", timeout=5):
-            cdp.evaluate("window.__host.setPerf(false)")
         cdp.evaluate(f"window.__bridgeSession = {json.dumps(token)}")
-        perf_on = args.perf == "on"
-        if not inject_bridge(cdp, timeout=args.ready_timeout, perf=perf_on):
+        if not inject_bridge(cdp, timeout=args.ready_timeout):
             log("WARNING: bridge not installed (no VM found?)")
         info = cdp.evaluate(STATE_JS)
         log({"target": args.target, "url": info.get("origin"), "bridge": info.get("bridge")})
@@ -630,7 +605,7 @@ def cmd_run(args) -> int:
             # it), so there is nothing to wait for; only live sites need this.
             if not cdp.evaluate("!!window.__host"):
                 while time.monotonic() < ready_deadline:
-                    inject_bridge(cdp, timeout=5, perf=perf_on)
+                    inject_bridge(cdp, timeout=5)
                     try:
                         if cdp.evaluate("!!(window.__bridge.pageReady && window.__bridge.pageReady())"):
                             break
@@ -649,7 +624,7 @@ def cmd_run(args) -> int:
             deadline = time.monotonic() + 15.0
             names: list[str] = []
             while True:
-                inject_bridge(cdp, timeout=5, perf=perf_on)
+                inject_bridge(cdp, timeout=5)
                 names = bridge_target_names(cdp)
                 if sorted(names) == wanted or time.monotonic() >= deadline:
                     break
@@ -838,16 +813,17 @@ def cmd_mouse(args) -> int:
 
 def cmd_key(args) -> int:
     cdp, _ = attach(args)
+    key = input_key_name(args.key)
     try:
         if args.down:
-            cdp.evaluate(f"window.__bridge.key({json.dumps(args.key)}, true)")
+            cdp.evaluate(f"window.__bridge.key({json.dumps(key)}, true)")
         elif args.up:
             # release only; sending a press first would fire another key-pressed hat
-            cdp.evaluate(f"window.__bridge.key({json.dumps(args.key)}, false)")
+            cdp.evaluate(f"window.__bridge.key({json.dumps(key)}, false)")
         else:
-            cdp.evaluate(f"window.__bridge.key({json.dumps(args.key)}, true)")
-            cdp.evaluate(f"window.__bridge.key({json.dumps(args.key)}, false)")
-        log({"key": args.key})
+            cdp.evaluate(f"window.__bridge.key({json.dumps(key)}, true)")
+            cdp.evaluate(f"window.__bridge.key({json.dumps(key)}, false)")
+        log({"key": args.key, "sent": key})
     finally:
         cdp.close()
     return 0
@@ -927,6 +903,65 @@ def cmd_perf(args) -> int:
     return 0
 
 
+def _bridge_has_profiler(cdp) -> bool:
+    return bool(cdp.evaluate("!!(window.__bridge && window.__bridge.setProfiling)"))
+
+
+def cmd_setprofiling(args) -> int:
+    cdp, _ = attach(args)
+    try:
+        on = args.mode == "on"
+        result = cdp.evaluate(f"window.__bridge.setProfiling({str(on).lower()})")
+        log({"profiling": bool(result)})
+    finally:
+        cdp.close()
+    return 0
+
+
+def cmd_profilereset(args) -> int:
+    cdp, _ = attach(args)
+    try:
+        log({"reset": bool(cdp.evaluate("window.__bridge.profileReset()"))})
+    finally:
+        cdp.close()
+    return 0
+
+
+def cmd_profiling(args) -> int:
+    cdp, _ = attach(args)
+    try:
+        report = cdp.evaluate("window.__bridge.profile()")
+        if not isinstance(report, dict):
+            log("no profiler on this bridge (reload the page with this gsbridge)")
+            return 1
+        gsdev._print_profile(report, args.top)
+    finally:
+        cdp.close()
+    return 0
+
+
+def cmd_profile(args) -> int:
+    cdp, _ = attach(args)
+    try:
+        if not _bridge_has_profiler(cdp):
+            log("no profiler on this bridge (reload the page with this gsbridge)")
+            return 1
+        cdp.evaluate("window.__bridge.setProfiling(true)")
+        cdp.evaluate("window.__bridge.profileReset()")
+        if not args.no_restart:
+            cdp.evaluate("window.__bridge.greenFlag()")
+        time.sleep(max(0.2, args.seconds))
+        report = cdp.evaluate("window.__bridge.profile()") or {}
+        if args.json:
+            Path(args.json).write_text(json.dumps(report, indent=2), encoding="utf-8")
+        gsdev._print_profile(report, args.top)
+        if args.off:
+            cdp.evaluate("window.__bridge.setProfiling(false)")
+    finally:
+        cdp.close()
+    return 0
+
+
 def cmd_restart(args) -> int:
     cdp, _ = attach(args)
     try:
@@ -981,11 +1016,12 @@ def cmd_session(args) -> int:
                     cdp.evaluate(f"window.__bridge.click({parts[1]}, {parts[2]})")
                     log(f"[click {parts[1]} {parts[2]}]")
                 elif verb == "key" and len(parts) >= 2:
+                    key = input_key_name(parts[1])
                     mode = parts[2] if len(parts) > 2 else "press"
                     down = "true" if mode in ("down", "press") else "false"
-                    cdp.evaluate(f"window.__bridge.key({json.dumps(parts[1])}, {down})")
+                    cdp.evaluate(f"window.__bridge.key({json.dumps(key)}, {down})")
                     if mode == "press":
-                        cdp.evaluate(f"window.__bridge.key({json.dumps(parts[1])}, false)")
+                        cdp.evaluate(f"window.__bridge.key({json.dumps(key)}, false)")
                     log(f"[key {parts[1]} {mode}]")
                 elif verb == "sleep":
                     time.sleep(float(parts[1]) / 1000.0)
@@ -1026,6 +1062,17 @@ def cmd_session(args) -> int:
                     failures += 0 if ok else 1
                 elif verb == "perf":
                     log(cdp.evaluate("window.__bridge.perf()"))
+                elif verb == "setprofiling" and len(parts) >= 2:
+                    on = parts[1].lower() in ("on", "true", "1")
+                    result = cdp.evaluate(f"window.__bridge.setProfiling({str(on).lower()})")
+                    log(f"[profiling {'on' if result else 'off'}]")
+                elif verb == "profilereset":
+                    cdp.evaluate("window.__bridge.profileReset()")
+                    log("[profilereset]")
+                elif verb == "profiling":
+                    report = cdp.evaluate("window.__bridge.profile()") or {}
+                    log(f"[profiling on={bool(cdp.evaluate('window.__bridge.profilingOn()'))} "
+                        f"steps={report.get('steps', 0)}]")
                 elif verb == "gpu":
                     log(cdp.evaluate("window.__bridge.gpu()"))
                 elif verb == "log":
@@ -1077,9 +1124,6 @@ def main(argv=None) -> int:
     run.add_argument("--leave-running", action="store_true")
     run.add_argument("--no-start", action="store_true", help="do not green-flag")
     run.add_argument("--ready-timeout", type=float, default=45.0)
-    run.add_argument("--perf", choices=["on", "off"], default="off",
-                     help="per-draw pen/stamp profiling (default off: it is unequal "
-                          "overhead across targets and stacks on the localhost host)")
     add_port(run)
     run.set_defaults(func=cmd_run)
 
@@ -1138,6 +1182,25 @@ def main(argv=None) -> int:
 
     perf = sub.add_parser("perf", help="frame/fps/rendertime snapshot")
     add_port(perf); perf.set_defaults(func=cmd_perf)
+
+    setprof = sub.add_parser("setprofiling", help="enable/disable procedure profiling")
+    setprof.add_argument("mode", choices=["on", "off"])
+    add_port(setprof); setprof.set_defaults(func=cmd_setprofiling)
+
+    profreset = sub.add_parser("profilereset", help="start a fresh profiling window")
+    add_port(profreset); profreset.set_defaults(func=cmd_profilereset)
+
+    prof = sub.add_parser("profiling", help="print the current profiling report")
+    prof.add_argument("--top", type=int, default=12)
+    add_port(prof); prof.set_defaults(func=cmd_profiling)
+
+    profile = sub.add_parser("profile", help="capture a bounded profiling window")
+    profile.add_argument("--seconds", type=float, default=2.0)
+    profile.add_argument("--top", type=int, default=12)
+    profile.add_argument("--no-restart", action="store_true")
+    profile.add_argument("--json", default="")
+    profile.add_argument("--off", action="store_true", help="disable profiling afterwards")
+    add_port(profile); profile.set_defaults(func=cmd_profile)
 
     rs = sub.add_parser("restart", help="green flag again")
     add_port(rs); rs.set_defaults(func=cmd_restart)

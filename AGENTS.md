@@ -94,9 +94,9 @@ python tools/gsbridge.py close
 Targets are `localhost`, `github`, `editor`, `production` (`--project-id N`), and
 `url`. `--project DIR` / `--sb3 FILE` load a build; production loads what is already
 on the page. The bridge uses fresh isolated profiles (CDP 9400 default) and exposes a
-**subset** of gsdev — no `watch`/`record`/`until`/`step`/property tools. Per-draw
-profiling is off by default (`--perf on` enables it). Keep one session open only while
-needed, then `close`.
+**subset** of gsdev — no `watch`/`record`/`until`/`step`/property tools — but the
+shared procedure profiler works there (`profile`, `profiling`, `setprofiling`,
+`profilereset`). Keep one session open only while needed, then `close`.
 
 `run` waits for the page's own project to load before replacing it, so the session is
 never a merge of the two: `targets` should list exactly `Stage` plus your sprites
@@ -106,16 +106,43 @@ edits work on `github`/`editor`; key injection can depend on page focus, so veri
 
 ## Measuring without fooling yourself
 
+- Measurement costs, so instrument deliberately. Default: **no instrumentation** — a
+  plain run or test carries only the always-on frame/step timing (fps, step ms), which
+  is effectively free. Escalate only while investigating, to `profile` (~+95-185%,
+  i.e. ~0.23-0.4 us per executed op: per-procedure self/inclusive, call graph,
+  UI-thread vs all-at-once, per-frame share spread, sampled time shares and Draws/step,
+  bounded with `--seconds`/`--wait-until`). Turn it off again, never use instrumented
+  time as a verdict, and say which counter was on when you report numbers. `profile`
+  also counts per-draw pen submission for its Draws/step (the pen hooks are installed
+  only while the window is open); those wrappers are a separate per-draw cost, so do
+  not run profiling merely to get a frame rate. Measure on **step** ms, not frame ms:
+  the host paces at 30 Hz, so a step under ~33 ms reports a cadence-flattened frame and
+  the overhead would read as zero. The ranges above come from paired step-ms A/B runs on
+  one machine/browser over a dispatch-heavy loop and two full games; on a project whose
+  steps are only a few ms the difference is below this harness's resolution, so
+  re-measure rather than quote.
 - `profile` counts executed-primitive operations per VM step and attributes them per
-  procedure and top-level script (`sum(self) + unattributed == total_ops`). It uses the
-  same wrapper as `setlogic on`, so it is intrusive: use it to find hotspots, never as
-  a timing verdict. `profile` streams one line per step by default (`--no-follow` for
+  procedure and top-level script (`sum(self) + unattributed == total_ops`). Its
+  per-primitive wrapper is intrusive: use it to find hotspots, never as a timing
+  verdict. `profile` streams one line per step by default (`--no-follow` for
   the summary), `profiling` reprints the current report, `setprofiling on|off` is a
   silent toggle, `profile --wait-until SEL --wait-op OP --wait-value V` starts the
-  window at an event, and `profilereset` opens one manually.
+  window at an event, and `profilereset` opens one manually. The table shows each
+  procedure's `self%` (own body), `kids%` (its subtree) and `incl%` (both), so a row
+  is self-dominated or a wrapper at a glance; `ctx` says whether the row runs on the
+  **ui-thread** (screen-refresh: the sequencer cuts it when the step's work budget is
+  spent) or `all` (without screen refresh: runs to completion in one step);
+  `--children NAME` breaks a procedure's inclusive work down by callee, and
+  `--sort self|kids|incl` ranks by own body (default), callee subtree, or whole
+  subtree. Top-level `event_*` scripts are containers, so they are only listed when
+  they hold at least `--hats-min` percent of the work (default 2) — and a large one is
+  always shown, even when ranking by self pushes it below `--top`. A separate
+  `screen-refresh budget` line flags the classic mistake of a big loop sitting in a
+  hat: the loop is cut at the budget, so its `blocks/step` *saturates* and understates
+  the damage — read the flag (steps held at the budget), not the block count.
 - `@fps` / `@renderfps` are smoothed renderer-call rates, not physical display FPS or
-  elapsed time; `@stepfps` is the VM step rate. Pen/stamp times are **CPU
-  submission**, not GPU completion. `--software` is for behaviour, not performance.
+  elapsed time; `@stepfps` is the VM step rate and `@rendertime` the time from step
+  entry to the frame's draw. `--software` is for behaviour, not performance.
 - Keep conditions equal when comparing runs (browser and version, headed vs headless,
   GPU, stage size, inputs, background load) and discard modal-obscured runs rather than
   trusting them. One machine's browser ranking generalises to nothing.

@@ -42,7 +42,7 @@
             applyCompatibilityMode();
             hud('gsdev host \u2014 project loaded');
             // Extensions register their primitives during load; re-wrap them.
-            if (gs.perf && gs.perf.logicEnabled) refreshLogic();
+            if (profiler.enabled()) profiler.refresh();
             const state = window.__gsdev;
             if (state) {
               state.errors = [];
@@ -57,8 +57,6 @@
                 p.lastStepAt = 0; p.lastRenderAt = 0; p.stepAt = 0;
                 p.rendertime = 0; p.rendertimeAvg = 0;
                 p.steptime = 0; p.steptimeAvg = 0;
-                p.drawcount = 0; p.stamps = 0; p.drawcalls = 0;
-                p._pen = 0; p._stamps = 0; p._gl = 0;
               }
             }
           });
@@ -93,26 +91,18 @@
     gs.errors = [];
     gs.logErrors = 0;
 
-    // Render-side perf counters (see plan-perf-metrics.md): fps (step + render),
-    // per-frame pen drawcount / stamps / GL draw calls, and frame rendertime.
-    // Logic op counts are a separate metric (plan-logic-cost.md).
+    // Frame/step perf counters: fps (step + render) and frame rendertime. Per-draw
+    // counts are not here — they belong to the profiler (see setProfiling), because
+    // wrapping the pen hot path costs per draw.
     gs.perf = {
-      enabled: true,
       stepInterval: 0, renderInterval: 0,
       stepFps: 0, renderFps: 0,
       stepAt: 0, lastStepAt: 0, lastRenderAt: 0,
       rendertime: 0, rendertimeAvg: 0,
       steptime: 0, steptimeAvg: 0,
-      drawcount: 0, stamps: 0, drawcalls: 0,
-      _pen: 0, _stamps: 0, _gl: 0, _inDraw: false, _penMs: 0, _stampMs: 0,
-      pentime: 0, pentimeAvg: 0, stamptime: 0,
-      _installed: false, _wraps: [],
-      logicEnabled: false, logicInstalled: false,
-      counts: {}, blocks: 0, _opNames: [], _opCounts: [], _opTotals: [],
-      _totals: {}, _blocksTotal: 0,
-      // Procedure attribution (plan-procedure-hotspots.md). Only populated while
-      // profileEnabled; the counter convention matches @blocks exactly.
-      profileEnabled: false, prof: null
+      // Always-on, bounded per-step stepThreads ms samples. Median-friendly, so
+      // overhead A/B runs need not poll the client (which would perturb the page).
+      stepMsSeries: [], stepMsCap: 512
     };
 
     // Runtime error capture. scratch-vm fires no error event and has no
@@ -135,12 +125,9 @@
         const st = performance.now() - t0;
         gs.perf.steptime = st;
         gs.perf.steptimeAvg = gs.perf.steptimeAvg ? gs.perf.steptimeAvg * 0.9 + st * 0.1 : st;
-        const prof = gs.perf.prof;
-        if (prof && prof.enabled) {
-          prof.stepMsSum += st;
-          prof.stepMsCount += 1;
-          prof.lastStepMs = st;
-        }
+        const series = gs.perf.stepMsSeries;
+        series.push(st);
+        if (series.length > gs.perf.stepMsCap) series.shift();
         return result;
       };
     }
@@ -158,23 +145,6 @@
         }
         perf.lastStepAt = now;
         perf.stepAt = now;
-        perf._pen = 0;
-        perf._stamps = 0;
-        // Close the previous step's profile sample (partial boundary steps are
-        // excluded from the per-step series; the plan's observed-step means use
-        // only these completed steps).
-        const prof = perf.prof;
-        if (prof && prof.enabled) {
-          prof.steps += 1;
-          prof.series.push({ frame: gs.frame - 1, t: now, step_ms: prof.lastStepMs,
-                             draws: prof.drawStep, blocks: prof.stepOps });
-          if (prof.series.length > prof.cap) {
-            prof.series.splice(0, prof.series.length - prof.cap);
-            prof.perStepCapped = true;
-          }
-          prof.stepOps = 0;
-          prof.drawStep = 0;
-        }
       }
       try {
         window.dispatchEvent(new CustomEvent('gsdev:frame', { detail: { frame: gs.frame } }));
@@ -205,52 +175,19 @@
     const originalDraw = renderer.draw;
     renderer.draw = function (...args) {
       const perf = gs.perf;
-      if (perf) { perf._inDraw = true; perf._gl = 0; }
       const result = originalDraw.apply(this, args);
       if (perf) {
-        perf._inDraw = false;
         const now = performance.now();
         if (perf.lastRenderAt) {
           const dt = now - perf.lastRenderAt;
           perf.renderInterval = perf.renderInterval ? perf.renderInterval * 0.9 + dt * 0.1 : dt;
         }
         perf.lastRenderAt = now;
-        perf.drawcount = perf._pen;
-        perf.stamps = perf._stamps;
-        if (perf.prof && perf.prof.enabled) {
-          perf.prof.drawSum += perf._pen;
-          perf.prof.drawStep += perf._pen;
-          perf.prof.drawFrames += 1;
-        }
-        perf.drawcalls = perf._gl;
-        perf.pentime = perf._penMs;
-        perf.stamptime = perf._stampMs;
-        perf.pentimeAvg = perf.pentimeAvg ? perf.pentimeAvg * 0.9 + perf.pentime * 0.1 : perf.pentime;
-        perf._penMs = 0;
-        perf._stampMs = 0;
         const rt = perf.stepAt ? now - perf.stepAt : 0;
         perf.rendertime = rt;
         perf.rendertimeAvg = perf.rendertimeAvg ? perf.rendertimeAvg * 0.9 + rt * 0.1 : rt;
         perf.stepFps = perf.stepInterval ? 1000 / perf.stepInterval : 0;
         perf.renderFps = perf.renderInterval ? 1000 / perf.renderInterval : 0;
-        if (perf.logicInstalled) {
-          const counts = {};
-          let total = 0;
-          const opCounts = perf._opCounts;
-          for (let i = 0; i < opCounts.length; i++) {
-            const n = opCounts[i];
-            if (!n) continue;
-            const op = perf._opNames[i];
-            counts[op] = n;
-            perf._opTotals[i] += n;
-            perf._totals[op] = (perf._totals[op] || 0) + n;
-            total += n;
-            opCounts[i] = 0;
-          }
-          perf.counts = counts;
-          perf.blocks = total;
-          perf._blocksTotal += total;
-        }
       }
       gs.rendered = gs.frame;
       gs.renderEvents += 1;
@@ -262,364 +199,21 @@
       return result;
     };
 
-    // Per-draw instrumentation affects pen-heavy timings. setPerf(false) restores
-    // these originals; frame events and step/render timing still remain active.
-    const perfWraps = gs.perf._wraps;
-    // Fixed-arity wrappers for the hot paths: no rest-args array allocation per call.
-    const installPerf = () => {
-      if (gs.perf._installed) return;
-      gs.perf._installed = true;
-      const P = gs.perf;
-      const wrap = (obj, name, wrapped) => {
-        const original = obj[name];
-        wrapped.__gsdevPerf = true;
-        perfWraps.push({ obj, name, original });
-        obj[name] = wrapped;
-      };
-      // penStamp(penSkinID, stampID) — the pen `stamp` block.
-      if (typeof renderer.penStamp === 'function' && !renderer.penStamp.__gsdevPerf) {
-        const o = renderer.penStamp;
-        wrap(renderer, 'penStamp', function (a, b) {
-          if (!P.enabled) return o.call(this, a, b);
-          const t0 = performance.now();
-          const result = o.call(this, a, b);
-          P._stamps += 1;
-          P._stampMs += performance.now() - t0;
-          return result;
-        });
-      }
-      // PenSkin.drawLine(penAttributes, x0, y0, x1, y1) — covers drawPoint, which
-      // delegates to it. The pen skin is created lazily, so hook createPenSkin.
-      const wrapPenSkin = skin => {
-        if (!skin || typeof skin.drawLine !== 'function' || skin.drawLine.__gsdevPerf) return;
-        const o = skin.drawLine;
-        wrap(skin, 'drawLine', function (pa, x0, y0, x1, y1) {
-          if (!P.enabled) return o.call(this, pa, x0, y0, x1, y1);
-          const t0 = performance.now();
-          const result = o.call(this, pa, x0, y0, x1, y1);
-          P._pen += 1;
-          P._penMs += performance.now() - t0;
-          return result;
-        });
-      };
-      if (typeof renderer.createPenSkin === 'function' && !renderer.createPenSkin.__gsdevPerf) {
-        const o = renderer.createPenSkin;
-        wrap(renderer, 'createPenSkin', function () {
-          const id = o.apply(this, arguments);
-          wrapPenSkin(this._allSkins && this._allSkins[id]);
-          return id;
-        });
-      }
-      for (const skin of (renderer._allSkins || [])) wrapPenSkin(skin);
-      // GL draw calls during the main draw pass (pen strokes are one batched call).
-      const gl = renderer.gl;
-      if (gl) {
-        if (typeof gl.drawElements === 'function' && !gl.drawElements.__gsdevPerf) {
-          const o = gl.drawElements;
-          wrap(gl, 'drawElements', function (m, c, t, off) {
-            if (P.enabled && P._inDraw) P._gl += 1;
-            return o.call(this, m, c, t, off);
-          });
-        }
-        if (typeof gl.drawArrays === 'function' && !gl.drawArrays.__gsdevPerf) {
-          const o = gl.drawArrays;
-          wrap(gl, 'drawArrays', function (m, f, c) {
-            if (P.enabled && P._inDraw) P._gl += 1;
-            return o.call(this, m, f, c);
-          });
-        }
-      }
-    };
-    const removePerf = () => {
-      for (const item of perfWraps.splice(0)) {
-        if (item.obj[item.name] && item.obj[item.name].__gsdevPerf) {
-          item.obj[item.name] = item.original;
-        }
-      }
-      gs.perf._installed = false;
-    };
-    window.__host.setPerf = on => {
-      gs.perf.enabled = !!on;
-      if (on) installPerf();
-      else removePerf();
-      return gs.perf.enabled;
-    };
-    // Logic op-count instrumentation (opt-in; see plan-logic-cost.md). Wraps every
-    // primitive and invalidates the per-target execute cache — the primitive
-    // reference is captured per block there — so counts must be re-applied after
-    // each project load. Off by default: per-execution counting perturbs hot loops.
-    const logicWraps = [];
-    const LOGIC_CATEGORIES = {
-      varreads: ['data_variable'],
-      varwrites: ['data_setvariableto', 'data_changevariableby'],
-      listreads: ['data_itemoflist', 'data_lengthoflist', 'data_listcontainsitem',
-        'data_itemnumoflist', 'data_listcontents'],
-      listwrites: ['data_replaceitemoflist', 'data_addtolist', 'data_deleteoflist',
-        'data_deletealloflist', 'data_insertatlist'],
-      paramreads: ['argument_reporter_string_number', 'argument_reporter_boolean'],
-      controlops: ['control_repeat', 'control_forever', 'control_if', 'control_if_else',
-        'control_wait', 'control_wait_until', 'control_repeat_until']
-    };
-    const clearExecuteCache = () => {
-      for (const target of runtime.targets) {
-        if (target.blocks && target.blocks._cache) target.blocks._cache._executeCached = {};
-      }
-    };
-    // --- procedure attribution (plan-procedure-hotspots.md) -----------------
-    // Counting convention matches @blocks exactly: only runtime._primitives
-    // dispatches are counted (no hats, literals, cached reporters or menu
-    // shadows). The active procedure is read from the thread's own stack:
-    // stepToProcedure pushes the procedure *definition*, so the nearest
-    // procedures_call block at or below the current frame is the active callee.
-    const PROF_STEP_CAP = 2048;
-    const spriteLabel = target => {
-      try {
-        if (!target) return 'stage';
-        const cloneSprite = target.isOriginal === false && target.sprite && target.sprite.name;
-        const name = cloneSprite || (target.getName ? target.getName()
-          : (target.sprite && target.sprite.name));
-        return name === 'Stage' ? 'stage' : String(name || 'unknown');
-      } catch (error) { return 'unknown'; }
-    };
-    const procRecord = (prof, target, proccode) => {
-      const key = spriteLabel(target) + ' :: ' + proccode;
-      let rec = prof.procedures[key];
-      if (!rec) {
-        rec = prof.procedures[key] = {
-          key, sprite: spriteLabel(target), name: proccode,
-          calls: 0, self: 0, inclusive: 0, ops: {}
-        };
-      }
-      return rec;
-    };
-    const topFrameIdentity = thread => {
-      try {
-        const block = thread.target.blocks.getBlock(thread.topBlock);
-        return { key: spriteLabel(thread.target) + ' :: '
-          + (block ? block.opcode : 'top-level'),
-          proccode: block ? block.opcode : 'top-level' };
-      } catch (error) { return null; }
-    };
-    const initProf = () => {
-      gs.perf.prof = {
-        enabled: true, steps: 0, stepOps: 0, totalOps: 0, unattributed: 0,
-        startedAt: performance.now(), procedures: {}, perStepCapped: false,
-        stepMsSum: 0, stepMsCount: 0, drawSum: 0, drawFrames: 0,
-        lastStepMs: 0, drawStep: 0, series: [],
-        cap: PROF_STEP_CAP
-      };
-    };
-    const attributeOp = (P, op, util) => {
-      const prof = P.prof;
-      if (!prof || !prof.enabled) return;
-      prof.stepOps += 1;
-      prof.totalOps += 1;
-      const thread = util && util.thread;
-      if (!thread || !thread.target || !thread.target.blocks || !thread.stack) {
-        prof.unattributed += 1;
-        return;
-      }
-      const blocks = thread.target.blocks;
-      const stack = thread.stack;
-      // For procedures_call the call block is the current top frame and the
-      // callee has not been entered: call setup belongs to the caller (plan 4).
-      const entering = op === 'procedures_call';
-      const limit = entering ? stack.length - 1 : stack.length;
-      const active = [];
-      for (let i = 0; i < limit; i++) {
-        const id = stack[i];
-        if (!id) continue;
-        const block = blocks.getBlock(id);
-        if (block && block.opcode === 'procedures_call') {
-          const code = (block.mutation && block.mutation.proccode) || 'call';
-          active.push({ key: spriteLabel(thread.target) + ' :: ' + code, proccode: code });
-        }
-      }
-      if (entering && stack.length) {
-        const call = blocks.getBlock(stack[stack.length - 1]);
-        if (call && call.opcode === 'procedures_call') {
-          const code = (call.mutation && call.mutation.proccode) || 'call';
-          procRecord(prof, thread.target, code).calls += 1;
-        }
-      }
-      const top = topFrameIdentity(thread);
-      const self = active.length ? active[active.length - 1] : top;
-      if (!self) {
-        prof.unattributed += 1;
-      } else {
-        const rec = procRecord(prof, thread.target, self.proccode);
-        rec.self += 1;
-        rec.ops[op] = (rec.ops[op] || 0) + 1;
-      }
-      // Inclusive: credit each distinct active identity once per operation
-      // (recursion collapses to one key; this is a flat view, not a call tree).
-      const seen = {};
-      for (const frame of active) {
-        if (seen[frame.key]) continue;
-        seen[frame.key] = true;
-        procRecord(prof, thread.target, frame.proccode).inclusive += 1;
-      }
-      if (top && !seen[top.key]) {
-        procRecord(prof, thread.target, top.proccode).inclusive += 1;
-      }
-    };
-    const reportData = prof => {
-      const procedures = Object.keys(prof.procedures).map(k => {
-        const r = prof.procedures[k];
-        const dominant = Object.keys(r.ops).map(op => [op, r.ops[op]])
-          .sort((a, b) => b[1] - a[1]).slice(0, 10);
-        return { key: r.key, sprite: r.sprite, name: r.name, calls: r.calls,
-                 self: r.self, inclusive: r.inclusive,
-                 share: prof.totalOps ? r.self / prof.totalOps : 0, dominant };
-      }).sort((a, b) => b.self - a.self);
-      let selfTotal = 0;
-      for (const p of procedures) selfTotal += p.self;
-      const series = prof.series.slice();
-      const perStep = series.map(s => s.blocks);
-      let maxStep = 0;
-      let sumSteps = 0;
-      let sumMs = 0;
-      let sumDraws = 0;
-      for (const s of series) {
-        sumSteps += s.blocks; if (s.blocks > maxStep) maxStep = s.blocks;
-        sumMs += s.step_ms; sumDraws += s.draws;
-      }
-      const n = series.length;
-      return {
-        enabled: prof.enabled, steps: n, step_boundaries: prof.steps,
-        steps_total: prof.steps, series_start_index: prof.steps - n,
-        window_ms: prof.startedAt ? performance.now() - prof.startedAt : 0,
-        total_ops: prof.totalOps, unattributed: prof.unattributed, unknown: prof.unattributed,
-        self_total: selfTotal,
-        ops_per_step_mean: n ? sumSteps / n : 0,
-        ops_per_step_max: maxStep, per_step: perStep, per_step_capped: prof.perStepCapped,
-        step_series: series,
-        step_ms_mean: n ? sumMs / n : 0, step_samples: n,
-        draws_per_step: n ? sumDraws / n : 0,
-        rendered_frames: prof.drawFrames,
-        procedures
-      };
-    };
+    // Procedure profiling lives in profiler.js (shared with gsbridge): it installs
+    // its own hooks on runtime._step / renderer.draw / the pen path, so this host
+    // just exposes the API. See plan-procedure-hotspots.md.
+    const profiler = window.GsdevProfiler({ runtime, renderer });
 
-    const installLogic = () => {
-      const P = gs.perf;
-      const opNames = Object.keys(runtime._primitives);
-      P._opNames = opNames;
-      P._opCounts = new Array(opNames.length).fill(0);
-      P._opTotals = new Array(opNames.length).fill(0);
-      opNames.forEach((op, i) => {
-        const original = runtime._primitives[op];
-        if (typeof original !== 'function' || original.__gsdevLogic) return;
-        const wrapped = function (args, util) {
-          P._opCounts[i] += 1;
-          if (P.profileEnabled) attributeOp(P, op, util);
-          return original.call(this, args, util);
-        };
-        wrapped.__gsdevLogic = true;
-        logicWraps.push({ op, original });
-        runtime._primitives[op] = wrapped;
-      });
-      clearExecuteCache();
-      P.logicInstalled = true;
-      P.counts = {};
-      P.blocks = 0;
-      P._totals = {};
-      P._blocksTotal = 0;
-      if (P.profileEnabled) initProf();
-    };
-    const removeLogic = () => {
-      for (const item of logicWraps.splice(0)) {
-        if (runtime._primitives[item.op] && runtime._primitives[item.op].__gsdevLogic) {
-          runtime._primitives[item.op] = item.original;
-        }
-      }
-      const P = gs.perf;
-      P.logicInstalled = false;
-      P.counts = {};
-      P.blocks = 0;
-      P._opNames = [];
-      P._opCounts = [];
-      P._opTotals = [];
-      P._totals = {};
-      P._blocksTotal = 0;
-      clearExecuteCache();
-    };
-    const refreshLogic = () => {
-      if (!gs.perf.logicEnabled) return;
-      removeLogic();
-      installLogic();
-    };
-    const logicSummary = () => {
-      const P = gs.perf;
-      const counts = P.counts || {};
-      const totalsCounts = P._totals || {};
-      const categories = {};
-      const totals = { blocks: P._blocksTotal || 0, categories: {} };
-      for (const name of Object.keys(LOGIC_CATEGORIES)) {
-        let n = 0;
-        let t = 0;
-        for (const op of LOGIC_CATEGORIES[name]) {
-          n += counts[op] || 0;
-          t += totalsCounts[op] || 0;
-        }
-        categories[name] = n;
-        totals.categories[name] = t;
-      }
-      const top = Object.keys(counts).map(op => [op, counts[op]])
-        .sort((a, b) => b[1] - a[1]).slice(0, 15);
-      return { blocks: P.blocks || 0, categories, top, enabled: P.logicInstalled, totals };
-    };
-    window.__host.setLogic = on => {
-      gs.perf.logicEnabled = !!on;
-      if (on) { removeLogic(); installLogic(); }
-      else removeLogic();
-      return gs.perf.logicEnabled;
-    };
-    window.__host.logic = () => logicSummary();
+    window.__host.setProfiling = on => profiler.setEnabled(on);
+    window.__host.profileReset = () => profiler.reset();
+    window.__host.profile = () => profiler.report();
+    window.__host.profileSteps = since => profiler.steps(since);
+    window.__host.profileValue = name => profiler.value(name);
 
-    // Procedure profiling (plan-procedure-hotspots.md). Same wrapper/counting
-    // convention as @blocks; the report is counts + attribution only.
-    window.__host.setProfiling = on => {
-      const P = gs.perf;
-      P.profileEnabled = !!on;
-      P.logicEnabled = P.logicEnabled || P.profileEnabled;
-      removeLogic();
-      if (P.logicEnabled) installLogic();
-      if (!P.profileEnabled) P.prof = null;
-      return P.profileEnabled;
-    };
-    window.__host.profileReset = () => {
-      if (!gs.perf.profileEnabled) return false;
-      initProf();
-      return true;
-    };
-    window.__host.profile = () => (gs.perf.prof ? reportData(gs.perf.prof)
-      : { enabled: false, steps: 0, step_boundaries: 0, steps_total: 0,
-          series_start_index: 0, window_ms: 0, total_ops: 0,
-          unattributed: 0, unknown: 0, self_total: 0, ops_per_step_mean: 0,
-          ops_per_step_max: 0, per_step: [], per_step_capped: false, step_series: [],
-          step_ms_mean: 0, step_samples: 0, draws_per_step: 0, rendered_frames: 0,
-          procedures: [] });
-    // Cheap incremental read for live follow: returns the bounded series entries
-    // with absolute index >= since.
-    window.__host.profileSteps = since => {
-      const prof = gs.perf.prof;
-      if (!prof || !prof.series) return { series_start: 0, steps: [] };
-      const seriesStart = prof.steps - prof.series.length;
-      const offset = Math.max(0, (Number(since) || 0) - seriesStart);
-      return { series_start: seriesStart + offset, steps: prof.series.slice(offset) };
-    };
-    window.__host.profileValue = name => {
-      const report = window.__host.profile();
-      switch (String(name || '').toLowerCase()) {
-      case 'steps': return report.steps;
-      case 'totalops': case 'blocks': return report.total_ops;
-      case 'unattributed': case 'unknown': return report.unattributed;
-      case 'selftotal': return report.self_total;
-      case 'opsperstep': return report.ops_per_step_mean;
-      default: return undefined;
-      }
-    };
+    // Per-step stepThreads ms samples (always on, bounded). Used by overhead A/B
+    // runs so they can take a median without polling the page.
+    window.__host.stepMs = n => gs.perf.stepMsSeries.slice(-Math.max(0, n | 0));
+    window.__host.stepMsReset = () => { gs.perf.stepMsSeries = []; return true; };
 
     // GL backend, for "are we actually on the GPU?" checks. Production Scratch
     // runs on the GPU; a software (SwiftShader) fallback is a silent, large
@@ -647,22 +241,12 @@
     window.__host.perf = () => ({
       stepFps: perfFresh(gs.perf.lastStepAt) ? gs.perf.stepFps : 0,
       renderFps: perfFresh(gs.perf.lastRenderAt) ? gs.perf.renderFps : 0,
-      drawcount: gs.perf.drawcount,
-      stamps: gs.perf.stamps,
-      drawcalls: gs.perf.drawcalls,
-      pentime: gs.perf.pentime,
-      pentimeAvg: gs.perf.pentimeAvg,
-      stamptime: gs.perf.stamptime,
-      penus: gs.perf.drawcount ? (gs.perf.pentime * 1000) / gs.perf.drawcount : 0,
-      stampus: gs.perf.stamps ? (gs.perf.stamptime * 1000) / gs.perf.stamps : 0,
       rendertime: gs.perf.rendertime,
       rendertimeAvg: gs.perf.rendertimeAvg,
       steptime: gs.perf.steptime,
       steptimeAvg: gs.perf.steptimeAvg,
-      blocks: gs.perf.blocks,
       frame: gs.frame,
       rendered: gs.rendered,
-      enabled: gs.perf.enabled,
       gpu: gpuInfo.renderer,
       gpuVendor: gpuInfo.vendor,
       software: softwareGL()
@@ -672,26 +256,10 @@
       switch (String(name || '').toLowerCase()) {
       case 'fps': case 'renderfps': return p.renderFps;
       case 'stepfps': return p.stepFps;
-      case 'drawcount': return p.drawcount;
-      case 'stamps': return p.stamps;
-      case 'drawcalls': return p.drawcalls;
-      case 'pentime': return p.pentime;
-      case 'pentimeavg': return p.pentimeAvg;
-      case 'stamptime': return p.stamptime;
-      case 'penus': return p.penus;
-      case 'stampus': return p.stampus;
       case 'rendertime': return p.rendertime;
       case 'rendertimeavg': return p.rendertimeAvg;
       case 'steptime': return p.steptime;
       case 'steptimeavg': return p.steptimeAvg;
-      case 'blocks': return p.blocks;
-      case 'varreads': case 'varwrites': case 'listreads': case 'listwrites':
-      case 'paramreads': case 'controlops':
-        return logicSummary().categories[String(name).toLowerCase()];
-      case 'totalblocks': return logicSummary().totals.blocks;
-      case 'totalvarreads': case 'totalvarwrites': case 'totallistreads':
-      case 'totallistwrites': case 'totalparamreads': case 'totalcontrolops':
-        return logicSummary().totals.categories[String(name).toLowerCase().slice(5)];
       case 'frame': return p.frame;
       case 'rendered': return p.rendered;
       case 'gpu': case 'gpurenderer': return p.gpu;
@@ -700,7 +268,6 @@
       default: return undefined;
       }
     };
-    installPerf();
 
     window.__host.frame = () => gs.frame;
     window.__host.rendered = () => gs.rendered;

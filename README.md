@@ -24,7 +24,7 @@ live state inspection, and execution profiling.
 - **Check on real Scratch** — `tools/gsbridge.py` runs the same style of verbs
   against the GitHub player, the production editor, or a production embed.
 - **Measure activity** — live `perf` pseudo-selectors (`@fps`, `@stepfps`,
-  `@rendertime`, `@drawcount`, `@pentime`, `@stamptime`, `@gpu`, …) and a procedure
+  `@rendertime`, `@steptime`, `@rendered`, `@gpu`, …) and a procedure
   profiler (`profile`, `profiling`) that ranks hot procedures per VM step.
 
 ## Choose the tool
@@ -135,6 +135,8 @@ python tools/gsdev.py profiling --steps 5            # current report (no new ca
 python tools/gsdev.py profile --wait-until Tick.framecount --wait-op '>' --wait-value 0
                                                      # start the window at an event (load/setup excluded)
 python tools/gsdev.py setprofiling on; python tools/gsdev.py profilereset   # manual window start
+python tools/gsdev.py profile --seconds 2 --children _3dEngine  # that procedure's callees
+python tools/gsdev.py profile --seconds 2 --sort incl          # rank by whole subtree
 ```
 
 **5. Screenshot and pixel**
@@ -151,6 +153,7 @@ python tools/gsbridge.py run --target github --project . --headless --duration 6
 python tools/gsbridge.py get main.tx "@fps" "@gpu"
 python tools/gsbridge.py expect_no_errors
 python tools/gsbridge.py targets                 # confirm the page's project was replaced
+python tools/gsbridge.py profile --seconds 3      # per-procedure hotspots + Draws/step
 python tools/gsbridge.py close
 ```
 

@@ -48,10 +48,7 @@ Commands:
     props       Print a target's properties
     prop        Read or write one target property
     clones      Print the clone count per sprite
-    perf        Print fps / drawcount / drawcalls / rendertime
-    setperf     Enable/disable render-side perf instrumentation
-    logic       Print per-frame block op counts (opt-in)
-    setlogic    Enable/disable logic op-count instrumentation
+    perf        Print fps / rendertime / steptime snapshot
     errors      Dump captured VM/page errors and error-log count
     expect_no_errors  Assert there are no VM/page or error-log errors
     wait_until  Wait (event-driven) until a variable satisfies a condition
@@ -83,6 +80,7 @@ from __future__ import annotations
 
 import argparse
 import base64
+import hashlib
 import io
 import json
 import os
@@ -91,6 +89,7 @@ import re
 import shutil
 import signal
 import socket
+import statistics
 import subprocess
 import sys
 import tempfile
@@ -657,7 +656,8 @@ def ensure_host_server() -> None:
     while time.monotonic() < deadline:
         info = probe_host_server(token)
         if info is not None:
-            write_host_state(token=token, pid=info.get("pid"), port=HOST_SERVER_PORT)
+            write_host_state(token=token, pid=info.get("pid"), port=HOST_SERVER_PORT,
+                             project=str(PROJECT_ROOT))
             log(f"host server on http://127.0.0.1:{HOST_SERVER_PORT}")
             return
         time.sleep(0.1)
@@ -1035,10 +1035,6 @@ def cmd_run(args: argparse.Namespace) -> int:
     ready = time.monotonic() - t0
     apply_cpu_throttle(cdp, getattr(args, "cpu", 0.0))
     try:
-        if getattr(args, "perf", None) is not None:
-            enabled = args.perf == "on"
-            cdp.evaluate(f"window.__host.setPerf({json.dumps(enabled)})")
-            log(f"render instrumentation {args.perf}")
         if args.no_reload:
             log(
                 f"host {'launched' if launched else 'warm'}: browser {ready:.2f}s, "
@@ -1054,13 +1050,18 @@ def cmd_run(args: argparse.Namespace) -> int:
         deadline = time.monotonic() + args.duration if args.duration else None
         errors_seen = 0
         next_dialog_check = time.monotonic()
+        next_perf = time.monotonic() + 1.0
         try:
             while True:
-                # A force-sign-in dialog can appear a little after startup; keep
-                # dismissing Edge/Chrome internal pages so they never cover the stage.
                 if time.monotonic() >= next_dialog_check:
                     dismiss_browser_dialogs(args.port)
                     next_dialog_check = time.monotonic() + 2.0
+                if time.monotonic() >= next_perf:
+                    p = cdp.evaluate("window.__host.perf()") or {}
+                    log(f"[perf] fps={float(p.get('stepFps') or 0):.1f} "
+                        f"step_ms={float(p.get('steptimeAvg') or 0):.2f} "
+                        f"render_ms={float(p.get('rendertimeAvg') or 0):.2f}")
+                    next_perf = time.monotonic() + 1.0
                 poll = poll_host(cdp, errors_seen)
                 for event in poll.get("logs", []):
                     if event is None:
@@ -1615,16 +1616,6 @@ def run_session_lines(cdp: CDP, lines, quiet: bool = False) -> dict:
                 log(json.dumps({"clones": cdp.evaluate("window.__host.clones()")}))
             elif op == "perf":
                 log(json.dumps(cdp.evaluate("window.__host.perf()")))
-            elif op == "setperf" and len(parts) >= 2:
-                enabled = parts[1].lower() in ("on", "true", "1")
-                result = cdp.evaluate(f"window.__host.setPerf({str(enabled).lower()})")
-                log(json.dumps({"perf": bool(result)}))
-            elif op == "logic":
-                log(json.dumps(cdp.evaluate("window.__host.logic()")))
-            elif op == "setlogic" and len(parts) >= 2:
-                enabled = parts[1].lower() in ("on", "true", "1")
-                result = cdp.evaluate(f"window.__host.setLogic({str(enabled).lower()})")
-                log(json.dumps({"logic": bool(result)}))
             elif op == "errors":
                 log(json.dumps(get_errors(cdp)))
             elif op == "expect_no_errors":
@@ -1785,6 +1776,11 @@ def cmd_test(args: argparse.Namespace) -> int:
             try:
                 info = get_errors(cdp)
                 entry["errors"] = int(info.get("count", 0)) + int(info.get("logErrors", 0))
+                perf = cdp.evaluate("window.__host.perf()") or {}
+                entry["perf"] = {
+                    "fps": round(float(perf.get("stepFps") or 0.0), 1),
+                    "step_ms": round(float(perf.get("steptimeAvg") or 0.0), 2),
+                }
                 failed = entry["failures"] > 0 or entry["errors"] > 0 or proc.returncode != 0
                 if failed and not args.no_screenshots:
                     artifacts.mkdir(parents=True, exist_ok=True)
@@ -1799,9 +1795,11 @@ def cmd_test(args: argparse.Namespace) -> int:
         report["totals"]["asserts"] += len(entry["asserts"])
         report["totals"]["failures"] += entry["failures"]
         if not JSON_MODE:
+            perf = entry.get("perf") or {}
             log(
                 f"[{'ok' if not failed else 'FAIL'}] {path}: {len(entry['asserts'])} assert(s), "
                 f"{entry['failures']} failure(s), {entry['errors']} error(s)"
+                f" | fps={perf.get('fps', 0)} step_ms={perf.get('step_ms', 0)}"
             )
     if JSON_MODE:
         print(json.dumps(report, separators=(",", ":")), flush=True)
@@ -2116,43 +2114,6 @@ def cmd_gpu(args: argparse.Namespace) -> int:
     return 0
 
 
-def cmd_setperf(args: argparse.Namespace) -> int:
-    cdp = open_live_cdp(args.port)
-    if cdp is None:
-        return 1
-    try:
-        enabled = args.mode == "on"
-        result = cdp.evaluate(f"window.__host.setPerf({str(enabled).lower()})")
-        log(json.dumps({"perf": bool(result)}))
-    finally:
-        cdp.close()
-    return 0
-
-
-def cmd_logic(args: argparse.Namespace) -> int:
-    cdp = open_live_cdp(args.port)
-    if cdp is None:
-        return 1
-    try:
-        log(json.dumps(cdp.evaluate("window.__host.logic()")))
-    finally:
-        cdp.close()
-    return 0
-
-
-def cmd_setlogic(args: argparse.Namespace) -> int:
-    cdp = open_live_cdp(args.port)
-    if cdp is None:
-        return 1
-    try:
-        enabled = args.mode == "on"
-        result = cdp.evaluate(f"window.__host.setLogic({str(enabled).lower()})")
-        log(json.dumps({"logic": bool(result)}))
-    finally:
-        cdp.close()
-    return 0
-
-
 def cmd_setprofiling(args: argparse.Namespace) -> int:
     cdp = open_live_cdp(args.port)
     if cdp is None:
@@ -2189,8 +2150,13 @@ def cmd_profiling(args: argparse.Namespace) -> int:
         if not isinstance(report, dict) or not report.get("enabled"):
             log("profiling is off: enable with `setprofiling on`, or run `profile`")
             return 1
-        _print_profile(report, args.top)
+        state = read_host_state()
+        _attach_sources(report, state.get("project"))
+        _print_profile(report, args.top, getattr(args, 'sort', 'self'),
+                       getattr(args, 'hats_min', 2.0))
         _print_profile_steps(report, args.steps)
+        if args.children:
+            _print_children(report, args.children, args.top)
         if args.json:
             out = Path(args.json).expanduser()
             out.parent.mkdir(parents=True, exist_ok=True)
@@ -2211,42 +2177,324 @@ def _short_proc(name: str) -> str:
     return (head[:space] if space > 0 else head) + "..."
 
 
-def _print_profile(report: dict, top: int) -> None:
-    """Print the project summary line and ranked procedure table for a report."""
+def _print_children(report: dict, name: str, top: int) -> None:
+    """Print the callees of `name` from the call-graph edges."""
     steps = int(report.get("steps") or 0)
-    total = int(report.get("total_ops") or 0)
-    unattributed = int(report.get("unattributed") or 0)
-    self_total = int(report.get("self_total") or 0)
-    window_ms = float(report.get("window_ms") or 0.0)
-    rate = steps / (window_ms / 1000) if window_ms else 0.0
-    step_ms = float(report.get("step_ms_mean") or 0.0)
-    draws = float(report.get("draws_per_step") or 0.0)
-    blocks = float(report.get("ops_per_step_mean") or 0.0)
-    log(f"profiling: {steps} observed steps in {window_ms:.0f} ms ({rate:.1f} steps/s)")
-    log(f"summary: VM steps/s={rate:.1f} | Step ms={step_ms:.3f} | "
-        f"Draws/step={draws:.2f} | Blocks/step={blocks:.1f}")
-    log(f"operations: total={total} self={self_total} unattributed={unattributed} "
-        f"mean/step={blocks:.1f} max/step={int(report.get('ops_per_step_max') or 0)}")
-    if report.get("per_step_capped"):
-        log("note: per-step series capped (earliest steps retained)")
-    invariant = "ok" if self_total + unattributed == total else "MISMATCH"
-    log(f"invariant sum(self)+unattributed == total: {invariant}")
+    edges = [e for e in (report.get("edges") or [])
+             if name.lower() in str(e.get("caller", "")).lower()]
+    if not edges:
+        log(f"no callees recorded for {name!r} (is the name in the procedure table?)")
+        return
+    by_key = {str(p.get("key")): p for p in (report.get("procedures") or [])}
+    parent_incl = 0
+    parent_self = 0
+    for p in (report.get("procedures") or []):
+        if name.lower() in str(p.get("key", "")).lower():
+            parent_incl = int(p.get("inclusive") or 0)
+            parent_self = int(p.get("self") or 0)
+            break
+    if not parent_incl:
+        parent_incl = sum(int(e.get("inclusive") or 0) for e in edges)
+    log(f"callees of {name}: (share% is of the caller's inclusive; blocks/step is "
+        f"edge-inclusive, i.e. the callee plus everything below it)")
+    log(f"{'callee':40} {'share%':>7} {'blocks/step':>12} {'calls':>7} {'calls/step':>10}")
+    for edge in sorted(edges, key=lambda e: -(e.get("inclusive") or 0))[: max(0, top)]:
+        child = by_key.get(str(edge.get("callee"))) or {}
+        calls = int(edge.get("calls") or 0)
+        incl_ops = int(edge.get("inclusive") or 0)
+        incl = (incl_ops / steps) if steps else 0.0
+        share = (100.0 * incl_ops / parent_incl) if parent_incl else 0.0
+        label = _short_proc(str(edge.get("callee", "?")))
+        if len(label) > 40:
+            label = label[:37] + "..."
+        log(f"{label:40} {share:6.1f}% {incl:12.2f} {calls:7d} "
+            f"{(calls / steps if steps else 0):10.2f}")
+    if parent_self and steps:
+        log(f"(caller self: {parent_self / steps:.2f}/step of "
+            f"{(parent_incl / steps) if steps else 0:.2f} inclusive)")
+
+
+def _proc_name_parts(name: str) -> tuple[str, list[str]]:
+    """('emit_dashed_row', ['world_y', 'clipped_sx_start']) from a Scratch proccode."""
+    proc = ""
+    match = re.match(r"([A-Za-z_][A-Za-z0-9_]*)", name or "")
+    if match:
+        proc = match.group(1)
+    params = re.findall(r"([A-Za-z_][A-Za-z0-9_]*)\s*:\s*%[sbn]", name or "")
+    return proc, params
+
+
+def _attach_sources(report: dict, project_root) -> None:
+    """Map each procedure row to its goboscript source, and record a file manifest.
+
+    A goboscript sprite is one `.gs` file named after the sprite, and procedures are
+    declared as `proc <name> ...`, so file and line come from scanning the project
+    (the VM keeps no source information).
+    """
     rows = report.get("procedures") or []
-    log(f"{'procedure':40} {'calls':>7} {'calls/step':>10} {'self/step':>10} "
-        f"{'incl/step':>10} {'self%':>7}")
-    for row in rows[: max(0, top)]:
-        calls = int(row.get("calls") or 0)
-        calls_per_step = (calls / steps) if steps else 0.0
-        per_step = (int(row.get("self") or 0) / steps) if steps else 0.0
-        incl = (int(row.get("inclusive") or 0) / steps) if steps else 0.0
-        share = 100.0 * float(row.get("share") or 0.0)
+    for row in rows:
+        proc, params = _proc_name_parts(str(row.get("name", "")))
+        row["proc"] = proc
+        row["params"] = params
+        row["kind"] = ("hat" if str(row.get("name", "")).startswith("event_")
+                       else ("procedure" if proc else "internal"))
+        row["resolved"] = False
+    root = Path(str(project_root)) if project_root else None
+    if not root or not root.is_dir():
+        return
+    files: list[dict] = []
+    index: dict[str, tuple[str, int]] = {}
+    skip = {"vendor", "node_modules", ".tools", ".git", "__pycache__"}
+    for path in sorted(root.rglob("*.gs")):
+        rel = path.relative_to(root).as_posix()
+        if any(part in skip for part in Path(rel).parts):
+            continue
+        try:
+            if path.stat().st_size > 2_000_000:
+                continue
+            text = path.read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            continue
+        lines = text.splitlines()
+        files.append({"file": rel, "lines": len(lines),
+                      "sha256": hashlib.sha256(text.encode("utf-8")).hexdigest()[:16]})
+        for number, line in enumerate(lines, 1):
+            match = re.match(r"\s*proc\s+([A-Za-z_][A-Za-z0-9_]*)", line)
+            if match:
+                index.setdefault(match.group(1), (rel, number))
+        if len(files) >= 200:
+            break
+    report["sources"] = {"project_dir": str(root), "files": files}
+    for row in rows:
+        hit = index.get(str(row.get("proc") or ""))
+        if hit:
+            row["file"], row["line"] = hit
+            row["search"] = f'grep -n "proc {row["proc"]}" {hit[0]}'
+            row["resolved"] = True
+            row["kind"] = "procedure"
+
+
+def _print_per_frame(report: dict, order: str, top: int) -> None:
+    """Per-frame share spread plus the slowest frames and their main contributors."""
+    frames = report.get("frames") or []
+    ids = report.get("ids") or {}
+    if not frames:
+        return
+    n = len(frames)
+    totals = [max(1, int(f.get("blocks") or 0)) for f in frames]
+    by_id: dict[int, list[int]] = {}
+    for index, frame in enumerate(frames):
+        for entry in (frame.get("ops") or []):
+            if isinstance(entry, (list, tuple)) and len(entry) == 2:
+                counts = by_id.setdefault(int(entry[0]), [0] * n)
+                counts[index] += int(entry[1])
+
+    def key_for(rid) -> str:
+        return str(ids.get(str(rid)) or ids.get(rid) or f"id{rid}")
+
+    def stats(rid: int):
+        counts = by_id.get(rid)
+        if not counts:
+            return None
+        shares = [c / t for c, t in zip(counts, totals)]
+        if n > 9:
+            deciles = statistics.quantiles(shares, n=10)
+            lo, hi = deciles[0], deciles[-1]
+        else:
+            lo, hi = min(shares), max(shares)
+        return statistics.median(shares), lo, hi, 100.0 * sum(1 for c in counts if c) / n
+
+    log(f"per-frame share ({n} frames; share of each frame's blocks, active% = frames "
+        f"the row appears in):")
+    log(f"{'procedure':40} {'median':>8} {'p10-p90':>15} {'active%':>8}")
+    ranked = report.get("procedures") or []
+    if order in ("incl", "kids"):
+        ranked = sorted(ranked, key=lambda r: -(int(r.get("inclusive") or 0)))
+    shown = 0
+    for row in ranked:
+        outcome = stats(int(row.get("id", -1)))
+        if not outcome:
+            continue
+        median, lo, hi, active = outcome
         label = _short_proc(str(row.get("key", "?")))
         if len(label) > 40:
             label = label[:37] + "..."
-        log(f"{label:40} {calls:7d} "
-            f"{calls_per_step:10.2f} {per_step:10.2f} {incl:10.2f} {share:6.1f}%")
+        log(f"{label:40} {100 * median:7.1f}% {100 * lo:6.1f}-{100 * hi:5.1f}% "
+            f"{active:7.0f}%")
+        shown += 1
+        if shown >= min(max(top, 5), 10):
+            break
+    if len(ranked) > shown:
+        log(f"... {len(ranked) - shown} more in the JSON (frames matrix + ids table)")
+
+    slowest = sorted(range(n), key=lambda i: -float(frames[i].get("step_ms") or 0))[:3]
+    log("slowest frames (instrumented step ms; contributors by share of that frame):")
+    for index in slowest:
+        frame = frames[index]
+        total = max(1, int(frame.get("blocks") or 0))
+        parts = []
+        for entry in sorted((frame.get("ops") or []), key=lambda e: -int(e[1]))[:3]:
+            parts.append(f"{_short_proc(key_for(entry[0])).split(' :: ')[-1][:24]} "
+                         f"{100 * int(entry[1]) / total:.0f}%")
+        log(f"  frame {frame.get('frame')}: {float(frame.get('step_ms') or 0):7.1f} ms, "
+            f"{int(frame.get('blocks') or 0):6d} blocks, "
+            f"{int(frame.get('draws') or 0):4d} draws -> " + ", ".join(parts))
+
+
+def _print_time_share(report: dict, top: int) -> None:
+    """Sampled per-procedure time as a share of the profiled total (never ms).
+
+    The clock is read once per adaptive window and credited to whichever identity ran
+    during it, split into ui-thread (screen-refresh) and all-at-once (without screen
+    refresh). Shares survive the profiler's inflation; the ms totals do not.
+    """
+    total = float(report.get("time_ms_total") or 0.0)
+    samples = int(report.get("time_samples") or 0)
+    if not total or not samples:
+        return
+    ranked = sorted(report.get("procedures") or [],
+                    key=lambda r: -float(r.get("time_share") or 0.0))
+    log(f"profiled time share ({samples} samples, {total:.0f} ms attributed, "
+        f"~{int(report.get('sample_every') or 0)} blocks/sample; instrumented — "
+        f"compare shares, not ms):")
+    log(f"{'procedure':40} {'time%':>7} {'ui%':>6} {'all%':>6} {'blocks%':>8}")
+    shown = 0
+    for row in ranked:
+        share = float(row.get("time_share") or 0.0)
+        if share <= 0:
+            continue
+        ui = 100.0 * float(row.get("ui_time_ms") or 0.0) / total
+        all_at_once = 100.0 * float(row.get("warp_time_ms") or 0.0) / total
+        label = _short_proc(str(row.get("key", "?")))
+        if len(label) > 40:
+            label = label[:37] + "..."
+        log(f"{label:40} {100 * share:6.1f}% {ui:5.1f}% {all_at_once:5.1f}% "
+            f"{100.0 * float(row.get('share') or 0.0):7.1f}%")
+        shown += 1
+        if shown >= min(max(top, 5), 10):
+            break
+    unattributed = float(report.get("unattributed_time_ms") or 0.0)
+    if unattributed:
+        log(f"  (unattributed {100.0 * unattributed / total:.1f}% of sampled time)")
+
+
+def _print_profile(report: dict, top: int, order: str = "self",
+                   hats_min: float = 2.0) -> None:
+    """Print the project summary and ranked procedure table.
+
+    `order` picks the ranking: `self` (own body work, the default), `incl` (whole
+    subtree), or `kids` (subtree below it). Top-level scripts (`event_*` hats) are
+    containers, not optimisable code, so they are summarised in a footer and only
+    listed when they hold at least `hats_min` percent of the counted work.
+    """
+    steps = int(report.get("steps") or 0)
+    all_rows = report.get("procedures") or []
+    total_ops = int(report.get("total_ops") or 0)
+
+    def ops_pct(ops: int) -> float:
+        return (100.0 * ops / total_ops) if total_ops else 0.0
+
+    def is_hat(row: dict) -> bool:
+        return str(row.get("name", "")).startswith("event_")
+
+    def ctx(row: dict) -> str:
+        return {"ui-thread": "ui", "all-at-once": "all", "mixed": "mix"}.get(
+            str(row.get("context") or ""), "?")
+
+    # Top-level scripts are containers rather than optimisable code, but they are also
+    # where a screen-refresh (non-warp) loop lives, so the ones that carry real work are
+    # ranked with everything else and only the small ones are summarised in the footer.
+    hats = [r for r in all_rows if is_hat(r)]
+    big_hats = [h for h in hats if ops_pct(int(h.get("inclusive") or 0)) >= hats_min]
+    rows = [r for r in all_rows if not is_hat(r)] + big_hats
+
+    def rank(row: dict) -> int:
+        self_ops = int(row.get("self") or 0)
+        incl_ops = int(row.get("inclusive") or 0)
+        if order == "incl":
+            return -incl_ops
+        if order == "kids":
+            return -max(0, incl_ops - self_ops)
+        return -self_ops
+
+    rows = sorted(rows, key=rank)
+    # self = ops executed with this procedure innermost (its own body only);
+    # kids = its descendants; incl = self + kids (the grouped subtree cost).
+    # All three percentages share one denominator (all counted ops), so they add up
+    # and are comparable across rows; blocks/step is the inclusive subtree cost.
+    # ctx: ui = screen-refresh (non-warp, cut at the step's work budget),
+    #      all = without-screen-refresh (warp), mix = both.
+    log(f"steps={steps} | Step ms={float(report.get('step_ms_mean') or 0.0):.2f} | "
+        f"Draws/step={float(report.get('draws_per_step') or 0.0):.1f} | "
+        f"Blocks/step={float(report.get('ops_per_step_mean') or 0.0):.1f} | "
+        f"total={total_ops} self={int(report.get('self_total') or 0)} "
+        f"unattributed={int(report.get('unattributed') or 0)}")
+    log(f"{'procedure':40} {'self%':>7} {'kids%':>7} {'incl%':>7} {'ctx':>4} "
+        f"{'blocks/step':>12} {'calls':>7} {'calls/step':>10}")
+    for row in rows[: max(0, top)]:
+        calls = int(row.get("calls") or 0)
+        calls_per_step = (calls / steps) if steps else 0.0
+        self_ops = int(row.get("self") or 0)
+        incl_ops = int(row.get("inclusive") or 0)
+        kids_ops = max(0, incl_ops - self_ops)
+        incl = (incl_ops / steps) if steps else 0.0
+        if total_ops:
+            self_pct = 100.0 * self_ops / total_ops
+            kids_pct = 100.0 * kids_ops / total_ops
+            incl_pct = 100.0 * incl_ops / total_ops
+        else:
+            self_pct = kids_pct = incl_pct = 0.0
+        label = _short_proc(str(row.get("key", "?")))
+        if len(label) > 40:
+            label = label[:37] + "..."
+        log(f"{label:40} {self_pct:6.1f}% {kids_pct:6.1f}% {incl_pct:6.1f}% "
+            f"{ctx(row):>4} {incl:12.2f} {calls:7d} {calls_per_step:10.2f}")
     if len(rows) > top:
         log(f"... {len(rows) - top} more procedure(s) in the JSON report")
+    # A top-level script that carries a large share must never be invisible just
+    # because its own body is small (hats sort last when ranking by self).
+    buried = [h for h in sorted(big_hats, key=lambda r: -int(r.get("inclusive") or 0))
+              if h not in rows[: max(0, top)]]
+    for hat in buried[:4]:
+        label = _short_proc(str(hat.get("key", "?")))
+        if len(label) > 40:
+            label = label[:37] + "..."
+        log(f"top-level: {label:36} {ops_pct(int(hat.get('self') or 0)):5.1f}% self "
+            f"{ops_pct(int(hat.get('inclusive') or 0)):5.1f}% incl  {ctx(hat)}")
+
+    def ops_pct(ops: int) -> float:
+        return (100.0 * ops / total_ops) if total_ops else 0.0
+
+    small_hats = [h for h in hats if h not in big_hats]
+    if small_hats:
+        ranked = sorted(small_hats, key=lambda h: -int(h.get("inclusive") or 0))
+        log(f"({len(ranked)} top-level script(s) below {hats_min:g}% incl omitted, "
+            f"largest: {_short_proc(str(ranked[0].get('key', '?')))})")
+
+    # Screen-refresh (non-warp) work that is still running when the step's work budget
+    # runs out is what starves a frame; blocks/step cannot show it because the loop is
+    # cut at the budget, so call it out explicitly.
+    budget_steps = int(report.get("budget_steps") or 0)
+    work_time = float(report.get("work_time_ms") or 0.0)
+    if budget_steps and steps:
+        log(f"screen-refresh budget: {budget_steps}/{steps} steps used >=90% of the "
+            f"{work_time:.1f} ms work budget")
+        flagged = [r for r in all_rows
+                   if float(r.get("budget_pct") or 0) >= 50.0
+                   and str(r.get("context")) in ("ui-thread", "mixed")
+                   and ops_pct(int(r.get("self") or 0)) >= 5.0]
+        for row in sorted(flagged, key=lambda r: -float(r.get("budget_pct") or 0))[:6]:
+            label = _short_proc(str(row.get("key", "?")))
+            if len(label) > 40:
+                label = label[:37] + "..."
+            log(f"  ! {label:38} held {float(row.get('budget_pct') or 0):5.0f}% of "
+                f"budget-bound steps  {(int(row.get('self') or 0) / steps):9.0f} "
+                f"blocks/step  {ctx(row)}")
+        if not flagged:
+            log("  (no single screen-refresh script dominated those steps)")
+
+    _print_per_frame(report, order, top)
+    _print_time_share(report, top)
 
 
 def _print_profile_steps(report: dict, count: int) -> None:
@@ -2305,10 +2553,6 @@ def cmd_profile(args: argparse.Namespace) -> int:
     dismiss_browser_dialogs(args.port)
     apply_cpu_throttle(cdp, getattr(args, "cpu", 0.0))
     try:
-        if getattr(args, "perf", None) not in (None, "keep"):
-            # Draws/step counts pen drawLine + penStamp submission, which only
-            # happens while render instrumentation is on.
-            cdp.evaluate(f"window.__host.setPerf({json.dumps(args.perf == 'on')})")
         if args.no_reload:
             log("reusing the running project (--no-reload)")
         else:
@@ -2350,10 +2594,11 @@ def cmd_profile(args: argparse.Namespace) -> int:
         if not isinstance(report, dict):
             log("no profiling report (is the host page up to date?)")
             return 1
-        if not bool(cdp.evaluate("window.__host.perf().enabled")):
-            log("draw counter: render instrumentation is OFF - Draws/step reads 0 "
-                "(pass --perf on to count pen/stamp submission)")
-        _print_profile(report, args.top)
+        _attach_sources(report, PROJECT_ROOT)
+        _print_profile(report, args.top, getattr(args, 'sort', 'self'),
+                       getattr(args, 'hats_min', 2.0))
+        if args.children:
+            _print_children(report, args.children, args.top)
         if args.json:
             out = Path(args.json).expanduser()
             out.parent.mkdir(parents=True, exist_ok=True)
@@ -3020,10 +3265,6 @@ def build_parser() -> argparse.ArgumentParser:
     run = subparsers.add_parser("run", help="build, start, and stream logs")
     add_port(run)
     add_cpu(run)
-    run.add_argument(
-        "--perf", choices=["on", "off"],
-        help="set render instrumentation before execution (default: keep host setting)",
-    )
     run.add_argument("--no-build", action="store_true", help="skip goboscript build")
     run.add_argument(
         "--no-reload",
@@ -3251,7 +3492,7 @@ def build_parser() -> argparse.ArgumentParser:
     clones.set_defaults(func=cmd_clones)
 
     perf = subparsers.add_parser(
-        "perf", help="print fps / drawcount / drawcalls / rendertime"
+        "perf", help="print fps / rendertime / steptime snapshot"
     )
     add_port(perf)
     perf.set_defaults(func=cmd_perf)
@@ -3261,26 +3502,6 @@ def build_parser() -> argparse.ArgumentParser:
     )
     add_port(gpu)
     gpu.set_defaults(func=cmd_gpu)
-
-    setperf = subparsers.add_parser(
-        "setperf", help="enable/disable render-side perf instrumentation"
-    )
-    add_port(setperf)
-    setperf.add_argument("mode", choices=["on", "off"])
-    setperf.set_defaults(func=cmd_setperf)
-
-    logic = subparsers.add_parser(
-        "logic", help="print per-frame block op counts (var/list/param/control)"
-    )
-    add_port(logic)
-    logic.set_defaults(func=cmd_logic)
-
-    setlogic = subparsers.add_parser(
-        "setlogic", help="enable/disable logic op-count instrumentation (opt-in)"
-    )
-    add_port(setlogic)
-    setlogic.add_argument("mode", choices=["on", "off"])
-    setlogic.set_defaults(func=cmd_setlogic)
 
     setprof = subparsers.add_parser(
         "setprofiling", help="enable/disable procedure profiling (opt-in, intrusive)"
@@ -3294,6 +3515,14 @@ def build_parser() -> argparse.ArgumentParser:
     )
     add_port(profread)
     profread.add_argument("--top", type=int, default=15, help="procedure rows to print")
+    profread.add_argument("--children", default="",
+                          help="also print the callees of this procedure")
+    profread.add_argument("--sort", choices=["self", "kids", "incl"], default="self",
+                          help="rank by own work (default), subtree below it, or the "
+                               "whole subtree")
+    profread.add_argument("--hats-min", type=float, default=2.0,
+                          help="only list top-level scripts holding at least this %% of "
+                               "the work (default 2)")
     profread.add_argument("--steps", type=int, default=20,
                           help="also print the last N per-step lines (0 disables)")
     profread.add_argument("--json", default="", help="write the full report to this path")
@@ -3315,7 +3544,16 @@ def build_parser() -> argparse.ArgumentParser:
     profile.add_argument("--warmup", type=float, default=0.5,
                          help="seconds to run before the capture window is reset")
     profile.add_argument("--top", type=int, default=15, help="procedure rows to print")
+    profile.add_argument("--children", default="",
+                         help="also print the callees of this procedure (substring match "
+                              "on the procedure key)")
     profile.add_argument("--json", default="", help="write the full report to this path")
+    profile.add_argument("--sort", choices=["self", "kids", "incl"], default="self",
+                         help="rank by own work (default), subtree below it, or the "
+                              "whole subtree")
+    profile.add_argument("--hats-min", type=float, default=2.0,
+                         help="only list top-level scripts holding at least this %% of "
+                              "the work (default 2)")
     profile.add_argument("--no-build", action="store_true", help="skip goboscript build")
     profile.add_argument("--no-reload", action="store_true",
                          help="reuse the running project (no build, no reload)")
@@ -3327,9 +3565,6 @@ def build_parser() -> argparse.ArgumentParser:
                          help="do not stream per-step lines during the capture")
     profile.add_argument("--follow-interval", type=float, default=0.2,
                          help="streaming poll interval (seconds, default 0.2)")
-    profile.add_argument("--perf", choices=["on", "off", "keep"], default="on",
-                         help="render instrumentation for the capture; default on so "
-                              "Draws/step is real (keep/off inherit or disable it)")
     profile.add_argument("--wait-until", default="",
                          help="event-gated start: begin the capture once this variable "
                               "condition is met (excludes load/setup)")

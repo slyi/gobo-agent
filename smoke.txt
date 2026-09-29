@@ -24,7 +24,6 @@ set main.tx 0
 waitframe 4
 expectpixel 0 0 #4c97ff
 
-# Harness-provided render perf metrics (no project code needed).
+# Harness-provided frame/step metrics (no project code needed).
 expect @stepfps > 0
 expect @rendered > 0
-expect @drawcalls >= 1
