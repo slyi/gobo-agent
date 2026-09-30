@@ -636,6 +636,30 @@ def cmd_run(args) -> int:
             if sorted(names) != wanted:
                 log(f"WARNING: expected targets {wanted}, got {names}")
 
+        # Live pages load their project asynchronously and the embed player mounts a
+        # VM with no stepping interval until told. Wait until the bridge can see the
+        # page's project (Stage + a sprite, or a PROJECT_LOADED) before starting or
+        # green-flagging, even when we did not replace an sb3 (--project-id/--url).
+        if not cdp.evaluate("!!window.__host"):
+            ready_deadline = time.monotonic() + 20.0
+            while time.monotonic() < ready_deadline:
+                inject_bridge(cdp, timeout=5)
+                try:
+                    if cdp.evaluate("!!(window.__bridge && window.__bridge.pageReady"
+                                    " && window.__bridge.pageReady())"):
+                        break
+                except (CDPError, TimeoutError, OSError):
+                    pass
+                time.sleep(0.25)
+
+        # The page may have navigated since we first tagged it; re-assert ownership
+        # (close verifies this token) on the settled document before starting.
+        cdp.evaluate(f"window.__bridgeSession = {json.dumps(token)}")
+
+        # The embed player mounts the VM without a stepping interval until play, so
+        # start the loop (frames advance and fps is meaningful); the green flag is
+        # separate and still honours --no-start.
+        cdp.evaluate("window.__bridge.start()")
         if args.no_start:
             pass
         else:
@@ -719,6 +743,7 @@ def _ensure_target(cdp, selector: str, state: dict | None = None,
                 log(f"reloading {sb3.name}: the page replaced the project")
                 encoded = load_sb3_b64(sb3)
                 cdp.evaluate(load_project_script(encoded), await_promise=True, timeout=120)
+                cdp.evaluate("window.__bridge.start()")
                 cdp.evaluate("window.__bridge.greenFlag()")
                 time.sleep(0.4)
             except (CDPError, TimeoutError, OSError):
@@ -948,6 +973,7 @@ def cmd_profile(args) -> int:
             return 1
         cdp.evaluate("window.__bridge.setProfiling(true)")
         cdp.evaluate("window.__bridge.profileReset()")
+        cdp.evaluate("window.__bridge.start()")
         if not args.no_restart:
             cdp.evaluate("window.__bridge.greenFlag()")
         time.sleep(max(0.2, args.seconds))
@@ -965,6 +991,7 @@ def cmd_profile(args) -> int:
 def cmd_restart(args) -> int:
     cdp, _ = attach(args)
     try:
+        cdp.evaluate("window.__bridge.start()")
         cdp.evaluate("window.__bridge.greenFlag()")
         log({"restarted": True})
     finally:
@@ -1034,6 +1061,7 @@ def cmd_session(args) -> int:
                         log(f"[ASSERT FAIL] waitframe {parts[1]} timed out")
                         failures += 1
                 elif verb == "restart":
+                    cdp.evaluate("window.__bridge.start()")
                     cdp.evaluate("window.__bridge.greenFlag()")
                 elif verb == "stop":
                     cdp.evaluate("window.__bridge.stopAll()")
