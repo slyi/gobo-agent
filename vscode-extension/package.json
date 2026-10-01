@@ -1,0 +1,32 @@
+{
+  "name": "gobo-agent-tests",
+  "displayName": "GoboScript Tests (gobo-agent)",
+  "description": "Run gobo-agent test manifests from the VS Code Test Explorer.",
+  "version": "0.1.2",
+  "publisher": "gobo-agent",
+  "private": true,
+  "license": "MIT",
+  "engines": {
+    "vscode": "^1.75.0"
+  },
+  "categories": ["Testing"],
+  "main": "./extension.js",
+  "activationEvents": [
+    "onStartupFinished",
+    "workspaceContains:gobo-tests.json"
+  ],
+  "contributes": {
+    "commands": [
+      {
+        "command": "gobo-agent.refreshTests",
+        "title": "Refresh Tests",
+        "category": "GoboScript"
+      },
+      {
+        "command": "gobo-agent.showLog",
+        "title": "Show Test Log",
+        "category": "GoboScript"
+      }
+    ]
+  }
+}
