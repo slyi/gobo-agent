@@ -367,8 +367,9 @@
       st.opNames = [];
       clearExecuteCache();
     };
-    // Per-draw pen counting: PenSkin.drawLine (covers drawPoint, which delegates).
-    // Counts only (no clock reads), credited to the current window's drawStep.
+    // Per-draw pen counting: PenSkin.drawLine (covers drawPoint, which delegates)
+    // and renderer.penStamp (the `stamp` block). Counts only (no clock reads),
+    // credited to the current window's drawStep.
     const wrapPenSkin = skin => {
       if (!skin || typeof skin.drawLine !== 'function' || skin.drawLine.__gsdevDraw) return;
       const o = skin.drawLine;
@@ -384,6 +385,21 @@
       skin.drawLine = w;
     };
     const installDrawHooks = () => {
+      // The `stamp` block renders through renderer.penStamp(penSkinID, stampID),
+      // not PenSkin.drawLine, so it needs its own hook.
+      if (typeof renderer.penStamp === 'function' && !renderer.penStamp.__gsdevDraw) {
+        const o = renderer.penStamp;
+        const w = function (penSkinID, stampID) {
+          const prof = st.prof;
+          if (!prof || !prof.enabled) return o.call(this, penSkinID, stampID);
+          const result = o.call(this, penSkinID, stampID);
+          prof.drawStep += 1;
+          return result;
+        };
+        w.__gsdevDraw = true;
+        drawWraps.push({ obj: renderer, name: 'penStamp', original: o });
+        renderer.penStamp = w;
+      }
       if (typeof renderer.createPenSkin === 'function' && !renderer.createPenSkin.__gsdevDraw) {
         const o = renderer.createPenSkin;
         const w = function () {

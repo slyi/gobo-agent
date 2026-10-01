@@ -2550,7 +2550,7 @@ def _print_per_frame(report: dict, order: str, top: int) -> None:
         f"the row appears in):")
     log(f"{'procedure':40} {'median':>8} {'p10-p90':>15} {'active%':>8}")
     ranked = report.get("procedures") or []
-    if order in ("incl", "kids"):
+    if order in ("total", "incl", "kids"):
         ranked = sorted(ranked, key=lambda r: -(int(r.get("inclusive") or 0)))
     shown = 0
     for row in ranked:
@@ -2624,10 +2624,11 @@ def _print_profile(report: dict, top: int, order: str = "self",
                    hats_min: float = 2.0) -> None:
     """Print the project summary and ranked procedure table.
 
-    `order` picks the ranking: `self` (own body work, the default), `incl` (whole
-    subtree), or `kids` (subtree below it). Top-level scripts (`event_*` hats) are
-    containers, not optimisable code, so they are summarised in a footer and only
-    listed when they hold at least `hats_min` percent of the counted work.
+    `order` picks the ranking: `self` (own body work, the default), `total` (whole
+    subtree; `incl` is accepted as an alias), or `kids` (subtree below it). Top-level
+    scripts (`event_*` hats) are containers, not optimisable code, so they are
+    summarised in a footer and only listed when they hold at least `hats_min` percent
+    of the counted work.
     """
     steps = int(report.get("steps") or 0)
     all_rows = report.get("procedures") or []
@@ -2653,7 +2654,7 @@ def _print_profile(report: dict, top: int, order: str = "self",
     def rank(row: dict) -> int:
         self_ops = int(row.get("self") or 0)
         incl_ops = int(row.get("inclusive") or 0)
-        if order == "incl":
+        if order in ("total", "incl"):
             return -incl_ops
         if order == "kids":
             return -max(0, incl_ops - self_ops)
@@ -2661,7 +2662,7 @@ def _print_profile(report: dict, top: int, order: str = "self",
 
     rows = sorted(rows, key=rank)
     # self = ops executed with this procedure innermost (its own body only);
-    # kids = its descendants; incl = self + kids (the grouped subtree cost).
+    # kids = its descendants; total = self + kids (the grouped subtree cost).
     # All three percentages share one denominator (all counted ops), so they add up
     # and are comparable across rows; blocks/step is the inclusive subtree cost.
     # ctx: ui = screen-refresh (non-warp, cut at the step's work budget),
@@ -2671,9 +2672,11 @@ def _print_profile(report: dict, top: int, order: str = "self",
         f"Blocks/step={float(report.get('ops_per_step_mean') or 0.0):.1f} | "
         f"total={total_ops} self={int(report.get('self_total') or 0)} "
         f"unattributed={int(report.get('unattributed') or 0)}")
-    log(f"{'procedure':40} {'self%':>7} {'kids%':>7} {'incl%':>7} {'ctx':>4} "
+    log(f"{'procedure':40} {'total%':>7} {'self%':>7} {'kids%':>7} {'ctx':>4} "
         f"{'blocks/step':>12} {'calls':>7} {'calls/step':>10}")
-    for row in rows[: max(0, top)]:
+    shown_rows = sorted(rows[: max(0, top)],
+                        key=lambda r: -int(r.get("inclusive") or 0))
+    for row in shown_rows:
         calls = int(row.get("calls") or 0)
         calls_per_step = (calls / steps) if steps else 0.0
         self_ops = int(row.get("self") or 0)
@@ -2689,10 +2692,10 @@ def _print_profile(report: dict, top: int, order: str = "self",
         label = _short_proc(str(row.get("key", "?")))
         if len(label) > 40:
             label = label[:37] + "..."
-        log(f"{label:40} {self_pct:6.1f}% {kids_pct:6.1f}% {incl_pct:6.1f}% "
+        log(f"{label:40} {incl_pct:6.1f}% {self_pct:6.1f}% {kids_pct:6.1f}% "
             f"{ctx(row):>4} {incl:12.2f} {calls:7d} {calls_per_step:10.2f}")
-    if len(rows) > top:
-        log(f"... {len(rows) - top} more procedure(s) in the JSON report")
+    if len(rows) > len(shown_rows):
+        log(f"... {len(rows) - len(shown_rows)} more procedure(s) in the JSON report")
     # A top-level script that carries a large share must never be invisible just
     # because its own body is small (hats sort last when ranking by self).
     buried = [h for h in sorted(big_hats, key=lambda r: -int(r.get("inclusive") or 0))
@@ -2702,7 +2705,7 @@ def _print_profile(report: dict, top: int, order: str = "self",
         if len(label) > 40:
             label = label[:37] + "..."
         log(f"top-level: {label:36} {ops_pct(int(hat.get('self') or 0)):5.1f}% self "
-            f"{ops_pct(int(hat.get('inclusive') or 0)):5.1f}% incl  {ctx(hat)}")
+            f"{ops_pct(int(hat.get('inclusive') or 0)):5.1f}% total  {ctx(hat)}")
 
     def ops_pct(ops: int) -> float:
         return (100.0 * ops / total_ops) if total_ops else 0.0
@@ -2710,7 +2713,7 @@ def _print_profile(report: dict, top: int, order: str = "self",
     small_hats = [h for h in hats if h not in big_hats]
     if small_hats:
         ranked = sorted(small_hats, key=lambda h: -int(h.get("inclusive") or 0))
-        log(f"({len(ranked)} top-level script(s) below {hats_min:g}% incl omitted, "
+        log(f"({len(ranked)} top-level script(s) below {hats_min:g}% total omitted, "
             f"largest: {_short_proc(str(ranked[0].get('key', '?')))})")
 
     # Screen-refresh (non-warp) work that is still running when the step's work budget
@@ -3771,9 +3774,10 @@ def build_parser() -> argparse.ArgumentParser:
     profread.add_argument("--top", type=int, default=15, help="procedure rows to print")
     profread.add_argument("--children", default="",
                           help="also print the callees of this procedure")
-    profread.add_argument("--sort", choices=["self", "kids", "incl"], default="self",
-                          help="rank by own work (default), subtree below it, or the "
-                               "whole subtree")
+    profread.add_argument("--sort", choices=["self", "kids", "total", "incl"],
+                          default="self",
+                          help="rank by own work (default), callee subtree, or the whole "
+                               "subtree (total; incl is an alias)")
     profread.add_argument("--hats-min", type=float, default=2.0,
                           help="only list top-level scripts holding at least this %% of "
                                "the work (default 2)")
@@ -3802,9 +3806,10 @@ def build_parser() -> argparse.ArgumentParser:
                          help="also print the callees of this procedure (substring match "
                               "on the procedure key)")
     profile.add_argument("--json", default="", help="write the full report to this path")
-    profile.add_argument("--sort", choices=["self", "kids", "incl"], default="self",
-                         help="rank by own work (default), subtree below it, or the "
-                              "whole subtree")
+    profile.add_argument("--sort", choices=["self", "kids", "total", "incl"],
+                         default="self",
+                         help="rank by own work (default), callee subtree, or the whole "
+                              "subtree (total; incl is an alias)")
     profile.add_argument("--hats-min", type=float, default=2.0,
                          help="only list top-level scripts holding at least this %% of "
                               "the work (default 2)")

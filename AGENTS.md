@@ -1,90 +1,226 @@
-# Quick iteration guide
+# Agent workflow
 
-`gobo-agent` builds a GoboScript project, runs it on the **vanilla Scratch VM** in a
-real browser, and lets you drive, inspect, and profile it — so you can change code and
-see what it actually does in a tight loop. No Scratch desktop app, Electron, Node,
-Rust, or compiler toolchain required.
+`gobo-agent` builds a GoboScript project and runs it on the **vanilla Scratch VM** in a
+real browser. It provides input injection, live state inspection/tuning, session
+assertions with failure bundles, and a **built-in procedure profiler**. Use these to
+reproduce, understand, edit and verify a project in a warm browser.
 
-- `tools/gsdev.py` — local build/run loop, unit and functional tests, live tuning,
-  input injection, and profiling.
+- `tools/gsdev.py` — local build/run loop, tests, live tuning, input injection, profiling.
 - `tools/gsbridge.py` — the same style of verbs against a live Scratch site.
 
 Command reference: [README.md](README.md). On macOS/Linux, `./tools/gsdev` and
-`./setup.sh` mirror the PowerShell launchers (same arguments, no admin needed; a
-Chromium-based browser is assumed, Safari is out of scope).
+`./setup.sh` mirror the PowerShell launchers.
+
+## Default working loop
+
+**Start one host and reuse it for the whole task.** Batch validation with
+`session --file`; rebuild/reload in the same browser after source edits; use the
+profiler the harness already provides instead of writing counters.
+
+| OS | Setup | Commands |
+| --- | --- | --- |
+| Windows PowerShell | `setup.ps1` | `tools\gsdev.ps1 ...` |
+| macOS/Linux | `./setup.sh` | `./tools/gsdev ...` |
+
+Windows resolves/downloads portable Python when needed; POSIX launchers require a
+Python 3.10+ (configured, portable, or on `PATH`). Prefer the launchers over assuming
+`python` is on `PATH`. Examples below use the Windows launcher (`tools\gsdev.ps1`); on
+macOS/Linux substitute `./tools/gsdev`, or use `python tools/gsdev.py` on any OS.
+
+```powershell
+# Start once; keep project + browser for later commands.
+tools\gsdev.ps1 run --headless --duration 2 --leave-running
+tools\gsdev.ps1 inspect main
+tools\gsdev.ps1 session --file checks.txt --bundle
+# Edit .gs, then rebuild/reload in that same host.
+tools\gsdev.ps1 run --headless --duration 2 --leave-running
+tools\gsdev.ps1 session --file checks.txt --bundle
+```
+
+Default agent work is **headless** unless a visible run is requested. Bound every `run`
+with `--duration` and add `--leave-running` when later commands must observe running
+scripts. The user's VS Code run task (Ctrl+Shift+B) opens a **visible** host: match that
+mode, or `close` it first rather than starting a second browser.
+
+## Decide which operation you need
+
+| Task | Action |
+| --- | --- |
+| Tune live values | `set` / `set_batch` — no rebuild or reload |
+| Validate current state | `get`, `inspect`, or `session --file` on the standing host |
+| Apply changed source/assets | `run --headless --duration 2 --leave-running` |
+| Observe without replacing the project | add `--no-reload` to `run` |
+| Repeatable test from reloaded state | `test FILE --headless --json` |
+| Find expensive procedures, keep execution | `profile --no-reload --no-restart --seconds 2 --no-follow --leave-running`, then `setprofiling off` |
+| Capture a freshly loaded image | `screenshot --no-build` (skips compile but reloads/stops the project) |
+| End project execution | `stop` — host stays available |
+| Finish an owned session | `close`, once work using it is done |
+
+`--no-build` is valid only when source is unchanged; it still reloads. `--no-reload`
+preserves loaded code/state. Live data edits never replace code. Cold starts are
+justified for initial setup, a deliberate browser-mode change, or a lifecycle test;
+otherwise use warm iteration. Keep independent hosts on explicit ports;
+`--port 0` remembers its choice. A warm host in the wrong headed/headless mode must be
+closed or moved; inspect conflicts, never kill unrelated listeners.
 
 ## Ground rules
 
-- Run browsers **headless** unless a visible investigation is explicitly requested.
-- **Bound** every `run` with `--duration`; add `--leave-running` when later commands
-  must observe scripts still running.
-- **Keep the host warm** between edits; do not `close` after every command.
-- **Rebuild/reload after source changes** (`run` does this). `set`/`set_batch` change
-  data only — they never replace code.
-- **Relaunch after editing `host.js`**: a warm page keeps the previous JavaScript.
+- Run browsers **headless** unless a visible investigation is requested.
+- **Bound** every `run`; **keep the host warm** between edits (do not `close` each time).
+- **Rebuild/reload after code changes**; `set`/`set_batch` change data only.
 - Never reuse a personal browser profile; never treat an unknown port owner as ours.
 
 ## Fast iteration
 
 ```powershell
-python tools/gsdev.py run --headless --duration 2 --leave-running   # keep the host warm
-python tools/gsdev.py get main.tx main.ty
-python tools/gsdev.py set_batch main.tx=120 main.ty=0               # one evaluation
-python tools/gsdev.py screenshot --headless --out debug/check.png
+tools\gsdev.ps1 run --headless --duration 2 --leave-running   # keep the host warm
+tools\gsdev.ps1 get main.tx main.ty
+tools\gsdev.ps1 set_batch main.tx=120 main.ty=0               # one evaluation
+tools\gsdev.ps1 screenshot --headless --out debug/check.png
 ```
 
-- **Prefer live variable edits for iteration.** Tune values with `set` and read the
-  effect on the next frame — no rebuild, reload, or browser restart. Only
-  rebuild/reload when the *code* changed (new/edited blocks, costumes, or `host.js`),
-  never just to try a new value.
-- **Prefer `set_batch` when changing several related values.** It evaluates them in
-  one go, so the VM cannot step between the writes; separate `set` calls are separate
-  evaluations and the VM can observe a half-updated state (a race).
-- `GSDEV_PROJECT=DIR` runs another project with the same host page.
-- `--no-build` only when source is unchanged; `run --no-reload` observes the loaded
-  project without building or loading. `stop` ends scripts; `close` ends the session
-  and its owned server.
-- Use explicit ports for independent hosts (CDP default 9230, HTTP 8077). `--port 0`
-  remembers its choice. A warm host with the wrong headed/headless mode must be
-  closed or moved to another port; inspect conflicts, never kill unrelated listeners.
+Prefer live variable edits for iteration: tune with `set`, read the next frame — no
+rebuild/reload/restart. Prefer `set_batch` when changing several related values so the
+VM cannot step between writes (it is not a rollback transaction if a write fails).
+`GSDEV_PROJECT=DIR` runs another project with the same host page.
 
-## Repeatable unit tests
+## Profiling: find hotspots before guessing
 
-- `test FILE...` builds/reloads each file's project, collects assertions and errors,
-  exits non-zero on failure, and writes a failure bundle under `--artifacts DIR`
-  (manifest, failures with captured state, events, reproduction, optional stage image);
-  `--json` gives a structured report including each bundle path.
-- `session --events PATH` writes versioned assertion records as JSONL and
-  `session --bundle` assembles the same failure bundle from a standing host. A
-  `capture SELECTOR...` line reads that state together with the next `expect` in one
-  evaluation, so a bundle shows assertion-time state, never a later re-read.
-- `session --file PATH` runs verbs against an existing host (one command per line).
-  Use **UTF-8** files: PowerShell 5.1 pipes are not UTF-8, so use `--file` for CJK.
-  Quote `@` selectors in PowerShell.
-- Selectors: `sprite.variable`, `sprite.list[index]` (1-based), bare name = Stage
-  global; `sprite#N` = clone (indices stable only within a frame).
-- Prefer event-driven `wait_frame` / `wait_until` / `wait_pixel` (session spellings
-  `waitframe` / `waituntil` / `waitpixel`) to sleeps; condition waits fail on timeout.
-- `pause` / `step N` / `resume` control logical steps, not elapsed time: timer and
-  `wait` blocks still need real time. The host uses 30-Hz compatibility mode.
-- Input is VM-level: coordinates are Scratch coordinates (centre `0,0`, +x right,
-  +y up). Hold/release keys across frames for polling scripts.
-- Check `errors` / `expect_no_errors`, not just the log stream — captured errors
-  include VM/page exceptions and goboscript `error` logs. Yield in logging loops.
-- The root project and `smoke.txt` are the portable baseline. `examples/` and
-  `tests/` are local fixtures — do not assume they exist in a fresh checkout.
+**Use the built-in `profile` command before writing custom counters or timing hooks.**
+For the scene already loaded in a warm host:
+
+```powershell
+tools\gsdev.ps1 profile --headless --no-reload --no-restart --seconds 2 --no-follow --leave-running --json debug/profile.json
+tools\gsdev.ps1 setprofiling off
+tools\gsdev.ps1 profile --headless --no-reload --no-restart --seconds 2 --sort total --children _3dEngine --no-follow --leave-running
+tools\gsdev.ps1 setprofiling off
+# open the window once the scene is ready (excludes load/setup work):
+tools\gsdev.ps1 profile --headless --seconds 2 --wait-until Tick.loaded --wait-op == --wait-value 1 --no-follow
+```
+
+Omit `--headless` for a visible host. A plain `profile` builds/reloads and restarts the
+project (choose the preservation flags deliberately); without `--leave-running` it
+disables profiling and stops the project after capture, and with it profiling stays
+enabled until `setprofiling off`. Gate capture at an event with
+`--wait-until SEL --wait-op OP --wait-value V` (e.g. wait for `Tick.loaded == 1`), and
+bound it with `--wait-timeout` (default 60 s). Reread the
+current report with `profiling`; manual capture uses `setprofiling on`, `profilereset`,
+then `setprofiling off`.
+
+The summary line reports `steps`, `Step ms` (instrumented, inflated ~2x), `Draws/step`
+(pen line/point **and stamp** submissions, counted only while profiling),
+`Blocks/step` (project-wide mean), `total`, `self`, `unattributed` — and
+`sum(self) + unattributed == total`. The table lists one row per `sprite :: procedure`:
+`total%` (whole subtree), `self%` (own body), `kids%` (callees, `total% = self% +
+kids%`), `ctx`, `blocks/step` (the row's **total** subtree per step), `calls`,
+`calls/step`. Rows are selected by `--sort` (`self`, the default) and printed in
+`total%` order. `top-level:` footer rows are each sprite's `event_*` scripts, shown at
+≥ `--hats-min` percent (default 2). Clones aggregate by original sprite.
+
+Interpret carefully:
+
+- Blocks are executed primitive dispatches, not editor blocks; totals overlap across procedures.
+- `ctx=ui` is screen-refresh scheduling (cut at the step's work budget); `ctx=all` is
+  without-screen-refresh (warp). These are not separate OS threads, and warp can yield.
+- Profiling adds substantial overhead and can alter pacing/yields; use it to locate
+  work and compare **shares**, never as a timing verdict. Verify elapsed-time
+  improvements with profiling off.
+- Draw counts are pen submissions (not proof of GPU saturation); Step ms may include
+  synchronous rendering and does not measure GPU completion.
+- Read `screen-refresh budget` warnings: scheduler-limited `blocks/step` understates backlog.
+
+Plain runs already expose basic `@fps`, `@renderfps`, `@stepfps`, `@rendertime`,
+`@steptime`, `@frame`, `@rendered`, `@gpu` (and `@software`) — profiling is unnecessary
+just to obtain them. `@fps`/`@renderfps` are renderer-call rates, not physical display
+FPS; `@stepfps` is the VM step rate.
+
+## Reviewing the profile JSON
+
+The stdout table is a top-N summary. `--json PATH` also writes the **full** report
+(gsdev and gsbridge), which is what to query for anything beyond the printed rows:
+
+```powershell
+tools\gsdev.ps1 profile --seconds 2 --no-follow --json debug/profile.json
+```
+
+Top-level fields:
+
+- `schema`, `instrumented`, `units`, `aggregated`, `enabled` — format/version metadata.
+- `steps`, `step_boundaries`, `total_ops`, `self_total`, `unattributed`, `unknown` —
+  the invariant is `self_total + unattributed == total_ops`.
+- `ops_per_step_mean`/`_max`, `per_step[]`, `per_step_capped`,
+  `step_series[]` (`{frame, t, step_ms, draws, blocks}`) — per-step blocks/series.
+- `draws_per_step`, `rendered_frames`, `budget_steps`, `work_time_ms` — pen draw counts
+  and the screen-refresh budget.
+- `time_ms_total`, `time_samples`, `ui_time_ms`, `warp_time_ms`, `unattributed_time_ms`,
+  `sample_every` — sampled time shares (instrumented; compare shares only).
+- `procedures[]` — the full list; each row has `key` (`sprite :: procedure`), `self`,
+  `inclusive`, `share`, `calls`, `context`, `ui_ops`/`warp_ops`,
+  `held_steps`/`budget_pct`, `time_ms`/`time_share`, and `dominant` (top opcodes).
+- `edges[]` — call graph (`caller`, `callee`, `calls`, `inclusive`).
+- `frames[]` (+ `frames_truncated`) and `ids{}` — the bounded per-frame per-procedure
+  matrix and the id→key table.
+- `sources` — `.gs` mapping (gsdev only): `files[]` with `lines`/`sha256`, plus
+  per-procedure `file`/`line`/`resolved`/`search` when a `proc` matched. The bridge
+  report has no `sources` (no local project files).
+
+Query it with Python (no extra deps) or `jq`:
+
+```sh
+python -c "import json;r=json.load(open('debug/profile.json'));print(sorted(((p['inclusive'],p['key']) for p in r['procedures']),reverse=True)[:10])"
+jq -r '.procedures[] | "\(.inclusive)\t\(.key)"' debug/profile.json | sort -rn | head
+```
+
+`--sort`, `--top`, `--children` and `--hats-min` only change the printed view; the JSON
+always carries the full set. State the capture window and whether profiling was on when
+reporting numbers.
+
+## Session validation and failure evidence
+
+Prefer one UTF-8 session file of input, event-driven waits and assertions over many
+shell calls. `session` uses one connection against loaded state; `test` builds/reloads
+each test's project. Both report failure through exit status.
+
+```text
+key space down
+waitframe 4
+key space up
+capture main.keys main.tx
+expect main.keys >= 1
+expect_no_errors
+```
+
+Replace selectors with real project names. `capture SELECTOR...` reads the listed state
+together with the next `expect`, in one in-page evaluation, so a failed assertion
+carries assertion-time state. `session --bundle` writes failure evidence under
+`--artifacts` (manifest, failures with captured state, events, reproduction, optional
+stage image); `test --artifacts DIR --json` reports bundle paths. Screenshots are later
+observations. `session --events PATH` records structured assertions as JSONL. Inspect
+the bundle before improvising another run.
+
+## Selectors, waits and input
+
+Selectors are `sprite.variable`, `sprite.list[index]` (1-based), a bare name (Stage
+global), or `sprite#N` clones (indices stable only within a frame). Discover names with
+`inspect`/`props`/`clones`. A leading `@` selects a harness metric, not a project
+variable. Quote `@` selectors in PowerShell.
+
+Prefer event-driven `wait_frame` / `wait_until` / `wait_pixel` (session spellings
+`waitframe` / `waituntil` / `waitpixel`) to sleeps; condition waits fail on timeout.
+`pause` / `step N` / `resume` control logical steps, not elapsed time — timer and `wait`
+blocks still need real time. Input is VM-level: coordinates are Scratch's (centre `0,0`,
++x right, +y up). Hold/release keys across frames for polling scripts; it does not
+operate editor menus or native fields. `broadcast` starts hats; `broadcast_wait` waits
+for their threads (runtime must be running). Check `errors`/`expect_no_errors`, not just
+the log stream. `--software` is for behaviour, not performance.
 
 ## Inspection and debugging
 
-`inspect`, `props`, `prop`, and `clones` expose target state. `broadcast` starts
-hats; `broadcast_wait` waits for their threads (runtime must be running).
-`record` / `trace` capture frame-by-frame values and report overflow; `until …
---pause` captures a matching frame. Prefer the `gsdev:frame` / `gsdev:render`
-events over repeated CDP polling.
-
-Pixel checks must account for sprite visibility, costume silhouettes, and renderer
-pixel alignment: pen widths 1 and 3 have a half-pixel rule, so do not apply a blanket
-offset; canvas-edge clicks are not equivalent to clicks strictly inside the stage.
+`inspect`, `props`, `prop`, `clones` expose target state. `record`/`trace` capture
+frame-by-frame values and report overflow; `until … --pause` captures a matching frame.
+Prefer the `gsdev:frame`/`gsdev:render` events over repeated CDP polling. Pixel checks
+must account for sprite visibility, costume silhouettes and renderer alignment: pen
+widths 1 and 3 have a half-pixel rule, and canvas-edge clicks may lie outside the stage.
 
 ## Live-site checks
 
@@ -96,79 +232,42 @@ python tools/gsbridge.py targets      # confirms the loaded project replaced the
 python tools/gsbridge.py close
 ```
 
-Targets are `localhost`, `github`, `editor`, `production` (`--project-id N`), and
-`url`. `--project DIR` / `--sb3 FILE` load a build; production loads what is already
-on the page. The bridge uses fresh isolated profiles (CDP 9400 default) and exposes a
-**subset** of gsdev — no `watch`/`record`/`until`/`step`/property tools — but the
-shared procedure profiler works there (`profile`, `profiling`, `setprofiling`,
-`profilereset`). Keep one session open only while needed, then `close`.
+Targets are `localhost`, `github`, `editor`, `production` (`--project-id N`), and `url`.
+`--project DIR`/`--sb3 FILE` load a build; production loads what is already on the page.
+The bridge uses fresh isolated profiles (CDP 9400 default) and exposes a **subset** of
+gsdev — no `watch`/`record`/`until`/`step`/property tools — but the shared procedure
+profiler works there (`profile`, `profiling`, `setprofiling`, `profilereset`). `run`
+waits for the page's own project before replacing it, so `targets` should list exactly
+`Stage` plus your sprites (re-load, never delete sprites, if a page applies its project
+late). Live variable edits work on `github`/`editor`; key injection can depend on page
+focus, so verify with `get`. Run gsbridge with a resolved interpreter (on Windows
+`.\.tools\python\python.exe tools\gsbridge.py ...`); the gsdev launcher does not forward.
 
-`run` waits for the page's own project to load before replacing it, so the session is
-never a merge of the two: `targets` should list exactly `Stage` plus your sprites
-(re-load, never sprite deletion, if a page applies its project late). Live variable
-edits work on `github`/`editor`; key injection can depend on page focus, so verify with
-`get` rather than assuming it landed.
+## Platform, runtime and Scratch conventions
 
-## Measuring without fooling yourself
+Use UTF-8 session files, especially for Japanese/CJK on Windows; PowerShell 5.1 pipes
+are not UTF-8. Launcher paths and output support Unicode, but verify target-machine
+behaviour rather than assume every policy/locale is identical. Keep conditions equal
+when comparing runs (build, browser/version, headed vs headless, GPU, stage size,
+inputs) and discard modal-obscured runs rather than trusting them. State the capture
+window and whether profiling was on when reporting numbers.
 
-- Measurement costs, so instrument deliberately. Default: **no instrumentation** — a
-  plain run or test carries only the always-on frame/step timing (fps, step ms), which
-  is effectively free. Escalate only while investigating, to `profile` (~+95-185%,
-  i.e. ~0.23-0.4 us per executed op: per-procedure self/inclusive, call graph,
-  UI-thread vs all-at-once, per-frame share spread, sampled time shares and Draws/step,
-  bounded with `--seconds`/`--wait-until`). Turn it off again, never use instrumented
-  time as a verdict, and say which counter was on when you report numbers. `profile`
-  also counts per-draw pen submission for its Draws/step (the pen hooks are installed
-  only while the window is open); those wrappers are a separate per-draw cost, so do
-  not run profiling merely to get a frame rate. Measure on **step** ms, not frame ms:
-  the host paces at 30 Hz, so a step under ~33 ms reports a cadence-flattened frame and
-  the overhead would read as zero. The ranges above come from paired step-ms A/B runs on
-  one machine/browser over a dispatch-heavy loop and two full games; on a project whose
-  steps are only a few ms the difference is below this harness's resolution, so
-  re-measure rather than quote.
-- `profile` counts executed-primitive operations per VM step and attributes them per
-  procedure and top-level script (`sum(self) + unattributed == total_ops`). Its
-  per-primitive wrapper is intrusive: use it to find hotspots, never as a timing
-  verdict. `profile` streams one line per step by default (`--no-follow` for
-  the summary), `profiling` reprints the current report, `setprofiling on|off` is a
-  silent toggle, `profile --wait-until SEL --wait-op OP --wait-value V` starts the
-  window at an event, and `profilereset` opens one manually. The table shows each
-  procedure's `self%` (own body), `kids%` (its subtree) and `incl%` (both), so a row
-  is self-dominated or a wrapper at a glance; `ctx` says whether the row runs on the
-  **ui-thread** (screen-refresh: the sequencer cuts it when the step's work budget is
-  spent) or `all` (without screen refresh: runs to completion in one step);
-  `--children NAME` breaks a procedure's inclusive work down by callee, and
-  `--sort self|kids|incl` ranks by own body (default), callee subtree, or whole
-  subtree. Top-level `event_*` scripts are containers, so they are only listed when
-  they hold at least `--hats-min` percent of the work (default 2) — and a large one is
-  always shown, even when ranking by self pushes it below `--top`. A separate
-  `screen-refresh budget` line flags the classic mistake of a big loop sitting in a
-  hat: the loop is cut at the budget, so its `blocks/step` *saturates* and understates
-  the damage — read the flag (steps held at the budget), not the block count.
-- `@fps` / `@renderfps` are smoothed renderer-call rates, not physical display FPS or
-  elapsed time; `@stepfps` is the VM step rate and `@rendertime` the time from step
-  entry to the frame's draw. `--software` is for behaviour, not performance.
-- Keep conditions equal when comparing runs (browser and version, headed vs headless,
-  GPU, stage size, inputs, background load) and discard modal-obscured runs rather than
-  trusting them. One machine's browser ranking generalises to nothing.
+Scratch 3 commonly stores bitmaps at **2×** with `bitmap_resolution = 2`; do not
+"fix" a rendering discrepancy by downsampling assets — check the project. TurboWarp-only
+options (`high_quality_pen`, `frame_interpolation`, custom clone limits) must not be
+assumed on production Scratch. The local host uses 30-Hz compatibility and has no
+attached audio engine, so sound-dependent behaviour needs review. The root project and
+`smoke.txt` are the portable baseline; `examples/` and `tests/` are local gitignored
+fixtures that may be absent on another machine.
 
-## Scratch compatibility
+## References and completion
 
-Scratch 3 commonly stores bitmaps at **2×** with `bitmap_resolution = 2` (Scratch 2
-used `1`); scratch-vm honours it, so do not "fix" a rendering discrepancy by
-downsampling assets — check the actual project. TurboWarp-only options such as
-`high_quality_pen`, `frame_interpolation`, and custom clone limits must not be assumed
-to work on production Scratch.
+- [README and setup](README.md)
+- [GoboScript language documentation](https://aspiz.uk/goboscript/docs/language/syntax.html)
+- [Scratch block opcodes](https://en.scratch-wiki.info/wiki/List_of_Block_Opcodes)
 
-## Fidelity notes
-
-- Semantics are upstream Scratch's (interpreter, no compiler).
-- The real GPU is used by default, including `--headless`; `--software` forces
-  ANGLE/SwiftShader (much slower) — trust behaviour there, not performance.
-- The host steps at 30-Hz compatibility. The audio engine is not attached, so
-  projects that use sound may need `scratch-audio`.
-
-## Cleanup
-
-Close the sessions you own when you are done; leave a host running if something else
-still needs it.
+Consult the language docs rather than inventing syntax; verify exact compilation and
+runtime behaviour with the installed compiler, generated SB3 and pinned VM. Opcode
+names do not establish execution cost. Verify changed behaviour with a relevant scenario
+and error checks, report what was tested plus limitations and artifact paths, and keep
+the host warm while related work continues. Close only the sessions you own.
