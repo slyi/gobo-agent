@@ -578,6 +578,7 @@ def cmd_run(args) -> int:
     if cdp is None:
         proc.terminate()
         raise SystemExit(f"no page attached (expected a page matching {match!r})")
+    gsdev.apply_cpu_throttle(cdp, getattr(args, "cpu", 0.0))
     token = uuid.uuid4().hex
     session = dict(target=args.target, url=url, host=match, pid=proc.pid,
                    profile=str(profile), token=token)
@@ -1019,6 +1020,7 @@ def cmd_expect_no_errors(args) -> int:
 # ---------------------------------------------------------------------------
 def cmd_session(args) -> int:
     cdp, _ = attach(args)
+    gsdev.apply_cpu_throttle(cdp, getattr(args, "cpu", 0.0))
     text = Path(args.file).read_text(encoding="utf-8") if args.file else sys.stdin.read()
     failures = 0
     try:
@@ -1151,6 +1153,8 @@ def main(argv=None) -> int:
     run.add_argument("--duration", type=float, default=0.0, help="seconds to stream logs")
     run.add_argument("--leave-running", action="store_true")
     run.add_argument("--no-start", action="store_true", help="do not green-flag")
+    run.add_argument("--cpu", type=float, default=0.0,
+                     help="CPU throttling rate (e.g. 4 = slow phone)")
     run.add_argument("--ready-timeout", type=float, default=45.0)
     add_port(run)
     run.set_defaults(func=cmd_run)
@@ -1238,6 +1242,8 @@ def main(argv=None) -> int:
 
     sess = sub.add_parser("session", help="run a verb script from --file or stdin")
     sess.add_argument("--file")
+    sess.add_argument("--cpu", type=float, default=0.0,
+                      help="CPU throttling rate (e.g. 4 = slow phone)")
     add_port(sess); sess.set_defaults(func=cmd_session)
 
     args = parser.parse_args(argv)

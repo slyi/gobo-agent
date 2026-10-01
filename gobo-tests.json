@@ -1,0 +1,12 @@
+{
+  "schema": 1,
+  "artifacts": "debug",
+  "tests": [
+    {
+      "id": "smoke",
+      "label": "root smoke",
+      "session": "smoke.txt",
+      "root": "."
+    }
+  ]
+}

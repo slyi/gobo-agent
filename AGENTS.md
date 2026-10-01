@@ -63,6 +63,22 @@ otherwise use warm iteration. Keep independent hosts on explicit ports;
 `--port 0` remembers its choice. A warm host in the wrong headed/headless mode must be
 closed or moved; inspect conflicts, never kill unrelated listeners.
 
+## Debug and release builds
+
+`build` / `run` / `screenshot` / `test` / `profile` take `--mode debug|release` (default
+`debug`; `GSDEV_MODE` overrides). A project opts in with `%include tools/gsdev_mode` and
+calls the harness macros as statements — no trailing `;` (the macro owns it):
+
+```text
+DBG_LOG("...")   DBG_SAY("...")   DBG_ADD(target, n)   DBG_SET(target, v)
+```
+
+The project ships a checked-in `tools/gsdev_mode.gs` (debug by default); gobo-agent
+rewrites it for the requested mode, builds, and restores it, so the working tree is
+unchanged. Release expands the macros to nothing, erasing the call **and its arguments**
+at compile time. Switching modes needs a rebuild. Keep safety checks and real state
+changes in release; only diagnostic code belongs in these macros.
+
 ## Ground rules
 
 - Run browsers **headless** unless a visible investigation is requested.
@@ -197,6 +213,17 @@ carries assertion-time state. `session --bundle` writes failure evidence under
 stage image); `test --artifacts DIR --json` reports bundle paths. Screenshots are later
 observations. `session --events PATH` records structured assertions as JSONL. Inspect
 the bundle before improvising another run.
+
+`test --manifest PATH` runs the tests declared in a versioned `gobo-tests.json`
+(schema 1): explicit project roots and session files, with `buildMode` reserved for
+debug/release builds. `--list` validates and lists them read-only (schema, duplicate
+ids, missing files, and root/session path escapes). The shipped manifest runs the root
+`smoke.txt`; the VS Code `Run Tests` task wraps this command in the standing host's
+browser mode — keep fixtures local (root project + `smoke.txt`), not checked in.
+
+An optional maintainer extension (`vscode-extension/`) surfaces the manifest in the
+Test Explorer (discover via `--list`, run via `--json`, Headless and Visible profiles);
+execution stays in the harness. It is not required by end users.
 
 ## Selectors, waits and input
 

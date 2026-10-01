@@ -13,6 +13,13 @@ key space up
 waitframe 4
 expect main.keys >= 1
 
+# debug-only `onkey "d"` hat (DBG_ADD): one more bump via a key-event hat
+key d down
+waitframe 4
+key d up
+waitframe 4
+expect main.keys >= 2
+
 # get pixel: the 96x96 face is solid #4c97ff at its centre
 expectpixel 0 0 #4c97ff
 

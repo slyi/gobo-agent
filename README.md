@@ -94,12 +94,14 @@ builds the project, opens or reuses a **visible browser**, and streams logs and 
 performance readings in the task terminal until you stop it. It does **not** pass
 `--headless`, so the default task is a visible, warm host.
 
-`Terminal > Run Task` lists Setup, Build, Screenshot, Stop project, Close host and
-Check dependencies. Stop ends project execution; Close releases the session (the two
-are different). The integrated terminal then runs the complete automation workflow —
-input injection, live inspection/tuning, session validation, failure bundles and
-profiling. Those are CLI commands; there are no dedicated test or profiling tasks, and
-no extension is required.
+`Terminal > Run Task` lists Setup, Build, **Run Tests**, Screenshot, Stop project,
+Close host and Check dependencies. `Run Tests` runs the test manifest
+(`gobo-tests.json`) in the same browser mode as the standing host and is the default
+test-group task; Screenshot is no longer a test. Stop ends project execution; Close
+releases the session (the two are different). The integrated terminal then runs the
+complete automation workflow — input injection, live inspection/tuning, session
+validation, failure bundles and profiling. Those are CLI commands; there is no
+dedicated profiling task, and no extension is required.
 
 Keep the browser mode consistent with the standing host: a visible VS Code host should
 receive visible CLI runs (or you close it first and start a headless one). Mixing modes
@@ -111,6 +113,17 @@ tools\gsdev.ps1 session --file checks.txt --bundle
 tools\gsdev.ps1 profile --no-reload --no-restart --seconds 2 --no-follow --leave-running
 tools\gsdev.ps1 setprofiling off
 ```
+
+An optional extension in `vscode-extension/` surfaces the manifest in VS Code's **Test
+Explorer**: it discovers `gobo-tests.json` via `test --manifest … --list`, offers Headless
+and Visible run profiles, and runs `test --manifest … --json` through the launcher —
+execution stays in the harness, and it needs no Node at runtime. It is not required (the
+tasks and terminal do the same work). A built
+`vscode-extension/gobo-agent-tests-<version>.vsix` is committed: install it from **Extensions**
+(`Ctrl+Shift+X`) → **⋯** (top-right) → **Install from VSIX…** (activates in the current
+window, no restart), or `code --install-extension …`. Maintainers can rebuild it with
+`npx @vscode/vsce package`. Step-by-step use and troubleshooting are in
+[`vscode-extension/README.md`](vscode-extension/README.md).
 
 For language editing support, see the GoboScript documentation (References below).
 
@@ -226,6 +239,8 @@ expect main.keys >= 1
 ```powershell
 tools\gsdev.ps1 session --file checks.txt --bundle   # failure bundle under --artifacts
 tools\gsdev.ps1 test checks.txt --headless --json    # builds/reloads each test's project
+tools\gsdev.ps1 test --manifest gobo-tests.json --headless   # run the manifest's tests
+tools\gsdev.ps1 test --manifest gobo-tests.json --list       # validate + list (read-only)
 ```
 
 Both report failure through a non-zero exit. `--artifacts DIR` chooses the bundle
@@ -233,6 +248,11 @@ location; a bundle contains a manifest, `failures.json` (with captured state),
 `state.json`, `events.jsonl`, `reproduction.txt`, and an optional `stage.png`, written
 atomically. Passing runs write no bundle. `session --events PATH` writes the versioned
 assertion records as JSONL without assembling a bundle.
+
+`test --manifest PATH` reads a versioned `gobo-tests.json` (schema 1) declaring project
+roots and session files; `--list` validates and lists them read-only (schema, duplicate
+ids, missing files, and root/session path escapes). `buildMode` is reserved for
+debug/release builds and currently ignored.
 
 Useful inspection commands:
 
@@ -249,6 +269,27 @@ Useful inspection commands:
 The standalone `screenshot` command builds/reloads, captures, then stops the project;
 `--no-build` skips compilation but still reloads. It is not a state-preserving snapshot
 of a running scene. Failure-bundle screenshots use the standing host's stage capture.
+
+## Debug and release builds
+
+`build`, `run`, `screenshot`, `test` and `profile` accept `--mode debug|release`
+(default `debug`; `GSDEV_MODE` overrides). A project opts in to the harness diagnostic
+macros with `%include tools/gsdev_mode`:
+
+```text
+DBG_LOG("player spawned")     # `log` in debug, erased in release
+DBG_SAY("paused")             # `say` in debug, erased in release
+DBG_ADD(drawCount, 1)         # drawCount += 1 in debug, erased in release
+DBG_SET(timer, 0)             # timer = 0 in debug, erased in release
+```
+
+The macros are statements and own the trailing `;` — do not add one at the call site. The
+project ships a checked-in `tools/gsdev_mode.gs` (debug by default, so a plain
+`goboscript build` also works); `gobo-agent` rewrites it for the requested mode, builds,
+and restores it, so your working tree is unchanged. Release expands the macros to
+nothing, removing the call **and its arguments** at compile time. Switching modes needs a
+rebuild (`--no-build`/`--no-reload` reuse whatever is built). Put only explicitly
+diagnostic code in these macros — keep safety checks and real state changes in release.
 
 ## Profiling
 
@@ -367,6 +408,11 @@ valid representations of the original text. Different OS/GPU/browser combination
 render and time differently — validate the behaviour you rely on.
 
 ## Configuration and troubleshooting
+
+`--cpu RATE` throttles the renderer's CPU via CDP (e.g. `--cpu 4` ≈ a slow phone).
+It is accepted by `gsdev` `run`/`screenshot`/`profile` and `gsbridge` `run`/`session`.
+It changes timing, so use it to exercise slow-device behaviour, not as a performance
+verdict.
 
 | Setting | Purpose |
 | --- | --- |

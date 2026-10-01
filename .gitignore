@@ -9,6 +9,12 @@ tools/scratchhost/vendor/
 tools/.gsdev-port
 __pycache__/
 
+# VS Code extension: source and the shipped VSIX are committed so end users need no
+# Node; only node_modules/ and stray VSIXes elsewhere are ignored.
+vscode-extension/node_modules/
+*.vsix
+!vscode-extension/*.vsix
+
 # Local Kilo state (agent-manager sessions, local settings)
 /.kilo/
 
@@ -18,6 +24,7 @@ archive/
 
 
 # Local planning/handoff notes (not part of the shipped repo).
+/plans/
 # Listed explicitly rather than with a blanket `*.md`: that pattern silently
 # dropped shipped docs such as tools/*.md, and would swallow a future
 # LICENSE.md / CONTRIBUTING.md / docs/**. README.md, AGENTS.md and tools/*.md
@@ -27,6 +34,7 @@ handover-*.md
 plan-*.md
 rtcfinding.md
 AGENTS-internal.md
+agents_staging.txt
 *_review.txt
 
 # Local perf-investigation reference screenshots now live in archive/ (see above).

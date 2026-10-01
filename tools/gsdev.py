@@ -976,36 +976,74 @@ def host_stage_rect(cdp: CDP) -> dict:
     ))
 
 
-def build_project_at(root: Path) -> Path:
+# --- debug / release builds ---------------------------------------------------
+# A harness-generated include (`lib/gsdev_mode.gs`) provides diagnostic statement
+# macros. Debug expands them to real statements; release erases the statement *and
+# its arguments* at compile time (verified empty macro expansion). A project opts in
+# with `%include lib/gsdev_mode` and calls the macros as statements without a
+# trailing `;` (the macro owns the terminator).
+MODE_MACROS = {
+    "debug": (
+        "%define DBG_LOG(msg) log msg;\n"
+        "%define DBG_SAY(msg) say msg;\n"
+        "%define DBG_ADD(target, n) target += n;\n"
+        "%define DBG_SET(target, v) target = v;\n"
+    ),
+    "release": (
+        "%define DBG_LOG(msg)\n"
+        "%define DBG_SAY(msg)\n"
+        "%define DBG_ADD(target, n)\n"
+        "%define DBG_SET(target, v)\n"
+    ),
+}
+def resolve_mode(args=None) -> str:
+    mode = getattr(args, "mode", None) or os.environ.get("GSDEV_MODE") or "debug"
+    return mode if mode in MODE_MACROS else "debug"
+
+
+def build_project_at(root: Path, mode: str = "debug") -> Path:
     goboscript = resolve_goboscript()
     if goboscript is None:
         raise SystemExit(
             "goboscript is not on PATH. "
             f"{_setup_hint()} (or install the GoboScript compiler)."
         )
-    log(f"building {root}")
-    sb3_path = root / (root.name + ".sb3")
-    # Rely on cwd for the input: newer goboscript uses -i/--input and rejects a
-    # positional directory, while older builds took a positional one.
-    command = [goboscript, "build", "-o", str(sb3_path)]
-    if JSON_MODE:
-        # Keep stdout clean for the JSON report.
-        # goboscript emits UTF-8 diagnostics; decode explicitly so a CP932/Japanese
-        # Windows locale cannot corrupt them or raise UnicodeDecodeError.
-        result = subprocess.run(
-            command, cwd=str(root), capture_output=True, text=True,
-            encoding="utf-8", errors="replace",
-        )
-        print((result.stdout or "") + (result.stderr or ""), end="", file=sys.stderr, flush=True)
+    mode = mode if mode in MODE_MACROS else "debug"
+    # The mode include is a checked-in project file (`tools/gsdev_mode.gs`). Rewrite
+    # it for this build and restore it afterwards, so building never changes the
+    # working tree. A project that does not opt in (no such file) builds unchanged.
+    mode_file = root / "tools" / "gsdev_mode.gs"
+    original = mode_file.read_text(encoding="utf-8") if mode_file.is_file() else None
+    if original is not None:
+        mode_file.write_text(MODE_MACROS[mode], encoding="utf-8")
+        log(f"building {root} ({mode})")
     else:
-        result = subprocess.run(command, cwd=str(root))
+        log(f"building {root}")
+    sb3_path = root / (root.name + ".sb3")
+    # Rely on cwd for the input (3.2.1 uses -i/--input, older builds a positional).
+    command = [goboscript, "build", "-o", str(sb3_path)]
+    try:
+        if JSON_MODE:
+            # Keep stdout clean for the JSON report; decode diagnostics as UTF-8 so a
+            # CP932/Japanese Windows locale cannot corrupt them.
+            result = subprocess.run(
+                command, cwd=str(root), capture_output=True, text=True,
+                encoding="utf-8", errors="replace",
+            )
+            print((result.stdout or "") + (result.stderr or ""), end="",
+                  file=sys.stderr, flush=True)
+        else:
+            result = subprocess.run(command, cwd=str(root))
+    finally:
+        if original is not None:
+            mode_file.write_text(original, encoding="utf-8")
     if result.returncode != 0:
         raise SystemExit(f"goboscript build failed (exit {result.returncode}).")
     return sb3_path
 
 
-def build_project() -> Path:
-    return build_project_at(PROJECT_ROOT)
+def build_project(mode: str = "debug") -> Path:
+    return build_project_at(PROJECT_ROOT, mode)
 
 
 def poll_host(cdp: CDP, since: int = 0) -> dict:
@@ -1020,7 +1058,7 @@ def print_event(event: dict) -> None:
 
 def cmd_build(args: argparse.Namespace) -> int:
     ensure_dependencies(need_bundles=False)
-    build_project()
+    build_project(resolve_mode(args))
     log(f"built {SB3_PATH.name}")
     return 0
 
@@ -1028,7 +1066,7 @@ def cmd_build(args: argparse.Namespace) -> int:
 def cmd_run(args: argparse.Namespace) -> int:
     ensure_dependencies(need_bundles=True)
     if not args.no_build and not args.no_reload:
-        build_project()
+        build_project(resolve_mode(args))
     t0 = time.monotonic()
     cdp, launched = ensure_host(args.port, args.headless, args.software)
     dismiss_browser_dialogs(args.port)
@@ -1094,7 +1132,7 @@ def cmd_run(args: argparse.Namespace) -> int:
 def cmd_screenshot(args: argparse.Namespace) -> int:
     ensure_dependencies(need_bundles=True)
     if not args.no_build:
-        build_project()
+        build_project(resolve_mode(args))
     out_path = Path(args.out).expanduser() if args.out else DEBUG_DIR / "stage.png"
     if not out_path.is_absolute():
         out_path = PROJECT_ROOT / out_path
@@ -1954,19 +1992,132 @@ def project_for_test(path: Path) -> Path:
     return PROJECT_ROOT
 
 
+MANIFEST_SCHEMA = 1
+
+
+def discover_tests(manifest_path: Path) -> tuple[list[dict], list[str]]:
+    """Read a versioned test manifest; validate without running anything.
+
+    Returns ``(tests, errors)``. Each test is ``{id, label, path, root, timeout,
+    buildMode}`` with resolved paths. Validation covers the schema, required fields,
+    duplicate ids, roots/projects existing, and sessions staying under their declared
+    root (no path escape). Read-only: no builds, no browser.
+    """
+    errors: list[str] = []
+    tests: list[dict] = []
+    if not manifest_path.is_file():
+        return [], [f"{manifest_path}: not found"]
+    try:
+        data = json.loads(manifest_path.read_text(encoding="utf-8"))
+    except (OSError, ValueError) as error:
+        return [], [f"{manifest_path}: {error}"]
+    if not isinstance(data, dict):
+        return [], [f"{manifest_path}: top level must be an object"]
+    if data.get("schema") != MANIFEST_SCHEMA:
+        errors.append(f"{manifest_path}: schema must be {MANIFEST_SCHEMA}")
+    base = manifest_path.resolve().parent
+    roots = data.get("roots") or {}
+    default_root = data.get("defaultRoot")
+    raw = data.get("tests")
+    if not isinstance(raw, list) or not raw:
+        errors.append(f"{manifest_path}: 'tests' must be a non-empty list")
+        return [], errors
+    seen: set[str] = set()
+    for index, item in enumerate(raw):
+        if not isinstance(item, dict):
+            errors.append(f"tests[{index}]: must be an object")
+            continue
+        test_id = item.get("id")
+        session = item.get("session")
+        if not isinstance(test_id, str) or not test_id:
+            errors.append(f"tests[{index}]: 'id' is required")
+            test_id = f"tests[{index}]"
+        elif test_id in seen:
+            errors.append(f"{test_id}: duplicate id")
+        else:
+            seen.add(test_id)
+        if not isinstance(session, str) or not session:
+            errors.append(f"{test_id}: 'session' is required")
+            continue
+        root_spec = item.get("root") or default_root or "."
+        root_dir = (base / roots.get(root_spec, root_spec)).resolve()
+        try:
+            root_dir.relative_to(base)
+        except ValueError:
+            errors.append(f"{test_id}: root {root_spec!r} escapes the manifest directory")
+            continue
+        if not (root_dir / "goboscript.toml").is_file():
+            errors.append(f"{test_id}: root {root_spec!r} has no goboscript.toml")
+            continue
+        session_path = (root_dir / session).resolve()
+        try:
+            session_path.relative_to(root_dir)
+        except ValueError:
+            errors.append(f"{test_id}: session {session!r} escapes its root")
+            continue
+        if not session_path.is_file():
+            errors.append(f"{test_id}: session {session!r} not found under {root_dir}")
+            continue
+        tests.append({"id": test_id, "label": item.get("label") or test_id,
+                      "path": session_path, "root": root_dir,
+                      "timeout": item.get("timeout"), "buildMode": item.get("buildMode")})
+    return tests, errors
+
+
 def cmd_test(args: argparse.Namespace) -> int:
-    artifacts = Path(args.artifacts).expanduser() if args.artifacts else DEBUG_DIR
+    manifest_data = None
+    if args.manifest:
+        manifest_path = Path(args.manifest)
+        items, errors = discover_tests(manifest_path)
+        if errors:
+            for error in errors:
+                log(f"manifest: {error}")
+            return 1
+        if args.list:
+            print(json.dumps({
+                "schema": MANIFEST_SCHEMA,
+                "tests": [{"id": t["id"], "label": t["label"],
+                           "session": str(t["path"]), "root": str(t["root"]),
+                           "build_mode": t.get("buildMode")} for t in items],
+            }, separators=(",", ":")), flush=True)
+            return 0
+        if not items:
+            log("manifest: no tests")
+            return 1
+        try:
+            manifest_data = json.loads(manifest_path.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            manifest_data = None
+    else:
+        if args.list:
+            log("--list requires --manifest")
+            return 1
+        if not args.files:
+            log("test: pass FILE... or --manifest PATH")
+            return 1
+        items = [{"id": Path(f).stem, "label": Path(f).stem, "path": Path(f),
+                  "root": project_for_test(Path(f)), "timeout": None,
+                  "buildMode": None} for f in args.files]
+
+    if args.artifacts:
+        artifacts = Path(args.artifacts).expanduser()
+    else:
+        spec = (manifest_data or {}).get("artifacts")
+        artifacts = Path(spec).expanduser() if spec else DEBUG_DIR
     if not artifacts.is_absolute():
         artifacts = PROJECT_ROOT / artifacts
     report = {"files": [], "totals": {"files": 0, "asserts": 0, "failures": 0}}
     any_failed = False
-    for item in args.files:
-        path = Path(item)
-        root = project_for_test(path)
+    for item in items:
+        path = item["path"]
+        root = item["root"]
+        timeout = item.get("timeout") or args.timeout
         sb3_path = root / (root.name + ".sb3")
-        entry = {"path": str(path), "asserts": [], "failures": 0, "errors": 0}
+        entry = {"id": item["id"], "label": item["label"], "path": str(path),
+                 "root": str(root), "build_mode": item.get("buildMode"),
+                 "asserts": [], "failures": 0, "errors": 0}
         if not args.no_build:
-            build_project_at(root)
+            build_project_at(root, resolve_mode(args))
         cdp, _ = ensure_host(args.port, args.headless, args.software)
         try:
             if not args.no_reload:
@@ -1983,7 +2134,7 @@ def cmd_test(args: argparse.Namespace) -> int:
              "--port", str(args.port), "--events", str(events_path)],
             input=path.read_text(encoding="utf-8"),
             capture_output=True, text=True, encoding="utf-8", errors="replace",
-            env=env, timeout=args.timeout,
+            env=env, timeout=timeout,
         )
         output = (proc.stdout or "") + (proc.stderr or "")
         if not JSON_MODE:
@@ -2486,7 +2637,7 @@ def _attach_sources(report: dict, project_root) -> None:
         return
     files: list[dict] = []
     index: dict[str, tuple[str, int]] = {}
-    skip = {"vendor", "node_modules", ".tools", ".git", "__pycache__"}
+    skip = {"vendor", "node_modules", ".tools", ".git", "__pycache__", "debug"}
     for path in sorted(root.rglob("*.gs")):
         rel = path.relative_to(root).as_posix()
         if any(part in skip for part in Path(rel).parts):
@@ -2793,7 +2944,7 @@ def cmd_profile(args: argparse.Namespace) -> int:
     """
     ensure_dependencies(need_bundles=True)
     if not args.no_build and not args.no_reload:
-        build_project()
+        build_project(resolve_mode(args))
     cdp, launched = ensure_host(args.port, args.headless, args.software)
     dismiss_browser_dialogs(args.port)
     apply_cpu_throttle(cdp, getattr(args, "cpu", 0.0))
@@ -3405,7 +3556,8 @@ def cmd_tasks(args: argparse.Namespace) -> int:
         return 1
 
     platform_key = _task_platform_key()
-    known = {"build", "status", "doctor", "selftest", "setup", "run", "screenshot", "stop", "close"}
+    known = {"build", "status", "doctor", "selftest", "setup", "run", "screenshot",
+             "test", "stop", "close"}
     runnable = {"build", "doctor", "stop", "close"}
     labels = {task.get("label", "<unlabeled>") for task in tasks}
     for task in tasks:
@@ -3481,7 +3633,16 @@ def build_parser() -> argparse.ArgumentParser:
     def add_json(sub: argparse.ArgumentParser) -> None:
         sub.add_argument("--json", action="store_true", help="emit a JSON report")
 
-    add_port(subparsers.add_parser("build", help="compile the project"))
+    def add_mode(sub: argparse.ArgumentParser) -> None:
+        sub.add_argument(
+            "--mode", choices=["debug", "release"], default=None,
+            help="build mode (default debug; GSDEV_MODE overrides)",
+        )
+
+    build = subparsers.add_parser("build", help="compile the project")
+    add_port(build)
+    add_mode(build)
+    build.set_defaults(func=cmd_build)
     add_port(subparsers.add_parser("status", help="show sprites and run state"))
 
     doctor = subparsers.add_parser("doctor", help="check that required tools are available")
@@ -3510,6 +3671,7 @@ def build_parser() -> argparse.ArgumentParser:
     run = subparsers.add_parser("run", help="build, start, and stream logs")
     add_port(run)
     add_cpu(run)
+    add_mode(run)
     run.add_argument("--no-build", action="store_true", help="skip goboscript build")
     run.add_argument(
         "--no-reload",
@@ -3529,6 +3691,7 @@ def build_parser() -> argparse.ArgumentParser:
     shot = subparsers.add_parser("screenshot", help="capture the stage to a PNG")
     add_port(shot)
     add_cpu(shot)
+    add_mode(shot)
     shot.add_argument("--no-build", action="store_true", help="skip goboscript build")
     shot.add_argument("--out", default="", help="output path (default debug/stage.png)")
     shot.add_argument("--delay", type=int, default=1200, help="wait before capture in ms")
@@ -3594,10 +3757,16 @@ def build_parser() -> argparse.ArgumentParser:
     session.set_defaults(func=cmd_session)
 
     test = subparsers.add_parser(
-        "test", help="run session files as tests, with a summary or --json report"
+        "test", help="run session files (or a test manifest) as tests"
     )
     add_port(test)
-    test.add_argument("files", nargs="+", help="session files to run as tests")
+    add_mode(test)
+    test.add_argument("files", nargs="*", help="session files to run as tests")
+    test.add_argument("--manifest", default="", help="run the tests in this manifest")
+    test.add_argument(
+        "--list", action="store_true",
+        help="validate and list the manifest's tests without running (requires --manifest)",
+    )
     test.add_argument(
         "--artifacts", default="",
         help="directory for failure screenshots (default debug/)",
@@ -3797,6 +3966,7 @@ def build_parser() -> argparse.ArgumentParser:
     )
     add_port(profile)
     add_cpu(profile)
+    add_mode(profile)
     profile.add_argument("--seconds", type=float, default=2.0,
                          help="capture window in seconds (default 2)")
     profile.add_argument("--warmup", type=float, default=0.5,

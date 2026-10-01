@@ -1,3 +1,5 @@
+%include tools/gsdev_mode
+
 costumes "assets/hello.svg" as "hello";
 
 var seconds = 0;
@@ -9,11 +11,11 @@ var ty = 0;
 onflag {
     seconds = 0;
     show;
-    log "[hello] green flag: GoboScript hello world started";
+    DBG_LOG("[hello] green flag: GoboScript hello world started")
     say "Hello, World!";
     forever {
         seconds += 1;
-        log ("Hello, World! second=" & seconds);
+        DBG_LOG("Hello, World! second=" & seconds)
         wait 1;
     }
 }
@@ -32,10 +34,16 @@ onflag {
         else {
             if armed {
                 keys += 1;
-                log ("[hello] space pressed count=" & keys);
+                DBG_LOG("[hello] space pressed count=" & keys)
                 armed = false;
             }
         }
         wait 0.05;
     }
+}
+
+# Debug-only key hat: pressing "d" bumps the counter through DBG_ADD (erased in
+# release builds). smoke.txt exercises it.
+onkey "d" {
+    DBG_ADD(keys, 1)
 }
