@@ -1,0 +1,104 @@
+name: goboscript prebuilt binaries
+
+# Builds goboscript from a pinned commit and publishes the per-platform
+# archives as release assets, so `gsdev setup` (and end users) can get a fixed
+# compiler without a Rust toolchain. Upstream ships no release with the negative
+# -literal fix (goboscript#158 is fixed only on main), so gobo-agent hosts its
+# own pinned build. See docs/integration.md.
+
+on:
+  workflow_dispatch:
+    inputs:
+      commit:
+        description: goboscript commit to build
+        required: true
+        default: 87014c61d5bb387313b5cbc3d36e7f626c94b943
+      tag:
+        description: release tag to create or update
+        required: true
+        default: goboscript-87014c61
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { os: windows-latest,   target: x86_64-pc-windows-msvc,   asset: goboscript_Windows_x86_64.zip,    kind: zip, experimental: false }
+          - { os: windows-11-arm,   target: aarch64-pc-windows-msvc,  asset: goboscript_Windows_arm64.zip,     kind: zip, experimental: true }
+          - { os: ubuntu-latest,    target: x86_64-unknown-linux-gnu, asset: goboscript_Linux_x86_64.tar.gz,  kind: tar, experimental: false }
+          - { os: ubuntu-24.04-arm, target: aarch64-unknown-linux-gnu, asset: goboscript_Linux_arm64.tar.gz,  kind: tar, experimental: false }
+          - { os: macos-14,         target: aarch64-apple-darwin,     asset: goboscript_Darwin_arm64.tar.gz,  kind: tar, experimental: false }
+          - { os: macos-14,         target: x86_64-apple-darwin,      asset: goboscript_Darwin_x86_64.tar.gz, kind: tar, experimental: false }
+    runs-on: ${{ matrix.os }}
+    continue-on-error: ${{ matrix.experimental }}
+    steps:
+      - name: Checkout gobo-agent (packaging script)
+        uses: actions/checkout@v4
+
+      - name: Checkout goboscript @ ${{ inputs.commit }}
+        uses: actions/checkout@v4
+        with:
+          repository: aspizu/goboscript
+          ref: ${{ inputs.commit }}
+          path: goboscript
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            goboscript/target
+          key: goboscript-${{ matrix.target }}-${{ inputs.commit }}
+
+      - name: Linux build dependencies
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y pkg-config libssl-dev
+
+      - name: Build (release, stripped)
+        working-directory: goboscript
+        run: cargo build --release --locked --target ${{ matrix.target }}
+
+      - name: Package
+        run: python .github/scripts/package_goboscript.py --target ${{ matrix.target }} --asset ${{ matrix.asset }} --kind ${{ matrix.kind }}
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: goboscript-${{ matrix.target }}
+          path: out/${{ matrix.asset }}
+          if-no-files-found: error
+
+  release:
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: Checksums
+        run: |
+          cd dist
+          ls -l
+          sha256sum * > goboscript_checksums.txt
+          cat goboscript_checksums.txt
+
+      - name: Publish release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ inputs.tag }}
+          name: goboscript ${{ inputs.commit }}
+          body: |
+            Prebuilt goboscript from ${{ inputs.commit }} (release profile, stripped).
+            Built by gobo-agent because upstream publishes no release with the
+            goboscript#158 negative-literal fix.
+          files: dist/*
+          fail_on_unmatched_files: true
