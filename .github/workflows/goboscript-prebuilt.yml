@@ -46,6 +46,13 @@ jobs:
           ref: ${{ inputs.commit }}
           path: goboscript
 
+      - name: Build for a portable baseline CPU
+        # goboscript's .cargo/config.toml forces `-Ctarget-cpu=native`, which bakes
+        # in the CI runner's CPU and crashes older machines (Windows 0xC000001D =
+        # illegal instruction). Drop it so the release binaries run everywhere.
+        shell: bash
+        run: rm -f goboscript/.cargo/config.toml
+
       - uses: dtolnay/rust-toolchain@stable
         with:
           targets: ${{ matrix.target }}
