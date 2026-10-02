@@ -182,12 +182,18 @@ def ensure_dependencies(need_bundles: bool = True) -> None:
     """
     missing_tools = resolve_goboscript() is None
     missing_bundles = need_bundles and not host_bundles_present()
-    if not (missing_tools or missing_bundles):
+    missing_sb2gs = not bootstrap.sb2gs_present()
+    if not (missing_tools or missing_bundles or missing_sb2gs):
         return
     if os.environ.get("GSDEV_NO_AUTO_SETUP", "").strip().lower() in ("1", "true", "yes"):
         return  # the caller's error path explains what is missing
     log("dependencies missing; downloading the prebuilt tools (no admin)")
-    bootstrap.run_setup(only="goboscript" if missing_tools and not missing_bundles else None)
+    only = None
+    if missing_tools and not missing_bundles and not missing_sb2gs:
+        only = "goboscript"
+    elif missing_sb2gs and not missing_tools and not missing_bundles:
+        only = "sb2gs"
+    bootstrap.run_setup(only=only)
 
 
 
@@ -3396,8 +3402,26 @@ def cmd_doctor(args: argparse.Namespace) -> int:
 
 
 def cmd_setup(args: argparse.Namespace) -> int:
-    """Download the prebuilt tools (goboscript + host bundles) with no admin."""
+    """Download the prebuilt tools (goboscript + host bundles + sb2gs), no admin."""
     return bootstrap.run_setup(only=args.only, force=args.force, offline=args.offline)
+
+
+def _run_sb2gs(argv: list[str]) -> int:
+    """Install sb2gs only if missing, then run it with argv."""
+    if not bootstrap.sb2gs_present():
+        if os.environ.get("GSDEV_NO_AUTO_SETUP", "").strip().lower() in ("1", "true", "yes"):
+            raise SystemExit("sb2gs is not installed; run `gsdev setup --only sb2gs`")
+        log("sb2gs not installed; downloading it (no admin)")
+        bootstrap.run_setup(only="sb2gs")
+    try:
+        return bootstrap.run_sb2gs(argv)
+    except bootstrap.SetupError as error:
+        raise SystemExit(str(error))
+
+
+def cmd_sb2gs(args: argparse.Namespace) -> int:
+    """Run the bundled sb2gs Scratch importer with the given arguments."""
+    return _run_sb2gs(list(args.sb2gs_args))
 
 
 def cmd_selftest(args: argparse.Namespace) -> int:
@@ -3442,6 +3466,13 @@ def cmd_selftest(args: argparse.Namespace) -> int:
         "portable Python arches",
         "arm64" in python_text and "amd64" in python_text,
         "x64 + arm64 embed zips",
+    )
+    check(
+        "sb2gs pins",
+        len(bootstrap.SB2GS_WHEELS) >= 10
+        and "win_amd64" in bootstrap.SB2GS_PILLOW
+        and bool(bootstrap.SB2GS_ZIP_SHA256),
+        f"{len(bootstrap.SB2GS_WHEELS)} wheels + pillow per platform",
     )
     host_html = (HOST_DIR / "host.html")
     html_text = host_html.read_text(encoding="utf-8") if host_html.exists() else ""
@@ -3650,14 +3681,22 @@ def build_parser() -> argparse.ArgumentParser:
     doctor.set_defaults(func=cmd_doctor)
 
     setup = subparsers.add_parser(
-        "setup", help="download prebuilt goboscript + host bundles (no admin/pip)"
+        "setup", help="download prebuilt goboscript + host bundles + sb2gs (no admin/pip)"
     )
     setup.add_argument(
-        "--only", choices=["goboscript", "vendor"], help="install just one piece"
+        "--only", choices=["goboscript", "vendor", "sb2gs"], help="install just one piece"
     )
     setup.add_argument("--force", action="store_true", help="re-download even if present")
     setup.add_argument("--offline", action="store_true", help="never touch the network")
     setup.set_defaults(func=cmd_setup)
+
+    sb2gs = subparsers.add_parser(
+        "sb2gs", help="import a Scratch project with the bundled sb2gs (e.g. --id 123 name.sb3)"
+    )
+    sb2gs.add_argument(
+        "sb2gs_args", nargs=argparse.REMAINDER, help="arguments forwarded to sb2gs"
+    )
+    sb2gs.set_defaults(func=cmd_sb2gs)
 
     selftest = subparsers.add_parser(
         "selftest", help="check per-platform path/flag logic (incl. macOS)"
@@ -4050,7 +4089,12 @@ def build_parser() -> argparse.ArgumentParser:
 def main(argv: list[str] | None = None) -> int:
     global JSON_MODE
     configure_stdio()
-    args = build_parser().parse_args(argv)
+    raw = list(sys.argv[1:] if argv is None else argv)
+    # `sb2gs` is a pass-through: forward its own flags untouched (argparse would
+    # otherwise try to interpret options like --id itself).
+    if raw and raw[0] == "sb2gs":
+        return _run_sb2gs(raw[1:])
+    args = build_parser().parse_args(raw)
     if getattr(args, "json", False):
         JSON_MODE = True
     if args.command != "build" and hasattr(args, "port"):

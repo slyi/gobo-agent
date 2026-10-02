@@ -12,6 +12,9 @@
     The embeddable zip is the same CPython build as the normal installer (with
     python.exe and the full standard library); it just ships as a plain zip.
 
+    The pinned build is 3.14. The harness itself needs only 3.10+, but 3.14 is
+    required to run the optional `sb2gs` Scratch importer with this interpreter.
+
 .EXAMPLE
     powershell -NoProfile -ExecutionPolicy Bypass -File tools\get-python.ps1
 .EXAMPLE
@@ -19,7 +22,7 @@
 #>
 [CmdletBinding()]
 param(
-    [string]$Version = "3.12.10",
+    [string]$Version = "3.14.3",
     [string]$Dest = "",
     [switch]$Force,
     [switch]$AddToPath
@@ -31,8 +34,8 @@ $ErrorActionPreference = "Stop"
 # signatures but no checksum file for the embed zips, so these were computed from
 # the python.org FTP download.
 $hashes = @{
-    "3.12.10/amd64" = "4acbed6dd1c744b0376e3b1cf57ce906f9dc9e95e68824584c8099a63025a3c3"
-    "3.12.10/arm64" = "3065efc3d382d1cda66757ac71ade11904fa6e350f5a97eb74811acd71ba5532"
+    "3.14.3/amd64" = "ad4961a479dedbeb7c7d113253f8db1b1935586b73c27488712beec4f2c894e6"
+    "3.14.3/arm64" = "3826ea24fb771a0e15aff90ab9bedcbb914d41a5df280b44ae3a43cd61cb9b02"
 }
 
 if (-not $Dest) {

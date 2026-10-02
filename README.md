@@ -76,10 +76,22 @@ expected to be installed):
 
 `GSDEV_PYTHON` overrides the interpreter; otherwise the launchers check
 `.tools/python/bin/python3` (or `GSDEV_PYTHON_DIR`) and then `python3`/`python` on
-`PATH`, requiring 3.10+ in every case. On Windows the portable install is
+`PATH`, requiring 3.10+ in every case. The Windows portable is pinned to 3.14
+(which the optional `sb2gs` Scratch importer needs); the portable install is
 `.\.tools\python\python.exe`. The examples below use the Windows launcher
 (`tools\gsdev.ps1`); on macOS/Linux use `./tools/gsdev`, or `python tools/gsdev.py` on
 any OS.
+
+Setup also installs **sb2gs** (the Scratch → GoboScript importer). It is pinned
+(source commit + wheels) under `.tools/sb2gs/`, with no pip/uv, and needs Python
+3.14+ (the Windows portable is pinned to 3.14). Decompile a Scratch project and
+adopt it in one flow:
+
+```powershell
+tools\gsdev.ps1 sb2gs --id 12345678 my_project.sb3   # download + decompile
+tools\gsdev.ps1 init --project my_project            # adopt with gobo-agent
+my_project\gobo-agent\runtime\tools\gsdev.ps1 run    # then use the project's own launcher
+```
 
 The VS Code tasks (`.vscode/tasks.json`) use the same launchers — `./setup.sh` and
 `./tools/gsdev` on macOS/Linux, `setup.ps1`/`gsdev.ps1` on Windows — so Setup, Build,
