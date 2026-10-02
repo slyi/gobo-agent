@@ -462,8 +462,18 @@ def target_url(args) -> str:
     raise SystemExit(f"unknown target {args.target}")
 
 
+# Temp-dir namespace for bridge profiles/session state. `kilo` is the historical
+# location; read/clear still check it so a session launched by an older build is
+# found, but new state uses the tool's own name.
+_BRIDGE_STATE_APPS = ("gobo-agent", "kilo")
+
+
+def _bridge_temp_dir(app: str) -> Path:
+    return Path(os.environ.get("TEMP", ".")) / app / "gsbridge"
+
+
 def profile_dir(port: int, tag: str) -> Path:
-    base = Path(os.environ.get("TEMP", ".")) / "kilo" / "gsbridge"
+    base = _bridge_temp_dir(_BRIDGE_STATE_APPS[0])
     return base / f"{tag}_{port}_{int(time.time() * 1000)}"
 
 
@@ -474,8 +484,8 @@ def match_for(url: str, target: str) -> str:
     return urlparse(url).netloc or ""
 
 
-def state_path(port: int) -> Path:
-    base = Path(os.environ.get("TEMP", ".")) / "kilo" / "gsbridge"
+def state_path(port: int, app: str | None = None) -> Path:
+    base = _bridge_temp_dir(app or _BRIDGE_STATE_APPS[0])
     base.mkdir(parents=True, exist_ok=True)
     return base / f"session_{port}.json"
 
@@ -488,17 +498,20 @@ def write_state(port: int, **fields) -> None:
 
 
 def read_state(port: int) -> dict:
-    try:
-        return json.loads(state_path(port).read_text(encoding="utf-8"))
-    except (OSError, ValueError):
-        return {}
+    for app in _BRIDGE_STATE_APPS:
+        try:
+            return json.loads(state_path(port, app).read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            continue
+    return {}
 
 
 def clear_state(port: int) -> None:
-    try:
-        state_path(port).unlink()
-    except OSError:
-        pass
+    for app in _BRIDGE_STATE_APPS:
+        try:
+            state_path(port, app).unlink()
+        except OSError:
+            pass
 
 
 def pid_owns_profile(pid: int, profile: str) -> bool:

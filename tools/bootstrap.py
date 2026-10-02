@@ -61,6 +61,13 @@ def _configure_stdio() -> None:
 _configure_stdio()
 
 GOBOSCRIPT_VERSION = "3.2.1"
+# The newest release (3.2.1) carries the goboscript#158 negative-literal
+# regression, which is fixed only on main and has not been released. gobo-agent
+# therefore hosts its own pinned prebuilt (see
+# .github/workflows/goboscript-prebuilt.yml). When the tag below is set it is
+# preferred over the upstream v{GOBOSCRIPT_VERSION} assets; clear it to fall back.
+GOBOSCRIPT_PREBUILT_REPO = "slyi/gobo-agent"
+GOBOSCRIPT_PREBUILT_TAG = "goboscript-87014c61"
 # Pinned to match tools/scratchhost/package.json.
 PACKAGES = {
     "@scratch/scratch-vm": "15.1.1",
@@ -156,9 +163,27 @@ SB2GS_PILLOW = {
 }
 
 
+def default_home() -> Path:
+    """Shared per-user install root so tools are downloaded once per machine.
+
+    ``GSDEV_HOME`` overrides it; otherwise a per-user cache
+    (``%LOCALAPPDATA%\\gobo-agent`` on Windows, ``$XDG_CACHE_HOME/gobo-agent`` or
+    ``~/.cache/gobo-agent`` on POSIX). ``GSDEV_TOOLS`` still overrides the whole
+    tools root (CI uses it to stay repo-local).
+    """
+    override = os.environ.get("GSDEV_HOME")
+    if override:
+        return Path(override).expanduser().resolve()
+    if os.name == "nt":
+        base = os.environ.get("LOCALAPPDATA") or (Path.home() / "AppData" / "Local")
+    else:
+        base = os.environ.get("XDG_CACHE_HOME") or (Path.home() / ".cache")
+    return (Path(base) / "gobo-agent").resolve()
+
+
 def tools_root() -> Path:
     override = os.environ.get("GSDEV_TOOLS")
-    return Path(override).expanduser().resolve() if override else (REPO_ROOT / ".tools").resolve()
+    return Path(override).expanduser().resolve() if override else default_home()
 
 
 def goboscript_dir() -> Path:
@@ -219,8 +244,10 @@ def resolve_goboscript() -> str | None:
     return str(bundled) if bundled is not None else None
 
 
-def vendor_dir() -> Path:
-    return TOOLS_DIR / "scratchhost" / "vendor"
+def bundles_dir() -> Path:
+    # Shared across projects (tools root), so the ~35 MB @scratch bundles are
+    # downloaded once per machine and mounted at /vendor/ by the host server.
+    return tools_root() / "bundles"
 
 
 def node_modules_dir() -> Path:
@@ -232,7 +259,7 @@ def _entry_ok(base: Path) -> bool:
 
 
 def vendor_present() -> bool:
-    return _entry_ok(vendor_dir())
+    return _entry_ok(bundles_dir())
 
 
 def node_modules_present() -> bool:
@@ -296,13 +323,35 @@ def _ensure_dir(path: Path) -> None:
     path.mkdir(parents=True, exist_ok=True)
 
 
+def _goboscript_release_label() -> str:
+    return GOBOSCRIPT_PREBUILT_TAG or f"v{GOBOSCRIPT_VERSION}"
+
+
+def _goboscript_release_base() -> str:
+    """Release base URL: gobo-agent's pinned prebuilt, else upstream's release."""
+    if GOBOSCRIPT_PREBUILT_TAG:
+        return (
+            f"https://github.com/{GOBOSCRIPT_PREBUILT_REPO}/releases/download/"
+            f"{GOBOSCRIPT_PREBUILT_TAG}"
+        )
+    return (
+        "https://github.com/aspizu/goboscript/releases/download/"
+        f"v{GOBOSCRIPT_VERSION}"
+    )
+
+
+def _goboscript_checksums_name() -> str:
+    return (
+        "goboscript_checksums.txt"
+        if GOBOSCRIPT_PREBUILT_TAG
+        else f"goboscript_{GOBOSCRIPT_VERSION}_checksums.txt"
+    )
+
+
 def _latest_checksums(offline: bool) -> dict[str, str]:
     if offline:
         raise SetupError("cannot verify the download without the release checksums (offline)")
-    url = (
-        "https://github.com/aspizu/goboscript/releases/download/"
-        f"v{GOBOSCRIPT_VERSION}/goboscript_{GOBOSCRIPT_VERSION}_checksums.txt"
-    )
+    url = f"{_goboscript_release_base()}/{_goboscript_checksums_name()}"
     text = _download(url, "goboscript checksums").decode("utf-8", "replace")
     checksums: dict[str, str] = {}
     for line in text.splitlines():
@@ -368,21 +417,19 @@ def install_goboscript(force: bool = False, offline: bool = False) -> Path:
                 "note: no native Windows arm64 goboscript is published; using the "
                 "x64 build (Windows 11 runs it under x64 emulation)"
             )
+    label = _goboscript_release_label()
     expected = checksums.get(asset)
     if expected is None:
-        raise SetupError(f"release {GOBOSCRIPT_VERSION} has no asset named {asset}")
-    url = (
-        "https://github.com/aspizu/goboscript/releases/download/"
-        f"v{GOBOSCRIPT_VERSION}/{asset}"
-    )
+        raise SetupError(f"release {label} has no asset named {asset}")
+    url = f"{_goboscript_release_base()}/{asset}"
 
-    data = _download(url, f"goboscript {GOBOSCRIPT_VERSION}")
+    data = _download(url, f"goboscript {label}")
     actual = _sha256(data)
     if actual != expected:
         raise SetupError(f"checksum mismatch for {asset}: expected {expected}, got {actual}")
 
     target = _extract_goboscript(data, kind)
-    _log(f"goboscript {GOBOSCRIPT_VERSION} -> {target}")
+    _log(f"goboscript {label} -> {target}")
     return target
 
 
@@ -442,7 +489,7 @@ def _registry_meta(package: str, version: str) -> dict:
 def _extract_dist_web(data: bytes, package: str) -> int:
     import io
 
-    destination = vendor_dir() / package
+    destination = bundles_dir() / package
     if destination.exists():
         shutil.rmtree(destination)
     prefix = "package/"
@@ -461,7 +508,7 @@ def _extract_dist_web(data: bytes, package: str) -> int:
                 continue
             # Confine extraction to the package dir: a member such as
             # `package/dist/web/../../../evil.js` satisfies the prefixes above but
-            # would otherwise escape vendor_dir().
+            # would otherwise escape bundles_dir().
             out = (base / relative).resolve()
             try:
                 out.relative_to(root)
@@ -480,7 +527,7 @@ def _extract_dist_web(data: bytes, package: str) -> int:
 
 
 def _versions_path() -> Path:
-    return vendor_dir() / ".versions.json"
+    return bundles_dir() / ".versions.json"
 
 
 def install_vendor(force: bool = False, offline: bool = False) -> None:
@@ -490,12 +537,12 @@ def install_vendor(force: bool = False, offline: bool = False) -> None:
         except (OSError, json.JSONDecodeError):
             recorded = {}
         if recorded.get("packages") == PACKAGES:
-            _log(f"host bundles already installed: {vendor_dir()}")
+            _log(f"host bundles already installed: {bundles_dir()}")
             return
     if offline:
         raise SetupError(
             "host bundles are not installed and --offline was given; expected "
-            f"{vendor_dir()}"
+            f"{bundles_dir()}"
         )
 
     for package, version in PACKAGES.items():
@@ -516,11 +563,11 @@ def install_vendor(force: bool = False, offline: bool = False) -> None:
         count = _extract_dist_web(data, package)
         _log(f"{package} {version}: {count} dist/web files")
 
-    _ensure_dir(vendor_dir())
+    _ensure_dir(bundles_dir())
     _versions_path().write_text(
         json.dumps({"packages": PACKAGES}, indent=2) + "\n", encoding="utf-8"
     )
-    _log(f"host bundles -> {vendor_dir()}")
+    _log(f"host bundles -> {bundles_dir()}")
 
 
 def sb2gs_root() -> Path:
@@ -543,12 +590,25 @@ def sb2gs_marker() -> Path:
     return sb2gs_root() / ".installed.json"
 
 
+def system_sb2gs() -> str | None:
+    """A user-installed sb2gs to prefer over our bundled copy.
+
+    ``GSDEV_SB2GS`` (a path to the command) or an ``sb2gs`` on PATH. When present
+    we run the user's own install instead of downloading ours.
+    """
+    override = os.environ.get("GSDEV_SB2GS")
+    if override:
+        return override if Path(override).expanduser().exists() else None
+    return shutil.which("sb2gs")
+
+
 def sb2gs_present() -> bool:
+    # Source + runner + marker are always written; the wheels are optional when
+    # the interpreter already provides sb2gs's packages (see install_sb2gs).
     return (
         (sb2gs_source_dir() / "sb2gs" / "__init__.py").is_file()
-        and (sb2gs_site_dir() / "httpx").is_dir()
-        and (sb2gs_site_dir() / "PIL").is_dir()
         and sb2gs_run_py().is_file()
+        and sb2gs_marker().is_file()
     )
 
 
@@ -561,6 +621,24 @@ def _sb2gs_pillow_key() -> str | None:
     if sys.platform.startswith("linux"):
         return "manylinux_aarch64" if machine in ("aarch64", "arm64") else "manylinux_x86_64"
     return None
+
+
+def _sb2gs_system_packages_ok(source: Path) -> bool:
+    """True when the running interpreter can import sb2gs with no bundled wheels.
+
+    Tries the pinned sb2gs source with only its directory on sys.path; a full
+    Python that already has httpx/pillow/rich/tomlkit (and their deps) imports it,
+    so the wheel download is skipped.
+    """
+    code = "import sys; sys.path.insert(0, sys.argv[1]); import sb2gs"
+    try:
+        result = subprocess.run(
+            [sys.executable, "-c", code, str(source)],
+            capture_output=True, timeout=120,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return False
+    return result.returncode == 0
 
 
 # Inserted before the pinned sb2gs source and wheels on sys.path, then delegate to
@@ -593,6 +671,10 @@ def _unzip_into(data: bytes, destination: Path) -> None:
 
 
 def install_sb2gs(force: bool = False, offline: bool = False) -> None:
+    system = system_sb2gs()
+    if system and not force:
+        _log(f"sb2gs already available: {system} (skipping download)")
+        return
     if sb2gs_present() and not force:
         try:
             recorded = json.loads(sb2gs_marker().read_text(encoding="utf-8"))
@@ -610,13 +692,6 @@ def install_sb2gs(force: bool = False, offline: bool = False) -> None:
         # still runs on 3.10+, so warn rather than failing setup on older Python.
         _log(f"sb2gs needs Python 3.14+; skipping (found {platform.python_version()})")
         return
-    key = _sb2gs_pillow_key()
-    if key is None or key not in SB2GS_PILLOW:
-        raise SetupError(
-            f"no pinned pillow wheel for {sys.platform}/{platform.machine()}; "
-            "sb2gs cannot be installed on this platform"
-        )
-
     source = sb2gs_source_dir()
     if source.exists():
         shutil.rmtree(source)
@@ -640,20 +715,38 @@ def install_sb2gs(force: bool = False, offline: bool = False) -> None:
         raise SetupError("sb2gs source archive had no src/sb2gs files")
 
     site = sb2gs_site_dir()
-    if site.exists():
-        shutil.rmtree(site)
-    wheels = [*SB2GS_WHEELS.values(), SB2GS_PILLOW[key]]
-    for filename, url, sha in wheels:
-        data = _download(url, filename)
-        if hashlib.sha256(data).hexdigest() != sha:
-            raise SetupError(f"checksum mismatch for {filename}")
-        _unzip_into(data, site)
-    _log(f"sb2gs {SB2GS_COMMIT[:8]}: {written} source files, {len(wheels)} wheels")
+    key: str | None = None
+    wheels: list[tuple[str, str, str]] = []
+    if _sb2gs_system_packages_ok(source):
+        # A full interpreter already provides httpx/pillow/rich/tomlkit: skip the
+        # wheels and import them from its own site-packages.
+        if site.exists():
+            shutil.rmtree(site)
+        mode = "system"
+        _log("sb2gs: interpreter already has its packages (skipping wheels)")
+    else:
+        key = _sb2gs_pillow_key()
+        if key is None or key not in SB2GS_PILLOW:
+            raise SetupError(
+                f"no pinned pillow wheel for {sys.platform}/{platform.machine()}; "
+                "sb2gs cannot be installed on this platform"
+            )
+        if site.exists():
+            shutil.rmtree(site)
+        wheels = [*SB2GS_WHEELS.values(), SB2GS_PILLOW[key]]
+        for filename, url, sha in wheels:
+            data = _download(url, filename)
+            if hashlib.sha256(data).hexdigest() != sha:
+                raise SetupError(f"checksum mismatch for {filename}")
+            _unzip_into(data, site)
+        mode = "bundled"
+    detail = f"{len(wheels)} wheels" if wheels else "system packages"
+    _log(f"sb2gs {SB2GS_COMMIT[:8]}: {written} source files, {detail}")
 
     sb2gs_run_py().write_text(SB2GS_RUNNER, encoding="utf-8")
     sb2gs_marker().write_text(
         json.dumps(
-            {"commit": SB2GS_COMMIT, "pillow": key,
+            {"commit": SB2GS_COMMIT, "mode": mode, "pillow": key,
              "packages": sorted(SB2GS_WHEELS)},
             indent=2,
         ) + "\n",
@@ -690,9 +783,9 @@ def status() -> dict:
         "goboscriptSource": (
             "bundled" if resolved_is_bundled else ("system" if resolved else None)
         ),
-        "vendor": str(vendor_dir()) if vendor_present() else None,
+        "vendor": str(bundles_dir()) if vendor_present() else None,
         "nodeModules": str(node_modules_dir()) if node_modules_present() else None,
-        "sb2gs": str(sb2gs_source_dir()) if sb2gs_present() else None,
+        "sb2gs": system_sb2gs() or (str(sb2gs_source_dir()) if sb2gs_present() else None),
     }
 
 

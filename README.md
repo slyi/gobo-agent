@@ -38,8 +38,10 @@ or a coding agent.
 | `tools/gsdev.py` | Local build/run loop, unit and functional tests, live tuning, profiling |
 | `tools/gsbridge.py` | Same-style verbs on the GitHub player, editor, embed, or a URL |
 
-Host internals (the static host page and pinned `@scratch/*` bundles) live in
-`tools/scratchhost/`. Iteration guidance is in [AGENTS.md](AGENTS.md).
+Host internals (the static host page) live in `tools/scratchhost/`; the pinned
+`@scratch/*` bundles are shared under the tools root's `bundles/` and mounted at
+`/vendor/` by the host server, so they are downloaded once per machine. Iteration
+guidance is in [AGENTS.md](AGENTS.md).
 
 ## Requirements
 
@@ -74,18 +76,23 @@ expected to be installed):
 ./setup.sh --only vendor --force  # other bootstrap flags pass straight through
 ```
 
-`GSDEV_PYTHON` overrides the interpreter; otherwise the launchers check
-`.tools/python/bin/python3` (or `GSDEV_PYTHON_DIR`) and then `python3`/`python` on
-`PATH`, requiring 3.10+ in every case. The Windows portable is pinned to 3.14
-(which the optional `sb2gs` Scratch importer needs); the portable install is
-`.\.tools\python\python.exe`. The examples below use the Windows launcher
-(`tools\gsdev.ps1`); on macOS/Linux use `./tools/gsdev`, or `python tools/gsdev.py` on
-any OS.
+`GSDEV_PYTHON` overrides the interpreter; otherwise the launchers check the tools
+root's `python/` (or `GSDEV_PYTHON_DIR`) and then `python3`/`python` on `PATH`,
+requiring 3.10+ in every case. The tools root is `GSDEV_TOOLS`, else `GSDEV_HOME`,
+else a per-user cache (`%LOCALAPPDATA%\gobo-agent` on Windows,
+`~/.cache/gobo-agent` on macOS/Linux), so goboscript, sb2gs, the portable Python and
+the `@scratch/*` host bundles are downloaded once per machine and shared by every
+project. `setup` skips anything already on `PATH`. The examples below use the Windows launcher (`tools\gsdev.ps1`);
+on macOS/Linux use `./tools/gsdev`, or `python tools/gsdev.py` on any OS.
 
-Setup also installs **sb2gs** (the Scratch → GoboScript importer). It is pinned
-(source commit + wheels) under `.tools/sb2gs/`, with no pip/uv, and needs Python
-3.14+ (the Windows portable is pinned to 3.14). Decompile a Scratch project and
-adopt it in one flow:
+**goboscript** is fetched from gobo-agent's pinned prebuilt release (a fixed build of
+upstream `main`), because upstream's newest release predates the goboscript#158
+negative-literal fix; a `goboscript` on `PATH` still takes precedence.
+
+Setup also provides **sb2gs** (the Scratch → GoboScript importer). It uses an
+`sb2gs` already on `PATH` (or `GSDEV_SB2GS`); otherwise it installs a pinned copy
+(source commit + wheels) under the tools root's `sb2gs/`, with no pip/uv. It needs
+Python 3.14+. Decompile a Scratch project and adopt it in one flow:
 
 ```powershell
 tools\gsdev.ps1 sb2gs --id 12345678 my_project.sb3   # download + decompile
@@ -97,6 +104,10 @@ The VS Code tasks (`.vscode/tasks.json`) use the same launchers — `./setup.sh`
 `./tools/gsdev` on macOS/Linux, `setup.ps1`/`gsdev.ps1` on Windows — so Setup, Build,
 Run, Screenshot, Stop, Close and Check dependencies behave identically on both.
 `python tools/gsdev.py tasks [--run]` verifies that resolution for the current OS.
+
+Putting gobo-agent into a project you already have (rather than using this repo as
+the template)? See the [integration guide](docs/integration.md) — `gsdev init`
+adopts a project into a single `gobo-agent/` folder.
 
 ## VS Code
 
@@ -127,17 +138,24 @@ tools\gsdev.ps1 setprofiling off
 ```
 
 An optional extension in `vscode-extension/` surfaces the manifest in VS Code's **Test
-Explorer**: it discovers `gobo-tests.json` via `test --manifest … --list`, offers Headless
-and Visible run profiles, and runs `test --manifest … --json` through the launcher —
-execution stays in the harness, and it needs no Node at runtime. It is not required (the
-tasks and terminal do the same work). A built
-`vscode-extension/gobo-agent-tests-<version>.vsix` is committed: install it from **Extensions**
-(`Ctrl+Shift+X`) → **⋯** (top-right) → **Install from VSIX…** (activates in the current
-window, no restart), or `code --install-extension …`. Maintainers can rebuild it with
-`npx @vscode/vsce package`. Step-by-step use and troubleshooting are in
+Explorer**: it discovers `gobo-tests.json` (at the workspace root, or under `gobo-agent/`
+for an adopted project) via `test --manifest … --list`, offers Headless and Visible run
+profiles, and runs `test --manifest … --json` through the project's launcher — execution
+stays in the harness, and it needs no Node at runtime. It uses a per-project auto port, so
+two projects don't collide. It is not required (the tasks and terminal do the same work).
+A built `vscode-extension/gobo-agent-tests-<version>.vsix` is committed: install it from
+**Extensions** (`Ctrl+Shift+X`) → **⋯** (top-right) → **Install from VSIX…** (activates in
+the current window, no restart), or `code --install-extension …`. Maintainers can rebuild
+it with `npx @vscode/vsce package`. Step-by-step use and troubleshooting are in
 [`vscode-extension/README.md`](vscode-extension/README.md).
 
-For language editing support, see the GoboScript documentation (References below).
+For language editing, the upstream **`aspizu.goboscript`** extension adds syntax, snippets,
+build-on-save diagnostics, and a `.sb3` **preview**. It has **no debugger** — don't press
+F5/Run‑Debug; build with gobo-agent and open the built `.sb3` for its preview (▶/⏹/⟳ live in
+the preview toolbar). Point it at gobo-agent's pinned compiler so it works without
+`goboscript` on `PATH`, e.g. `"goboscript.compilerPath":
+"C:/Users/<you>/AppData/Local/gobo-agent/goboscript/goboscript.exe"`. It coexists cleanly
+with the gobo-agent-tests extension. Language reference: GoboScript docs (References below).
 
 ## Warm edit-and-check loop
 
@@ -389,8 +407,8 @@ OP --wait-value V`. Draw submissions are counted while profiling; basic `@fps`/
 ## Check on live Scratch sites
 
 `tools/gsbridge.py` uses the same verbs against hosted pages; the `gsdev` launcher
-invokes gsdev, not gsbridge, so run gsbridge with a resolved interpreter (on Windows,
-`.\.tools\python\python.exe tools\gsbridge.py ...` when Python is not on `PATH`).
+invokes gsdev, not gsbridge, so run gsbridge with a resolved interpreter (the shared
+`tools-root/python/python.exe`, or a `python` on `PATH`).
 
 ```powershell
 python tools/gsbridge.py run --target github --project . --headless --duration 6 --leave-running
@@ -430,7 +448,9 @@ verdict.
 | --- | --- |
 | `GSDEV_PROJECT` | Project directory (default: this repository) |
 | `GSDEV_PYTHON`, `GSDEV_PYTHON_DIR` | Interpreter / portable install directory |
-| `GSDEV_GOBOSCRIPT`, `GSDEV_TOOLS` | Compiler override / bundled-tools directory |
+| `GSDEV_GOBOSCRIPT` | Compiler override (else `PATH`, else the pinned bundle) |
+| `GSDEV_TOOLS`, `GSDEV_HOME` | Tools root override / shared per-user home |
+| `GSDEV_SB2GS` | Use this sb2gs command (else `PATH`, else the pinned bundle) |
 | `GSDEV_BROWSER` | Browser executable |
 | `GSDEV_CDP_PORT`, `--port` | Local CDP port (default 9230); `--port 0` picks one |
 | `GSDEV_HOST_PORT` | Local static-server port (default 8077) |
@@ -466,6 +486,7 @@ sound-dependent behaviour needs review.
 ## References
 
 - [Agent iteration guide](AGENTS.md)
+- [Integrating gobo-agent into an existing project](docs/integration.md)
 - [GoboScript syntax and language documentation](https://aspiz.uk/goboscript/docs/language/syntax.html)
 - [Scratch opcode reference](https://en.scratch-wiki.info/wiki/List_of_Block_Opcodes)
 

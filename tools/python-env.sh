@@ -10,7 +10,8 @@
 #
 # Resolution order, identical in spirit to the PowerShell version:
 #   1. $GSDEV_PYTHON
-#   2. $GSDEV_PYTHON_DIR/bin/python3 (default: <repo>/.tools/python/bin/python3)
+#   2. $GSDEV_PYTHON_DIR/bin/python3 (default: <tools-root>/python/bin/python3,
+#      shared per user; see GSDEV_TOOLS/GSDEV_HOME)
 #   3. python3, then python, on PATH
 
 gsdev_python_is_310() {
@@ -19,11 +20,23 @@ gsdev_python_is_310() {
         >/dev/null 2>&1
 }
 
+# Shared per-user install root (goboscript, sb2gs, python). Mirrors
+# bootstrap.default_home(): GSDEV_TOOLS, then GSDEV_HOME, then ~/.cache.
+gsdev_tools_root() {
+    if [ -n "${GSDEV_TOOLS:-}" ]; then
+        printf '%s\n' "$GSDEV_TOOLS"
+    elif [ -n "${GSDEV_HOME:-}" ]; then
+        printf '%s\n' "$GSDEV_HOME"
+    else
+        printf '%s\n' "${XDG_CACHE_HOME:-$HOME/.cache}/gobo-agent"
+    fi
+}
+
 gsdev_python_dir() {
     if [ -n "${GSDEV_PYTHON_DIR:-}" ]; then
         printf '%s\n' "$GSDEV_PYTHON_DIR"
     else
-        printf '%s\n' "${GSDEV_ROOT%/}/.tools/python"
+        printf '%s\n' "$(gsdev_tools_root)/python"
     fi
 }
 
@@ -57,7 +70,8 @@ gsdev_python_hint() {
     cat >&2 <<'EOF'
 [gsdev] Python 3.10+ not found.
   Install one (macOS: brew install python; Debian/Ubuntu: sudo apt install python3),
-  point GSDEV_PYTHON at an interpreter, or place a portable interpreter in
-  .tools/python/bin/python3 (or set GSDEV_PYTHON_DIR).
+  point GSDEV_PYTHON at an interpreter, or place a portable interpreter under
+  the tools root's python/ (or set GSDEV_PYTHON_DIR). The tools root is
+  GSDEV_TOOLS, else GSDEV_HOME, else ~/.cache/gobo-agent.
 EOF
 }

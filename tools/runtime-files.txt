@@ -1,0 +1,24 @@
+# Files installed by `gsdev init --layout copy` into <project>/gobo-agent/runtime/.
+# Paths are relative to the gobo-agent repo root; comments and blank lines are
+# ignored. Keep this the single source of truth for the runtime subset (shared by
+# `init --layout copy` and release packaging) so the list is maintained once.
+setup.ps1
+setup.cmd
+setup.sh
+LICENSE
+tools/gsdev.py
+tools/bootstrap.py
+tools/cdp.py
+tools/hostserver.py
+tools/python-env.ps1
+tools/python-env.sh
+tools/get-python.ps1
+tools/gsdev.ps1
+tools/gsdev.cmd
+tools/gsdev
+tools/gsdev_mode.gs
+tools/scratchhost/host.html
+tools/scratchhost/host.js
+tools/scratchhost/profiler.js
+tools/scratchhost/package.json
+tools/scratchhost/package-lock.json

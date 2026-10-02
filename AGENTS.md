@@ -9,7 +9,10 @@ reproduce, understand, edit and verify a project in a warm browser.
 - `tools/gsbridge.py` — the same style of verbs against a live Scratch site.
 
 Command reference: [README.md](README.md). On macOS/Linux, `./tools/gsdev` and
-`./setup.sh` mirror the PowerShell launchers.
+`./setup.sh` mirror the PowerShell launchers. Putting gobo-agent into an existing
+project (rather than using this repo as the template)? See the
+[integration guide](docs/integration.md) — `gsdev init` adopts a project into a single
+`gobo-agent/` folder.
 
 ## Default working loop
 
@@ -287,9 +290,26 @@ attached audio engine, so sound-dependent behaviour needs review. The root proje
 `smoke.txt` are the portable baseline; `examples/` and `tests/` are local gitignored
 fixtures that may be absent on another machine.
 
+## Credit and provenance
+
+If you reuse code, assets, or an idea from a published Scratch project (or any
+other production project), add a provenance comment in the GoboScript source so
+the original authors are credited — next to the code you borrowed, not only in a
+README:
+
+```text
+# Adapted from "<project title>" by <author> (scratch.mit.edu/projects/<id>), <license>.
+```
+
+Scratch projects are shared under CC BY-SA 2.0 by default, but state whatever
+license the project actually uses. This applies to converted projects too: when a
+project was decompiled (for example with sb2gs), record where the original came
+from before editing it.
+
 ## References and completion
 
 - [README and setup](README.md)
+- [Integrating gobo-agent into an existing project](docs/integration.md)
 - [GoboScript language documentation](https://aspiz.uk/goboscript/docs/language/syntax.html)
 - [Scratch block opcodes](https://en.scratch-wiki.info/wiki/List_of_Block_Opcodes)
 

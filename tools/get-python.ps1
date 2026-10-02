@@ -4,10 +4,12 @@
 
 .DESCRIPTION
     gobo-agent needs Python 3.10+. On a clean Windows box this downloads the
-    official CPython "embeddable" zip into <repo>\.tools\python (override with
-    GSDEV_PYTHON_DIR) and checks it can do HTTPS and import the standard-library
-    modules the tools use. No installer, no registry writes, and no PATH change
-    unless -AddToPath is given, so it works with no administrator rights.
+    official CPython "embeddable" zip into the shared tools root's python\
+    (<tools-root>\python, override with GSDEV_PYTHON_DIR) and checks it can do
+    HTTPS and import the standard-library modules the tools use. The tools root is
+    GSDEV_TOOLS, else GSDEV_HOME, else %LOCALAPPDATA%\gobo-agent. No installer, no
+    registry writes, and no PATH change unless -AddToPath is given, so it works
+    with no administrator rights.
 
     The embeddable zip is the same CPython build as the normal installer (with
     python.exe and the full standard library); it just ships as a plain zip.
@@ -42,7 +44,14 @@ if (-not $Dest) {
     if ($env:GSDEV_PYTHON_DIR) {
         $Dest = $env:GSDEV_PYTHON_DIR
     } else {
-        $Dest = Join-Path (Split-Path -Parent $PSScriptRoot) ".tools\python"
+        # Shared per-user tools root (mirrors bootstrap.default_home() and
+        # python-env.ps1): GSDEV_TOOLS, then GSDEV_HOME, then the per-user cache.
+        $toolsRoot = $null
+        if ($env:GSDEV_TOOLS) { $toolsRoot = $env:GSDEV_TOOLS }
+        elseif ($env:GSDEV_HOME) { $toolsRoot = $env:GSDEV_HOME }
+        elseif ($env:LOCALAPPDATA) { $toolsRoot = Join-Path $env:LOCALAPPDATA "gobo-agent" }
+        else { $toolsRoot = Join-Path $HOME "AppData\Local\gobo-agent" }
+        $Dest = Join-Path $toolsRoot "python"
     }
 }
 

@@ -2,7 +2,8 @@
 
 Optional, maintainer-only extension that shows the `gobo-tests.json` manifest in VS
 Code's **Test Explorer**. It only discovers and runs tests through the gobo-agent CLI
-(`tools/gsdev`); execution stays in the harness. It has **no npm dependencies** and no
+(`tools/gsdev` in the repo, `gobo-agent/runtime/tools/gsdev` in an adopted project);
+execution stays in the harness. It has **no npm dependencies** and no
 build step, and it is not required — the `Run Tests` task and the terminal do the same
 work.
 
@@ -10,8 +11,10 @@ work.
 
 - Run gobo-agent setup once (`tools\gsdev.ps1 doctor` should pass), so the launcher can
   resolve Python and the compiler.
-- A `gobo-tests.json` (schema 1) in the workspace folder. The repo ships one that runs
-  the root `smoke.txt`.
+- A `gobo-tests.json` (schema 1): at the workspace root (the repo ships one that runs the
+  root `smoke.txt`), or under `gobo-agent/` in a project adopted with `gsdev init`. The
+  extension finds the launcher at `tools/gsdev.*` (repo) or `gobo-agent/runtime/tools/gsdev.*`
+  (adopted), and discovers the manifest at either location.
 - **Trust the workspace** — VS Code will not run project code in an untrusted workspace,
   and the extension refuses to run tests there.
 
@@ -68,8 +71,8 @@ Code's window handling the host may open **without a folder**; if so, use the in
 extension above instead — F5 is optional. When it does open with the repo folder, the
 **Testing** view lists the tests as above.
 
-Both paths run their own browser on port **9235**, separate from your interactive host
-(default **9230**). Don't point a normal run/test at 9235 while the extension is using it.
+Both paths run their own browser on a **per-project auto port** (`--port 0`), separate
+from your interactive host (default **9230**), so two projects never collide.
 
 ## What it runs
 
@@ -85,11 +88,11 @@ Both paths run their own browser on port **9235**, separate from your interactiv
   Extension Development Host already inherits the repo folder. Don't *Open Folder* for
   the same folder (VS Code focuses the existing window); close the extra window and press
   F5 again.
-- **No tests appear** — check the workspace is trusted, `gobo-tests.json` is at the
-  folder root, and setup has run. `--list` errors are written to the **GoboScript tests**
-  output channel.
+- **No tests appear** — check the workspace is trusted, `gobo-tests.json` is present (at
+  the folder root, or under `gobo-agent/` for an adopted project), and setup has run.
+  `--list` errors are written to the **GoboScript tests** output channel.
 - **Python / `test` errors** — run setup; on Windows it fetches portable Python.
-- **"run failed" with a port error** — something else is on 9235; close it with
-  `tools\gsdev.ps1 close --port 9235`, or change `PORT` in `extension.js`.
+- **"run failed" with a port error** — a leftover host from another project; close it
+  with `tools\gsdev.ps1 close --port <n>` (the message names the port), or `close --port 0`.
 - **Manifest problems** (duplicate ids, missing sessions, path escapes) — validate with
   `tools\gsdev.ps1 test --manifest gobo-tests.json --list`.

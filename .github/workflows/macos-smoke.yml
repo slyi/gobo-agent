@@ -15,6 +15,12 @@ on:
 permissions:
   contents: read
 
+# Keep CI hermetic: install into the checkout's .tools instead of the shared
+# per-user home the CLI now defaults to.
+env:
+  GSDEV_TOOLS: ${{ github.workspace }}/.tools
+  GSDEV_PYTHON_DIR: ${{ github.workspace }}/.tools/python
+
 jobs:
   macos:
     # macos-14 is Apple Silicon; the workflow picks the matching goboscript build.
@@ -75,6 +81,34 @@ jobs:
 
       - name: tasks
         run: python3 tools/gsdev.py tasks --run
+
+      # Adoption path: stand up a project that has no harness, `init` it, and run
+      # the adopted runtime end to end.
+      - name: adopt a standalone copy (init) and run it
+        run: |
+          set -euo pipefail
+          dst="$(mktemp -d)"
+          cp -R assets "$dst/"
+          printf 'frame_rate = 30\nstage_width = 480\nstage_height = 360\n' > "$dst/goboscript.toml"
+          printf 'costumes "assets/backdrop.svg" as "backdrop";\n' > "$dst/stage.gs"
+          printf 'costumes "assets/hello.svg" as "hello";\n\nonflag {\n    log "adopted project running";\n}\n' > "$dst/main.gs"
+
+          python3 tools/gsdev.py init --project "$dst"
+
+          # Tools and host bundles are shared through GSDEV_TOOLS (set at the
+          # workflow level), so the adopted project needs no second download.
+          rt="$dst/gobo-agent/runtime"
+          export GSDEV_PYTHON="$(command -v python3)"
+          export GSDEV_TOOLS="$PWD/.tools"
+
+          gs="$rt/tools/gsdev"
+          "$gs" build
+          "$gs" run --headless --software --duration 3 --leave-running | tee "$dst/adopt-run.log"
+          grep -q '\[LOG' "$dst/adopt-run.log"
+          "$gs" session --file "$dst/gobo-agent/smoke.txt"
+          "$gs" close
+          "$gs" test --manifest "$dst/gobo-agent/gobo-tests.json" --headless --software
+          "$gs" close
 
       - uses: actions/upload-artifact@v4
         if: always()

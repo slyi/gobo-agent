@@ -32,6 +32,7 @@
     window.__host = {
       vm,
       renderer,
+      identity: window.__gsdevIdentity || { project: '', fingerprint: '' },
       load: bytes => {
         const promise = vm.loadProject(bytes);
         // A fresh project starts from a clean slate. Without clearing `stopped`

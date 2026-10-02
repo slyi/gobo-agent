@@ -6,7 +6,9 @@ const path = require('path');
 const vscode = require('vscode');
 
 const MANIFEST_NAME = 'gobo-tests.json';
-const PORT = 9235;
+// 0 = auto: gobo-agent picks and remembers a per-project CDP port, so two
+// projects (or a leftover host) never collide on a fixed port.
+const PORT = 0;
 
 let controller;
 let output;
@@ -46,20 +48,51 @@ function activate(context) {
     refresh().catch((error) => log(`refresh failed: ${error && error.stack || error}`));
 }
 
-function launcher(root) {
-    if (process.platform === 'win32') {
-        return {
-            command: 'powershell',
-            args: ['-NoProfile', '-ExecutionPolicy', 'Bypass', '-File',
-                   path.join(root, 'tools', 'gsdev.ps1')],
-        };
+// Both layouts: the gobo-agent repo/template (<root>/tools) and an adopted
+// project created by `gsdev init` (<root>/gobo-agent/runtime/tools).
+const LAUNCHER_DIRS = [['tools'], ['gobo-agent', 'runtime', 'tools']];
+// The repo ships gobo-tests.json at the root; an adopted project keeps it under
+// gobo-agent/. The file watcher already globs '**/gobo-tests.json'.
+const MANIFEST_DIRS = [[], ['gobo-agent']];
+
+function findManifest(root) {
+    for (const parts of MANIFEST_DIRS) {
+        const candidate = path.join(root, ...parts, MANIFEST_NAME);
+        if (fs.existsSync(candidate)) return candidate;
     }
-    return { command: path.join(root, 'tools', 'gsdev'), args: [] };
+    return null;
+}
+
+function launcher(root) {
+    for (const parts of LAUNCHER_DIRS) {
+        const dir = path.join(root, ...parts);
+        if (process.platform === 'win32') {
+            const ps1 = path.join(dir, 'gsdev.ps1');
+            if (fs.existsSync(ps1)) {
+                return {
+                    command: 'powershell',
+                    args: ['-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', ps1],
+                };
+            }
+        } else {
+            const sh = path.join(dir, 'gsdev');
+            if (fs.existsSync(sh)) {
+                return { command: sh, args: [] };
+            }
+        }
+    }
+    return null;
 }
 
 function execGsdev(root, args, token) {
     return new Promise((resolve) => {
-        const { command, args: base } = launcher(root);
+        const chosen = launcher(root);
+        if (!chosen) {
+            log(`no gobo-agent launcher under ${root}`);
+            resolve({ code: -1, stdout: '', stderr: 'no gobo-agent launcher', cancelled: false });
+            return;
+        }
+        const { command, args: base } = chosen;
         const full = [command, ...base, ...args].join(' ');
         log(`$ ${full}`);
         const env = { ...process.env, PYTHONUTF8: '1', PYTHONIOENCODING: 'utf-8' };
@@ -115,10 +148,9 @@ async function refresh() {
     }
     for (const folder of vscode.workspace.workspaceFolders || []) {
         const root = folder.uri.fsPath;
-        const manifest = path.join(root, MANIFEST_NAME);
-        const exists = fs.existsSync(manifest);
-        log(`folder ${root}: manifest ${exists ? 'found' : 'missing'}`);
-        if (!exists) continue;
+        const manifest = findManifest(root);
+        log(`folder ${root}: manifest ${manifest || 'missing'}`);
+        if (!manifest) continue;
         const result = await execGsdev(root,
             ['test', '--manifest', manifest, '--list'], undefined);
         log(`--list exit ${result.code}`);

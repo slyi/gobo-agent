@@ -31,6 +31,15 @@
     };
     window.__hostHud = hud;
 
+    // Host identity, passed by host_url(): the project this host belongs to and
+    // a fingerprint of the harness build. gsdev reads it back before attaching,
+    // so a host is never silently reused by another project or a different build.
+    const params = new URLSearchParams(location.search);
+    window.__gsdevIdentity = {
+      project: params.get('project') || '',
+      fingerprint: params.get('fp') || ''
+    };
+
     const files = [
       "/scratch-vm/dist/web/scratch-vm.js",
       "/scratch-render/dist/web/scratch-render.min.js",

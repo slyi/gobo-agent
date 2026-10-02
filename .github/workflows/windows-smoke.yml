@@ -30,6 +30,12 @@ on:
 permissions:
   contents: read
 
+# Keep CI hermetic: install into the checkout's .tools instead of the shared
+# per-user home the CLI now defaults to.
+env:
+  GSDEV_TOOLS: ${{ github.workspace }}/.tools
+  GSDEV_PYTHON_DIR: ${{ github.workspace }}/.tools/python
+
 jobs:
   windows:
     runs-on: windows-latest
@@ -105,6 +111,37 @@ jobs:
 
       - name: tasks
         run: python tools/gsdev.py tasks --run
+
+      # Adoption path: stand up a project that has no harness, `init` it, and run
+      # the adopted runtime end to end.
+      - name: adopt a standalone copy (init) and run it
+        run: |
+          $dst = Join-Path $env:RUNNER_TEMP "adopt"
+          New-Item -ItemType Directory -Force $dst | Out-Null
+          Copy-Item assets -Destination $dst -Recurse
+          "frame_rate = 30`nstage_width = 480`nstage_height = 360" | Set-Content (Join-Path $dst "goboscript.toml")
+          'costumes "assets/backdrop.svg" as "backdrop";' | Set-Content (Join-Path $dst "stage.gs")
+          "costumes `"assets/hello.svg`" as `"hello`";`nonflag {`n    log `"adopted project running`";`n}" | Set-Content (Join-Path $dst "main.gs")
+
+          python tools/gsdev.py init --project $dst
+
+          # Tools and host bundles are shared through GSDEV_TOOLS (set at the
+          # workflow level), so the adopted project needs no second download.
+          $rt = Join-Path $dst "gobo-agent\runtime"
+          $env:GSDEV_PYTHON = (Get-Command python).Source
+          $env:GSDEV_TOOLS = Join-Path $env:GITHUB_WORKSPACE ".tools"
+
+          $gs = Join-Path $rt "tools\gsdev.ps1"
+          powershell -NoProfile -ExecutionPolicy Bypass -File $gs build
+          powershell -NoProfile -ExecutionPolicy Bypass -File $gs run --headless --software --duration 3 --leave-running |
+            Tee-Object -FilePath adopt-run.log
+          if (-not (Select-String -Path adopt-run.log -Pattern '\[LOG' -Quiet)) {
+            throw "no [LOG] lines from the adopted project"
+          }
+          powershell -NoProfile -ExecutionPolicy Bypass -File $gs session --file (Join-Path $dst "gobo-agent\smoke.txt")
+          powershell -NoProfile -ExecutionPolicy Bypass -File $gs close
+          powershell -NoProfile -ExecutionPolicy Bypass -File $gs test --manifest (Join-Path $dst "gobo-agent\gobo-tests.json") --headless --software
+          powershell -NoProfile -ExecutionPolicy Bypass -File $gs close
 
       - uses: actions/upload-artifact@v4
         if: always()

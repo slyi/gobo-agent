@@ -7,11 +7,22 @@
 # context managers, etc.). Each candidate is *run* to confirm it is 3.10+; an older
 # Python 3 is rejected so the portable-interpreter fallback still runs.
 
+function Get-GsdevToolsRoot {
+    # Shared per-user install root (goboscript, sb2gs, python), so tools are
+    # downloaded once per machine and reused across projects. Mirrors
+    # bootstrap.default_home(): GSDEV_TOOLS, then GSDEV_HOME, then a per-user
+    # cache. GSDEV_PYTHON_DIR overrides just the Python location.
+    if ($env:GSDEV_TOOLS) { return $env:GSDEV_TOOLS }
+    if ($env:GSDEV_HOME) { return $env:GSDEV_HOME }
+    if ($env:LOCALAPPDATA) { return (Join-Path $env:LOCALAPPDATA "gobo-agent") }
+    return (Join-Path $HOME "AppData\Local\gobo-agent")
+}
+
 function Get-GsdevPythonDir {
     # The portable-Python directory, resolved identically here and in
     # tools\get-python.ps1 so an install into GSDEV_PYTHON_DIR is found again.
     if ($env:GSDEV_PYTHON_DIR) { return $env:GSDEV_PYTHON_DIR }
-    return (Join-Path (Split-Path -Parent $PSScriptRoot) ".tools\python")
+    return (Join-Path (Get-GsdevToolsRoot) "python")
 }
 
 function Test-Python3 {

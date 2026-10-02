@@ -72,8 +72,8 @@ prints `[WATCH +Nms] name=value` lines. This is data injection: values can be
 poked freely, but structural script changes still need a rebuild + reload.
 
 Pass --cpu RATE to emulate a slower CPU (e.g. --cpu 4 ~ a phone) via CDP, or
---port 0 (GSDEV_CDP_PORT=0) to auto-pick a free CDP port recorded in
-tools/.gsdev-port for parallel A/B runs.
+--port 0 (GSDEV_CDP_PORT=0) to auto-pick a free CDP port recorded in the state
+root's .gsdev-port for parallel A/B runs.
 """
 
 from __future__ import annotations
@@ -110,13 +110,279 @@ from cdp import (  # noqa: E402
 import bootstrap  # noqa: E402
 
 TOOLS_DIR = Path(__file__).resolve().parent
-PROJECT_ROOT = Path(os.environ.get("GSDEV_PROJECT") or TOOLS_DIR.parent).resolve()
+HARNESS_ROOT = TOOLS_DIR.parent
+
+# --- Project config (gobo-agent.json) -----------------------------------------
+#
+# gobo-agent can be vendored into another project (e.g. gobo-agent/runtime/)
+# and configured with a ``gobo-agent.json``. Resolution contract:
+#
+#   * Precedence per value: ``GSDEV_*`` env -> config field -> built-in default.
+#
+#   * Config *path* values resolve relative to the directory containing the
+#     config file; env path values resolve relative to the current working
+#     directory. The exception is ``modeInclude``, which is project-root
+#     relative because it mirrors a ``%include`` line in project source.
+#
+#   * Discovery order: ``GSDEV_CONFIG``; else ``<GSDEV_PROJECT>/gobo-agent.json``
+#     when ``GSDEV_PROJECT`` is set; else ``<harness>/../gobo-agent.json`` (the
+#     vendored folder/submodule layout).
+#
+#   * With no config file the historical harness-relative defaults apply, so a
+#     plain gobo-agent checkout (this repo) is unchanged.
+CONFIG_SCHEMA = 1
+
+
+def _load_config() -> tuple[dict, Path | None]:
+    override = os.environ.get("GSDEV_CONFIG")
+    candidates: list[Path] = []
+    if override:
+        candidates.append(Path(override).expanduser())
+    else:
+        project_env = os.environ.get("GSDEV_PROJECT")
+        if project_env:
+            candidates.append(Path(project_env).expanduser() / "gobo-agent.json")
+        candidates.append(HARNESS_ROOT.parent / "gobo-agent.json")
+    for candidate in candidates:
+        if not candidate.is_file():
+            continue
+        try:
+            data = json.loads(candidate.read_text(encoding="utf-8"))
+        except (OSError, ValueError) as error:
+            raise SystemExit(f"invalid gobo-agent config {candidate}: {error}")
+        if not isinstance(data, dict):
+            raise SystemExit(
+                f"invalid gobo-agent config {candidate}: top level must be an object"
+            )
+        return data, candidate.resolve().parent
+    if override:
+        raise SystemExit(f"GSDEV_CONFIG={override} is not a file")
+    return {}, None
+
+
+CONFIG, CONFIG_DIR = _load_config()
+
+
+def _config_path(key: str, base: Path) -> Path | None:
+    value = CONFIG.get(key)
+    if not value:
+        return None
+    path = Path(str(value)).expanduser()
+    return (path if path.is_absolute() else base / path).resolve()
+
+
+def _env_path(name: str) -> Path | None:
+    value = os.environ.get(name)
+    if not value:
+        return None
+    path = Path(value).expanduser()
+    return (path if path.is_absolute() else Path.cwd() / path).resolve()
+
+
+def _resolve_project_root() -> Path:
+    env = _env_path("GSDEV_PROJECT")
+    if env is not None:
+        return env
+    configured = _config_path("project", CONFIG_DIR or Path.cwd())
+    if configured is not None:
+        return configured
+    return TOOLS_DIR.parent
+
+
+PROJECT_ROOT = _resolve_project_root()
+
+
+def _resolve_state_root() -> Path:
+    """Where per-project run state lives (port file, browser profiles).
+
+    Defaults to ``<config dir>/state`` when a config is present (the vendored
+    layout's ``gobo-agent/state/``), else the historical harness-local ``tools/``
+    so an unconfigured checkout is unchanged.
+    """
+    env = _env_path("GSDEV_STATE")
+    if env is not None:
+        return env
+    configured = _config_path("state", CONFIG_DIR or PROJECT_ROOT)
+    if configured is not None:
+        return configured
+    if CONFIG_DIR is not None:
+        return (CONFIG_DIR / "state").resolve()
+    return TOOLS_DIR
+
+
+STATE_ROOT = _resolve_state_root()
+
+
+def mode_include_path(root: Path) -> Path:
+    """Path to the debug/release include rewritten for a build.
+
+    ``GSDEV_MODE_INCLUDE`` then config ``modeInclude`` override the default
+    ``tools/gsdev_mode.gs``; both are relative to the project root (the
+    ``%include`` path), not the config directory.
+    """
+    spec = os.environ.get("GSDEV_MODE_INCLUDE") or CONFIG.get("modeInclude") or "tools/gsdev_mode.gs"
+    path = Path(str(spec))
+    return (path if path.is_absolute() else root / path).resolve()
+
+
+def _int_setting(env_name: str, key: str, default: int) -> int:
+    """env -> config -> default, preserving an explicit 0 (auto port)."""
+    raw = os.environ.get(env_name)
+    if raw is not None and raw != "":
+        try:
+            return int(raw)
+        except ValueError:
+            raise SystemExit(f"{env_name}={raw!r} is not an integer")
+    value = CONFIG.get(key)
+    if value is not None:
+        try:
+            return int(value)
+        except (TypeError, ValueError):
+            raise SystemExit(f"config {key}={value!r} is not an integer")
+    return default
+
+
+def _prebuild_argv() -> list[str] | None:
+    """The configured pre-build command as an argv list, or None.
+
+    ``GSDEV_PREBUILD`` (shell-split) then config ``prebuild`` (a string or a
+    list of strings).
+    """
+    raw = os.environ.get("GSDEV_PREBUILD")
+    if raw is None:
+        raw = CONFIG.get("prebuild")
+    if not raw:
+        return None
+    if isinstance(raw, list) and all(isinstance(item, str) for item in raw):
+        return list(raw)
+    if isinstance(raw, str):
+        import shlex
+        return shlex.split(raw)
+    raise SystemExit("config prebuild must be a string or a list of strings")
+
+
+def _config_env() -> dict:
+    env = CONFIG.get("env")
+    if env is None:
+        return {}
+    if not isinstance(env, dict):
+        raise SystemExit("config env must be an object of string values")
+    return {str(key): str(value) for key, value in env.items()}
+
+
+def run_prebuild(root: Path, mode: str = "debug") -> None:
+    """Run the project's pre-build command, if configured.
+
+    Runs with cwd = the project root, the resolved interpreter's directory
+    prepended to PATH (so a bare ``python``/``python3`` finds the same Python
+    that runs gsdev), and ``{python}``/``{project}``/``{mode}`` tokens
+    substituted. A non-zero exit aborts the build.
+    """
+    argv = _prebuild_argv()
+    if not argv:
+        return
+    project = str(root)
+    tokens = {"{python}": sys.executable, "{project}": project, "{mode}": mode}
+    command = []
+    for arg in argv:
+        for token, value in tokens.items():
+            arg = arg.replace(token, value)
+        command.append(arg)
+    env = dict(os.environ)
+    env.update(_config_env())
+    interpreter_dir = str(Path(sys.executable).parent)
+    env["PATH"] = interpreter_dir + os.pathsep + env.get("PATH", "")
+    env["GSDEV_PROJECT"] = project
+    env["GSDEV_MODE"] = mode
+    log("prebuild: " + " ".join(command))
+    try:
+        result = subprocess.run(command, cwd=project, env=env)
+    except OSError as error:
+        raise SystemExit(f"prebuild failed to start: {error}")
+    if result.returncode != 0:
+        raise SystemExit(f"prebuild failed (exit {result.returncode}): {' '.join(command)}")
+
+
+_INCLUDE_RE = re.compile(r"^\s*%include\s+(\S+)")
+
+
+def _missing_includes(root: Path) -> list[str]:
+    """Project ``%include`` paths that do not resolve.
+
+    Scans the project's own source set (top-level ``*.gs`` plus ``lib/``), so
+    ``doctor`` can flag a tree that is not build-ready (typically because
+    generated code has not been produced) without reading nested fixtures or
+    build copies.
+    """
+    missing: list[str] = []
+    # Only the real source set: top-level sprites/stage plus the include dir.
+    # Avoids nested fixtures/build copies (examples/, debug/, .gsdev/) whose
+    # relative includes would otherwise read as unresolved.
+    sources = sorted(root.glob("*.gs"))
+    lib = root / "lib"
+    if lib.is_dir():
+        sources += sorted(lib.rglob("*.gs"))
+    for path in sources:
+        try:
+            text = path.read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            continue
+        for line in text.splitlines():
+            match = _INCLUDE_RE.match(line)
+            if not match:
+                continue
+            target = (root / match.group(1)).resolve()
+            candidates = [target, target.with_suffix(".gs")] if target.suffix != ".gs" else [target]
+            if not any(candidate.exists() for candidate in candidates):
+                try:
+                    shown = path.relative_to(root)
+                except ValueError:
+                    shown = path
+                missing.append(f"{shown}: {match.group(1)}")
+    return missing
+
+
+def _default_ports() -> tuple[int, int]:
+    """Default CDP/host-server ports.
+
+    A plain gobo-agent checkout keeps 9230/8077 (docs, CI, existing hosts). An
+    adopted project (a config is present) gets a stable project-scoped pair so
+    two adopted projects do not collide by default.
+    """
+    if CONFIG_DIR is None:
+        return 9230, 8077
+    digest = hashlib.sha1(str(PROJECT_ROOT).encode("utf-8")).digest()
+    cdp = 9300 + int.from_bytes(digest[:2], "big") % 300
+    host = 8100 + int.from_bytes(digest[2:4], "big") % 300
+    return cdp, host
+
+
+_DEFAULT_CDP_PORT, _DEFAULT_HOST_PORT = _default_ports()
 SB3_PATH = PROJECT_ROOT / (PROJECT_ROOT.name + ".sb3")
 DEBUG_DIR = PROJECT_ROOT / "debug"
-DEFAULT_PORT = int(os.environ.get("GSDEV_CDP_PORT", "9230"))
-PORT_FILE = TOOLS_DIR / ".gsdev-port"
+DEFAULT_PORT = _int_setting("GSDEV_CDP_PORT", "cdpPort", _DEFAULT_CDP_PORT)
+PORT_FILE = STATE_ROOT / ".gsdev-port"
 HOST_DIR = TOOLS_DIR / "scratchhost"
-HOST_PROFILE_ROOT = TOOLS_DIR / "scratchvm-profiles"
+HOST_PROFILE_ROOT = STATE_ROOT / "scratchvm-profiles"
+
+
+def _harness_fingerprint() -> str:
+    """Short hash of the served host page + injected scripts.
+
+    Identifies the harness code a warm host/server is running, so a host or
+    server from a different build is never silently reused across an update.
+    """
+    digest = hashlib.sha1()
+    for name in ("host.html", "host.js", "profiler.js"):
+        try:
+            digest.update(name.encode("utf-8"))
+            digest.update((HOST_DIR / name).read_bytes())
+        except OSError:
+            pass
+    return digest.hexdigest()[:12]
+
+
+HARNESS_FINGERPRINT = _harness_fingerprint()
 
 
 def host_profile_dir(port: int) -> Path:
@@ -127,8 +393,9 @@ def host_profile_dir(port: int) -> Path:
     and exit, and then no second debug port ever appears.
     """
     return HOST_PROFILE_ROOT / str(port)
-HOST_SERVER_PORT = int(os.environ.get("GSDEV_HOST_PORT", "8077"))
-VENDOR_DIR = HOST_DIR / "vendor"
+HOST_SERVER_PORT = _int_setting("GSDEV_HOST_PORT", "hostPort", _DEFAULT_HOST_PORT)
+# Shared across projects; the host server mounts it at /vendor/ (see hostserver.py).
+BUNDLES_DIR = bootstrap.bundles_dir()
 
 # Phase 1: how long a freshly launched browser has to expose a debuggable page.
 # Deliberately short (5s) so a blocked/broken browser fails fast instead of
@@ -182,7 +449,13 @@ def ensure_dependencies(need_bundles: bool = True) -> None:
     """
     missing_tools = resolve_goboscript() is None
     missing_bundles = need_bundles and not host_bundles_present()
-    missing_sb2gs = not bootstrap.sb2gs_present()
+    # sb2gs needs Python 3.14+; on an older interpreter it can never be present, so
+    # do not let that keep triggering setup. A user-installed sb2gs counts too.
+    missing_sb2gs = (
+        sys.version_info[:2] >= (3, 14)
+        and bootstrap.system_sb2gs() is None
+        and not bootstrap.sb2gs_present()
+    )
     if not (missing_tools or missing_bundles or missing_sb2gs):
         return
     if os.environ.get("GSDEV_NO_AUTO_SETUP", "").strip().lower() in ("1", "true", "yes"):
@@ -249,9 +522,9 @@ def resolve_port(requested: int) -> int:
 
     A port of 0 means "auto": reuse this project's last auto port while a
     listener is still there, otherwise pick a fresh free one and remember it in
-    tools/.gsdev-port so later commands (status/stop/close) find the same
-    editor. The file is per project root, so parallel runs in separate
-    worktrees stay independent.
+    the state root's .gsdev-port so later commands (status/stop/close) find the
+    same editor. The file is per state root, so parallel runs in separate
+    projects/worktrees stay independent.
     """
     if requested and requested > 0:
         return requested
@@ -561,7 +834,14 @@ def find_browser() -> str | None:
 
 
 def host_url() -> str:
-    return f"http://127.0.0.1:{HOST_SERVER_PORT}/host.html"
+    # Identity travels in the URL so the page can expose which project + harness
+    # build it is; ensure_host reads it back before attaching (never reuse a host
+    # belonging to another project or a different build).
+    query = urllib.parse.urlencode({
+        "project": str(PROJECT_ROOT),
+        "fp": HARNESS_FINGERPRINT,
+    })
+    return f"http://127.0.0.1:{HOST_SERVER_PORT}/host.html?{query}"
 
 
 def _detached_kwargs() -> dict:
@@ -576,34 +856,49 @@ def _detached_kwargs() -> dict:
     return {"start_new_session": True}
 
 
-def _host_state_path() -> Path:
-    base = Path(os.environ.get("TEMP", tempfile.gettempdir())) / "kilo"
+# Temp-dir namespace for cross-process host state. `kilo` is the historical
+# location; read/clear still check it so a host started by an older build is
+# found, but all new state is written under the tool's own name.
+_HOST_STATE_APPS = ("gobo-agent", "kilo")
+
+
+def _host_state_path(app: str) -> Path:
+    return Path(os.environ.get("TEMP", tempfile.gettempdir())) / app / (
+        f"gsdev_host_{HOST_SERVER_PORT}.json"
+    )
+
+
+def _host_state_write_path() -> Path:
+    path = _host_state_path(_HOST_STATE_APPS[0])
     try:
-        base.mkdir(parents=True, exist_ok=True)
+        path.parent.mkdir(parents=True, exist_ok=True)
     except OSError:
         pass
-    return base / f"gsdev_host_{HOST_SERVER_PORT}.json"
+    return path
 
 
 def read_host_state() -> dict:
-    try:
-        return json.loads(_host_state_path().read_text(encoding="utf-8"))
-    except (OSError, ValueError):
-        return {}
+    for app in _HOST_STATE_APPS:
+        try:
+            return json.loads(_host_state_path(app).read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            continue
+    return {}
 
 
 def write_host_state(**fields) -> None:
     try:
-        _host_state_path().write_text(json.dumps(fields), encoding="utf-8")
+        _host_state_write_path().write_text(json.dumps(fields), encoding="utf-8")
     except OSError:
         pass
 
 
 def clear_host_state() -> None:
-    try:
-        _host_state_path().unlink()
-    except OSError:
-        pass
+    for app in _HOST_STATE_APPS:
+        try:
+            _host_state_path(app).unlink()
+        except OSError:
+            pass
 
 
 def probe_host_server(token: str | None = None, timeout: float = 1.0) -> dict | None:
@@ -630,8 +925,15 @@ def ensure_host_server() -> None:
     if port_open(HOST_SERVER_PORT):
         info = probe_host_server()
         if info is not None:
+            if info.get("fingerprint") != HARNESS_FINGERPRINT:
+                raise SystemExit(
+                    f"host server on port {HOST_SERVER_PORT} was started by a different "
+                    f"gobo-agent build (fingerprint {info.get('fingerprint')!r}, expected "
+                    f"{HARNESS_FINGERPRINT}); set GSDEV_HOST_PORT to a free port or stop it."
+                )
             # A gsdev host server already holds the port (ours, or another
-            # checkout's). Reuse it; we only *close* a server we recorded.
+            # checkout's running the same harness build). Reuse it; we only *close*
+            # a server we recorded.
             if not (state.get("token") and info.get("token") == state["token"]):
                 log(f"host server already on http://127.0.0.1:{HOST_SERVER_PORT} "
                     f"(pid {info.get('pid')}); reusing")
@@ -655,7 +957,8 @@ def ensure_host_server() -> None:
     token = uuid.uuid4().hex
     args = [
         sys.executable, str(TOOLS_DIR / "hostserver.py"),
-        str(HOST_DIR), str(HOST_SERVER_PORT), token,
+        str(HOST_DIR), str(HOST_SERVER_PORT), token, HARNESS_FINGERPRINT,
+        str(BUNDLES_DIR),
     ]
     subprocess.Popen(args, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, **_detached_kwargs())
     deadline = time.monotonic() + 10
@@ -663,7 +966,7 @@ def ensure_host_server() -> None:
         info = probe_host_server(token)
         if info is not None:
             write_host_state(token=token, pid=info.get("pid"), port=HOST_SERVER_PORT,
-                             project=str(PROJECT_ROOT))
+                             project=str(PROJECT_ROOT), fingerprint=HARNESS_FINGERPRINT)
             log(f"host server on http://127.0.0.1:{HOST_SERVER_PORT}")
             return
         time.sleep(0.1)
@@ -796,6 +1099,41 @@ def browser_flags(browser: str, port: int, profile) -> list[str]:
     ]
 
 
+def _assert_host_identity(conn: CDP, port: int) -> None:
+    """Refuse to use a host page belonging to another project or build.
+
+    ``host_url()`` carries the project root and harness fingerprint as query
+    params; host.html exposes them as ``window.__gsdevIdentity``. Missing
+    identity means a host page from a different build (or a foreign page), which
+    is never adopted silently.
+    """
+    identity = conn.evaluate(
+        "(() => { const i = window.__gsdevIdentity ||"
+        " (window.__host && window.__host.identity);"
+        " return i ? {project: String(i.project || ''), fp: String(i.fingerprint || '')}"
+        " : null; })()",
+        timeout=CDP_ATTACH_TIMEOUT,
+    )
+    if not isinstance(identity, dict) or not identity.get("project"):
+        raise SystemExit(
+            f"host on port {port} has no project identity; it may be from a different "
+            f"gobo-agent build. Run `close --port {port}` and start it again."
+        )
+    host_project = Path(identity["project"]).resolve()
+    if host_project != PROJECT_ROOT:
+        raise SystemExit(
+            f"host on port {port} belongs to project {host_project}, not {PROJECT_ROOT}; "
+            f"use another --port or `close --port {port}`."
+        )
+    host_fp = identity.get("fp")
+    if host_fp and host_fp != HARNESS_FINGERPRINT:
+        raise SystemExit(
+            f"host on port {port} runs a different gobo-agent build (fingerprint "
+            f"{host_fp}, expected {HARNESS_FINGERPRINT}); run `close --port {port}` and "
+            "start it again."
+        )
+
+
 def ensure_host(port: int, headless: bool, software: bool) -> tuple[CDP, bool]:
     # GSDEV_SOFTWARE=1 forces software GL without threading --software through
     # every command (CI sets it once so the test suites can run on GPU-less boxes).
@@ -815,6 +1153,7 @@ def ensure_host(port: int, headless: bool, software: bool) -> tuple[CDP, bool]:
                     f"host on port {port} is {actual}, but this command requests {wanted}; "
                     f"run `close --port {port}` first, or choose another --port"
                 )
+            _assert_host_identity(conn, port)
             dismiss_browser_dialogs(port)
             return conn, False
         except BaseException:
@@ -907,7 +1246,13 @@ def open_host(port: int) -> CDP | None:
     if target is None:
         log(f"no scratch-vm host on port {port}; start the project with run first")
         return None
-    return connect(target, timeout=CDP_ATTACH_TIMEOUT)
+    conn = connect(target, timeout=CDP_ATTACH_TIMEOUT)
+    try:
+        _assert_host_identity(conn, port)
+    except BaseException:
+        conn.close()
+        raise
+    return conn
 
 
 def apply_cpu_throttle(cdp: CDP, rate: float) -> None:
@@ -1015,10 +1360,12 @@ def build_project_at(root: Path, mode: str = "debug") -> Path:
             f"{_setup_hint()} (or install the GoboScript compiler)."
         )
     mode = mode if mode in MODE_MACROS else "debug"
-    # The mode include is a checked-in project file (`tools/gsdev_mode.gs`). Rewrite
-    # it for this build and restore it afterwards, so building never changes the
-    # working tree. A project that does not opt in (no such file) builds unchanged.
-    mode_file = root / "tools" / "gsdev_mode.gs"
+    run_prebuild(root, mode)
+    # The mode include is a checked-in project file (default `tools/gsdev_mode.gs`,
+    # overridable via config `modeInclude`). Rewrite it for this build and restore
+    # it afterwards, so building never changes the working tree. A project that does
+    # not opt in (no such file) builds unchanged.
+    mode_file = mode_include_path(root)
     original = mode_file.read_text(encoding="utf-8") if mode_file.is_file() else None
     if original is not None:
         mode_file.write_text(MODE_MACROS[mode], encoding="utf-8")
@@ -2005,9 +2352,12 @@ def discover_tests(manifest_path: Path) -> tuple[list[dict], list[str]]:
     """Read a versioned test manifest; validate without running anything.
 
     Returns ``(tests, errors)``. Each test is ``{id, label, path, root, timeout,
-    buildMode}`` with resolved paths. Validation covers the schema, required fields,
-    duplicate ids, roots/projects existing, and sessions staying under their declared
-    root (no path escape). Read-only: no builds, no browser.
+    buildMode}`` with resolved paths. Test ``root`` values resolve against the
+    configured project root (so a manifest vendored inside the project targets the
+    parent project with ``root: "."``), unless the manifest declares its own
+    ``base`` relative to itself. Validation covers the schema, required fields,
+    duplicate ids, roots/projects existing, and sessions staying under their
+    declared root (no path escape). Read-only: no builds, no browser.
     """
     errors: list[str] = []
     tests: list[dict] = []
@@ -2021,7 +2371,16 @@ def discover_tests(manifest_path: Path) -> tuple[list[dict], list[str]]:
         return [], [f"{manifest_path}: top level must be an object"]
     if data.get("schema") != MANIFEST_SCHEMA:
         errors.append(f"{manifest_path}: schema must be {MANIFEST_SCHEMA}")
-    base = manifest_path.resolve().parent
+    manifest_dir = manifest_path.resolve().parent
+    # Roots are relative to the configured project root by default, so a manifest
+    # vendored inside the project (e.g. gobo-agent/gobo-tests.json) targets the
+    # parent project with root ".". A manifest may override the base relative to
+    # itself with "base" (e.g. "." for a manifest-local layout).
+    base_field = data.get("base")
+    if isinstance(base_field, str) and base_field:
+        base = (manifest_dir / base_field).resolve()
+    else:
+        base = PROJECT_ROOT
     roots = data.get("roots") or {}
     default_root = data.get("defaultRoot")
     raw = data.get("tests")
@@ -2050,7 +2409,7 @@ def discover_tests(manifest_path: Path) -> tuple[list[dict], list[str]]:
         try:
             root_dir.relative_to(base)
         except ValueError:
-            errors.append(f"{test_id}: root {root_spec!r} escapes the manifest directory")
+            errors.append(f"{test_id}: root {root_spec!r} escapes the manifest base")
             continue
         if not (root_dir / "goboscript.toml").is_file():
             errors.append(f"{test_id}: root {root_spec!r} has no goboscript.toml")
@@ -2114,6 +2473,9 @@ def cmd_test(args: argparse.Namespace) -> int:
         artifacts = PROJECT_ROOT / artifacts
     report = {"files": [], "totals": {"files": 0, "asserts": 0, "failures": 0}}
     any_failed = False
+    # Like build/run/screenshot/profile, install the prebuilt tools on first use:
+    # the test path builds a project and launches a host.
+    ensure_dependencies(need_bundles=True)
     for item in items:
         path = item["path"]
         root = item["root"]
@@ -3353,7 +3715,7 @@ def cmd_doctor(args: argparse.Namespace) -> int:
         fail("goboscript", f"not found; {_setup_hint()} (or install from github.com/aspizu/goboscript)")
 
     if host_bundles_present():
-        where = VENDOR_DIR if bootstrap.vendor_present() else (HOST_DIR / "node_modules")
+        where = BUNDLES_DIR if bootstrap.vendor_present() else (HOST_DIR / "node_modules")
         ok("host bundles", str(where))
     else:
         fail("host bundles", f"not installed; {_setup_hint()}")
@@ -3391,6 +3753,27 @@ def cmd_doctor(args: argparse.Namespace) -> int:
     else:
         ok("host server", "not running (started on demand)")
 
+    missing_includes = _missing_includes(PROJECT_ROOT)
+    if missing_includes:
+        preview = ", ".join(missing_includes[:3]) + ("..." if len(missing_includes) > 3 else "")
+        if _prebuild_argv():
+            ok("build readiness", f"{len(missing_includes)} include(s) generated by prebuild")
+        else:
+            warn("build readiness",
+                 f"{len(missing_includes)} unresolved %include path(s), no prebuild: {preview}")
+    else:
+        ok("build readiness", "all %include paths resolve")
+
+    system_sb2gs = bootstrap.system_sb2gs()
+    if system_sb2gs:
+        ok("sb2gs", f"{system_sb2gs} (system)")
+    elif bootstrap.sb2gs_present():
+        ok("sb2gs", str(bootstrap.sb2gs_source_dir()))
+    elif sys.version_info[:2] < (3, 14):
+        warn("sb2gs", f"needs Python 3.14+ (found {platform.python_version()})")
+    else:
+        fail("sb2gs", f"not installed; {_setup_hint()}")
+
     print("", flush=True)
     if failures:
         print(f"[FAIL] doctor - {failures} required dependency(ies) missing", flush=True)
@@ -3407,7 +3790,10 @@ def cmd_setup(args: argparse.Namespace) -> int:
 
 
 def _run_sb2gs(argv: list[str]) -> int:
-    """Install sb2gs only if missing, then run it with argv."""
+    """Run a user-installed sb2gs if present, else install ours (only if missing)."""
+    system = bootstrap.system_sb2gs()
+    if system:
+        return subprocess.run([system, *argv]).returncode
     if not bootstrap.sb2gs_present():
         if os.environ.get("GSDEV_NO_AUTO_SETUP", "").strip().lower() in ("1", "true", "yes"):
             raise SystemExit("sb2gs is not installed; run `gsdev setup --only sb2gs`")
@@ -3633,6 +4019,409 @@ def cmd_tasks(args: argparse.Namespace) -> int:
     return 1 if failures else 0
 
 
+# --- gsdev init (adopt) -------------------------------------------------------
+#
+# Adopts an existing project into a single namespaced `gobo-agent/` folder,
+# non-destructively and idempotently. Project-owned files (config, manifest,
+# smoke, mode include) are created once and never overwritten without
+# --force-owned; generated files (the runtime copy, VERSION, .install.json) may
+# be refreshed with --force. An existing gobo-agent/ that is not a recognized
+# install is refused, never merged into.
+
+INIT_SCHEMA = 1
+INSTALL_DIRNAME = "gobo-agent"
+_GITATTRIBUTES_RULES = (
+    "# gobo-agent: keep the POSIX launchers LF so they run after a Windows checkout",
+    "gobo-agent/runtime/tools/gsdev text eol=lf",
+    "gobo-agent/runtime/setup.sh text eol=lf",
+)
+_GITIGNORE_RULES = (
+    "# gobo-agent",
+    "/gobo-agent/state/",
+    "/gobo-agent/runtime/.tools/",
+    "/gobo-agent/runtime/tools/scratchhost/vendor/",
+    "/gobo-agent/runtime/tools/scratchhost/node_modules/",
+    "/gobo-agent/runtime/tools/scratchvm-profiles/",
+    "*.sb3",
+    "debug/",
+    "__pycache__/",
+)
+_SMOKE_TEMPLATE = (
+    "# gobo-agent smoke: loads, runs, renders, and reports no errors.\n"
+    "waitframe 6\n"
+    "expect @stepfps > 0\n"
+    "expect @rendered > 0\n"
+    "expect_no_errors\n"
+)
+
+
+def _sha256_bytes(data: bytes) -> str:
+    return hashlib.sha256(data).hexdigest()
+
+
+def _strip_jsonc(text: str) -> str:
+    """Drop // and /* */ comments (outside strings) and trailing commas."""
+    out = []
+    i = 0
+    n = len(text)
+    in_str = False
+    while i < n:
+        ch = text[i]
+        if in_str:
+            out.append(ch)
+            if ch == "\\" and i + 1 < n:
+                out.append(text[i + 1])
+                i += 2
+                continue
+            if ch == '"':
+                in_str = False
+            i += 1
+            continue
+        if ch == '"':
+            in_str = True
+            out.append(ch)
+            i += 1
+            continue
+        if ch == "/" and i + 1 < n and text[i + 1] == "/":
+            while i < n and text[i] != "\n":
+                i += 1
+            continue
+        if ch == "/" and i + 1 < n and text[i + 1] == "*":
+            i += 2
+            while i + 1 < n and not (text[i] == "*" and text[i + 1] == "/"):
+                i += 1
+            i += 2
+            continue
+        out.append(ch)
+        i += 1
+    return re.sub(r",(\s*[}\]])", r"\1", "".join(out))
+
+
+def _load_jsonc(path: Path):
+    raw = path.read_text(encoding="utf-8")
+    try:
+        return json.loads(raw)
+    except json.JSONDecodeError:
+        return json.loads(_strip_jsonc(raw))
+
+
+def _runtime_manifest() -> list[str]:
+    lines = []
+    for line in (TOOLS_DIR / "runtime-files.txt").read_text(encoding="utf-8").splitlines():
+        line = line.strip()
+        if line and not line.startswith("#"):
+            lines.append(line)
+    return lines
+
+
+def _git_capture(args: list[str], cwd: Path) -> str | None:
+    try:
+        proc = subprocess.run(["git", *args], cwd=str(cwd), capture_output=True,
+                              text=True, timeout=15)
+    except (OSError, subprocess.SubprocessError):
+        return None
+    return proc.stdout.strip() if proc.returncode == 0 else None
+
+
+def _config_template() -> bytes:
+    return (json.dumps({
+        "schema": 1,
+        "project": "..",
+        "harness": "runtime",
+        "modeInclude": "gobo-agent/gsdev_mode.gs",
+    }, indent=2) + "\n").encode("utf-8")
+
+
+def _manifest_template() -> bytes:
+    return (json.dumps({
+        "schema": 1,
+        "tests": [{"id": "smoke", "label": "smoke",
+                   "session": "gobo-agent/smoke.txt", "root": "."}],
+    }, indent=2) + "\n").encode("utf-8")
+
+
+def _adopted_tasks() -> list[dict]:
+    rt = "${workspaceFolder}/gobo-agent/runtime"
+    manifest = "${workspaceFolder}/gobo-agent/gobo-tests.json"
+    setup_label = "gobo-agent: Setup (download prebuilt tools, no admin)"
+
+    def task(label, args, *, depends=False, group=None, extra=None):
+        entry = {
+            "label": label,
+            "type": "process",
+            "command": f"{rt}/tools/gsdev",
+            "args": args,
+            "windows": {
+                "command": "powershell",
+                "args": ["-NoProfile", "-ExecutionPolicy", "Bypass", "-File",
+                         f"{rt}/tools/gsdev.ps1", *args],
+            },
+            "options": {"cwd": "${workspaceFolder}"},
+            "problemMatcher": [],
+        }
+        if depends:
+            entry["dependsOn"] = [setup_label]
+            entry["dependsOrder"] = "sequence"
+        if group is not None:
+            entry["group"] = group
+        if extra:
+            entry.update(extra)
+        return entry
+
+    setup = {
+        "label": setup_label,
+        "type": "process",
+        "command": f"{rt}/setup.sh",
+        "args": [],
+        "windows": {
+            "command": "powershell",
+            "args": ["-NoProfile", "-ExecutionPolicy", "Bypass", "-File", f"{rt}/setup.ps1"],
+        },
+        "options": {"cwd": "${workspaceFolder}"},
+        "problemMatcher": [],
+        "presentation": {"reveal": "always", "panel": "dedicated", "clear": True},
+    }
+    shown = {"reveal": "always", "panel": "dedicated", "clear": True}
+    return [
+        setup,
+        task("gobo-agent: Run (web, build + live logs)", ["run"], depends=True,
+             group={"kind": "build", "isDefault": True},
+             extra={"presentation": shown, "runOptions": {"instanceLimit": 1}}),
+        task("gobo-agent: Build", ["build"], depends=True, group="build"),
+        task("gobo-agent: Screenshot",
+             ["screenshot", "--out", "${workspaceFolder}/debug/check.png"], depends=True,
+             extra={"presentation": shown, "runOptions": {"instanceLimit": 1}}),
+        task("gobo-agent: Run Tests", ["test", "--manifest", manifest], depends=True,
+             group={"kind": "test", "isDefault": True},
+             extra={"presentation": shown, "runOptions": {"instanceLimit": 1}}),
+        task("gobo-agent: Stop project", ["stop"]),
+        task("gobo-agent: Close host", ["close"]),
+        task("gobo-agent: Check dependencies", ["doctor"],
+             extra={"presentation": shown}),
+    ]
+
+
+def cmd_init(args: argparse.Namespace) -> int:
+    project = Path(args.project).expanduser().resolve()
+    if not project.is_dir():
+        raise SystemExit(f"--project {project} is not a directory")
+    harness = Path(args.harness).expanduser().resolve() if args.harness else HARNESS_ROOT
+    if not (harness / "tools" / "gsdev.py").is_file():
+        raise SystemExit(f"--harness {harness} is not a gobo-agent checkout")
+    if (project / "tools" / "gsdev.py").is_file():
+        raise SystemExit(
+            f"{project} already looks like a gobo-agent checkout (tools/gsdev.py); "
+            "nothing to adopt."
+        )
+
+    install = project / INSTALL_DIRNAME
+    marker_path = install / ".install.json"
+    version_path = install / "VERSION"
+    marker = None
+    if marker_path.is_file():
+        try:
+            marker = _load_jsonc(marker_path)
+        except (OSError, ValueError):
+            marker = None
+    recognized = (isinstance(marker, dict) and marker.get("schema") == INIT_SCHEMA
+                  and version_path.is_file())
+    if install.exists() and not recognized:
+        raise SystemExit(
+            f"{install} exists but is not a recognized gobo-agent install "
+            "(missing/invalid VERSION + .install.json); refusing to modify it. "
+            "Move it aside, then re-run init."
+        )
+    created: dict = marker.get("created", {}) if recognized else {}
+    if not isinstance(created, dict):
+        created = {}
+
+    commit = _git_capture(["rev-parse", "HEAD"], harness) or "unknown"
+    version_text = (
+        "gobo-agent integration\n"
+        f"schema: {INIT_SCHEMA}\n"
+        f"layout: {args.layout}\n"
+        f"harness: {harness}\n"
+        f"commit: {commit}\n"
+        f"fingerprint: {HARNESS_FINGERPRINT}\n"
+    ).encode("utf-8")
+
+    planned: list[tuple[str, Path, bytes, str, bool]] = []
+    conflicts: list[str] = []
+
+    def consider(rel: str, data: bytes, *, owned: bool) -> None:
+        path = project / rel
+        if not path.exists():
+            planned.append(("create", path, data, "", owned))
+            return
+        current = path.read_bytes()
+        if current == data:
+            planned.append(("unchanged", path, data, "", owned))
+            return
+        recorded = created.get(rel)
+        if recorded is not None and _sha256_bytes(current) == recorded:
+            if (not owned) or args.force_owned:
+                planned.append(("refresh", path, data, "", owned))
+            else:
+                planned.append(("kept", path, data, "", owned))
+            return
+        if owned and args.force_owned:
+            planned.append(("overwrite --force-owned", path, data, "", owned))
+        elif (not owned) and args.force:
+            planned.append(("overwrite --force", path, data, "", owned))
+        else:
+            conflicts.append(rel)
+            planned.append(("kept (modified)", path, b"", "", owned))
+
+    owned_files = {
+        "gobo-agent/gobo-agent.json": _config_template(),
+        "gobo-agent/gobo-tests.json": _manifest_template(),
+        "gobo-agent/smoke.txt": _SMOKE_TEMPLATE.encode("utf-8"),
+        "gobo-agent/gsdev_mode.gs": (TOOLS_DIR / "gsdev_mode.gs").read_bytes(),
+    }
+    for rel in sorted(owned_files):
+        consider(rel, owned_files[rel], owned=True)
+
+    generated_files: dict[str, bytes] = {"gobo-agent/VERSION": version_text}
+    if args.layout == "copy":
+        for rel in _runtime_manifest():
+            src = harness / rel
+            if src.is_file():
+                generated_files[f"gobo-agent/runtime/{rel}"] = src.read_bytes()
+            else:
+                conflicts.append(f"missing in harness: {rel}")
+    for rel in sorted(generated_files):
+        consider(rel, generated_files[rel], owned=False)
+
+    # .gitignore additions
+    gi_path = project / ".gitignore"
+    gi_existing = gi_path.read_text(encoding="utf-8").splitlines() if gi_path.is_file() else []
+    gi_missing = [line for line in _GITIGNORE_RULES if line not in gi_existing]
+
+    # .gitattributes additions (copy layout: the runtime ships with the project, so
+    # its POSIX launchers must stay LF; a submodule carries its own .gitattributes).
+    ga_path = project / ".gitattributes"
+    ga_existing = ga_path.read_text(encoding="utf-8").splitlines() if ga_path.is_file() else []
+    ga_missing = ([line for line in _GITATTRIBUTES_RULES if line not in ga_existing]
+                  if args.layout == "copy" else [])
+
+    # .vscode/tasks.json merge
+    tasks_path = project / ".vscode" / "tasks.json"
+    tasks_existing = _load_jsonc(tasks_path) if tasks_path.is_file() else None
+    if tasks_existing is not None and not isinstance(tasks_existing, dict):
+        raise SystemExit(f"{tasks_path}: top level must be an object")
+    generated_tasks = _adopted_tasks()
+    generated_labels = {t["label"] for t in generated_tasks}
+    base_tasks = []
+    if isinstance(tasks_existing, dict) and isinstance(tasks_existing.get("tasks"), list):
+        base_tasks = [t for t in tasks_existing["tasks"]
+                      if not (isinstance(t, dict) and t.get("label") in generated_labels)]
+    merged_tasks = {
+        "version": (tasks_existing or {}).get("version", "2.0.0") if isinstance(tasks_existing, dict) else "2.0.0",
+        "tasks": base_tasks + generated_tasks,
+    }
+    tasks_changed = not (
+        isinstance(tasks_existing, dict)
+        and tasks_existing.get("tasks") == merged_tasks["tasks"]
+        and tasks_existing.get("version") == merged_tasks["version"]
+    )
+
+    writes = [p for p in planned if p[0] in ("create", "refresh", "overwrite --force",
+                                             "overwrite --force-owned")]
+
+    if args.dry_run:
+        print(f"[init] project: {project}")
+        print(f"[init] harness: {harness} (commit {commit})")
+        print(f"[init] layout:  {args.layout}")
+        for op, path, data, _, owned in sorted(planned, key=lambda p: str(p[1])):
+            rel = path.relative_to(project)
+            kind = "owned" if owned else "generated"
+            print(f"  {op:>20}  {rel}  ({kind}, {len(data)} bytes)")
+        if gi_missing:
+            print(f"  {'append':>20}  .gitignore  (+{len(gi_missing)} rules)")
+        if ga_missing:
+            print(f"  {'append':>20}  .gitattributes  (+{len(ga_missing)} rules)")
+        if tasks_changed:
+            print(f"  {'merge':>20}  .vscode/tasks.json  (+{len(generated_tasks)} tasks)")
+        if conflicts:
+            print(f"[init] conflicts (left untouched): {', '.join(sorted(set(conflicts)))}")
+        print("[init] dry run: nothing written")
+        return 0
+
+    for op, path, data, _, _owned in planned:
+        if not data:
+            continue
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(data)
+    if gi_missing:
+        prefix = "" if (not gi_path.is_file() or gi_path.read_text(encoding="utf-8").endswith("\n")) else "\n"
+        with gi_path.open("a", encoding="utf-8") as handle:
+            handle.write(prefix + "\n".join(gi_missing) + "\n")
+    if ga_missing:
+        prefix = "" if (not ga_path.is_file() or ga_path.read_text(encoding="utf-8").endswith("\n")) else "\n"
+        with ga_path.open("a", encoding="utf-8") as handle:
+            handle.write(prefix + "\n".join(ga_missing) + "\n")
+    if tasks_changed:
+        tasks_path.parent.mkdir(parents=True, exist_ok=True)
+        tasks_path.write_text(json.dumps(merged_tasks, indent=4) + "\n", encoding="utf-8")
+
+    # Make the copied runtime launchers executable on POSIX (preserve other modes).
+    if args.layout == "copy" and os.name != "nt":
+        exec_launchers = {"tools/gsdev", "setup.sh"}
+        for rel in _runtime_manifest():
+            src = harness / rel
+            dest = project / "gobo-agent" / "runtime" / rel
+            if not (src.is_file() and dest.is_file()):
+                continue
+            mode = 0o755 if rel in exec_launchers else src.stat().st_mode & 0o777
+            try:
+                os.chmod(dest, mode)
+            except OSError:
+                pass
+
+    # Record ownership of every managed file whose on-disk content matches what we
+    # intended (generated + project-owned); a user-modified file is left as unknown
+    # so a later run reports it again instead of silently clobbering it.
+    recorded_out: dict[str, str] = {}
+    for op, path, data, _, _owned in planned:
+        if not data:
+            continue
+        rel = str(path.relative_to(project)).replace("\\", "/")
+        recorded_out[rel] = _sha256_bytes(data)
+    install.mkdir(parents=True, exist_ok=True)
+    marker_payload = {
+        "schema": INIT_SCHEMA,
+        "layout": args.layout,
+        "harness": {"path": str(harness), "commit": commit,
+                    "fingerprint": HARNESS_FINGERPRINT},
+        "created": recorded_out,
+    }
+    marker_path.write_text(json.dumps(marker_payload, indent=2) + "\n", encoding="utf-8")
+
+    log(f"adopted {project} into {install.relative_to(project)}/ ({args.layout})")
+    for op, path, _data, _, _owned in sorted(planned, key=lambda p: str(p[1])):
+        log(f"  {op}: {path.relative_to(project)}")
+    if gi_missing:
+        log(f"  .gitignore: +{len(gi_missing)} rules")
+    if ga_missing:
+        log(f"  .gitattributes: +{len(ga_missing)} rules")
+    if tasks_changed:
+        log(f"  .vscode/tasks.json: {len(generated_tasks)} gobo-agent tasks")
+    if conflicts:
+        log(f"conflicts (left untouched): {', '.join(sorted(set(conflicts)))}")
+
+    if args.layout == "submodule":
+        runtime = install / "runtime"
+        if not runtime.is_dir() or not any(runtime.iterdir()):
+            url = args.harness_url or _git_capture(["remote", "get-url", "origin"], harness)
+            url = url or "<gobo-agent-repo-url>"
+            log("runtime submodule is not initialized; add it, then re-run init:")
+            log(f'  git -C "{project}" submodule add {url} gobo-agent/runtime')
+            log(f'  git -C "{project}" submodule update --init --recursive gobo-agent/runtime')
+            return 1
+    log("next: gobo-agent/runtime/setup.ps1  then  gobo-agent/runtime/tools/gsdev.ps1 run")
+    return 0
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     subparsers = parser.add_subparsers(dest="command", required=True)
@@ -3706,6 +4495,21 @@ def build_parser() -> argparse.ArgumentParser:
     tasks = subparsers.add_parser("tasks", help="check .vscode tasks resolve on this platform")
     tasks.add_argument("--run", action="store_true", help="also execute the non-launching tasks")
     tasks.set_defaults(func=cmd_tasks)
+
+    init = subparsers.add_parser(
+        "init", help="adopt an existing project into a gobo-agent/ folder"
+    )
+    init.add_argument("--project", default=".", help="project directory (default: cwd)")
+    init.add_argument("--harness", help="gobo-agent source dir (default: this checkout)")
+    init.add_argument("--layout", choices=["copy", "submodule"], default="copy",
+                      help="copy the runtime (default) or scaffold a submodule")
+    init.add_argument("--harness-url", help="git URL for --layout submodule")
+    init.add_argument("--dry-run", action="store_true", help="print the plan; write nothing")
+    init.add_argument("--force", action="store_true",
+                      help="re-copy generated files (not project-owned ones)")
+    init.add_argument("--force-owned", action="store_true",
+                      help="also overwrite project-owned files")
+    init.set_defaults(func=cmd_init)
 
     run = subparsers.add_parser("run", help="build, start, and stream logs")
     add_port(run)
