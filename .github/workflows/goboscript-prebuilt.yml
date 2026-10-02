@@ -53,6 +53,13 @@ jobs:
         shell: bash
         run: rm -f goboscript/.cargo/config.toml
 
+      - name: Make the standard-library update offline-safe
+        # goboscript's build calls the GitHub API to resolve goboscript/std unless
+        # its cache is fresh; rate-limited CI IPs (or offline users) get an error
+        # object instead of the tag array and the build aborts. Patch it to fall
+        # back to "no std" on failure.
+        run: python .github/scripts/patch_goboscript.py
+
       - uses: dtolnay/rust-toolchain@stable
         with:
           targets: ${{ matrix.target }}
