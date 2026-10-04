@@ -207,10 +207,135 @@ New-Item -ItemType Directory -Force .\scratch | Out-Null
 python <gobo>\tools\gsdev.py init --project .\scratch\my_project
 ```
 
-Conversion is best-effort upstream: some projects do not decompile (unsupported
-opcodes, or sprite names that are not valid filenames). Always `goboscript build`
-the result before trusting it. sb2gs needs Python 3.14+ (the Windows portable is
-3.14).
+Conversion is best-effort: some projects do not decompile. Always `goboscript
+build` the result before trusting it. sb2gs needs Python 3.14+ (the Windows
+portable is 3.14).
+
+An `--id` import also writes `provenance.json` at the project root (title,
+author/username, project id, release date, instructions, notes and credits,
+source and author URLs, retrieval time) so the original work stays credited — see
+"Credit and provenance" in the repo `AGENTS.md`. Local-file imports have no
+metadata, so no file is written.
+
+Names change during conversion. The compiled project uses goboscript **identifiers**,
+not the Scratch names: goboscript lowercases a name, strips leading **and** trailing
+`_`, maps whitespace/`.`/`-`/`:` to `_`, drops any other symbol, and appends `_`/a
+number to avoid a keyword or a collision (gobo-agent also renames a variable/list
+name clash, e.g. `x` → `x_list`). So Scratch `Render._stickman` is `Render.stickman`
+after import. When poking live values (`set`/`set_batch`) or reading with `get`, use
+the compiled name — find it with `inspect`/`props` or from the decompiled `.gs`
+(the "gobo-agent patches" list below is where such renames are explained).
+
+## Known upstream limitations (sb2gs / goboscript)
+
+Recorded here so adopters know what to expect. These are upstream behaviours; we
+don't fix them and don't file bugs for them. Issue links are for reference.
+Conversion is not guaranteed pixel-identical: always `goboscript build`, then run
+and compare (e.g. `gsdev run` + `screenshot`) rather than assuming equivalence.
+
+**sb2gs**
+
+- **Sprite names that aren't valid filenames** — each sprite is written as
+  `<name>.gs` (`decompile.py:64`), unsanitized. `/` fails on every OS; on Windows
+  `* : < > ? |` (and a trailing `.`/space) fail too. Costume/sound names are
+  handled (renamed, or hash-named on Windows) by `get_asset_filename`. Upstream:
+  [#23](https://github.com/aspizu/sb2gs/issues/23) (sprites, closed not-planned),
+  [#4](https://github.com/aspizu/sb2gs/issues/4) (assets). There is no upstream
+  fix; use a project without such names, or rename them there.
+- **Misc unsupported opcodes/inputs** — e.g. `event_whenbackdropswitchesto`
+  ([#25](https://github.com/aspizu/sb2gs/issues/25)), color input fields
+  ([#5](https://github.com/aspizu/sb2gs/issues/5)), float→int
+  ([#13](https://github.com/aspizu/sb2gs/issues/13)).
+- **Vector costumes with an off-center rotation center are rewritten** —
+  `fix_vector_center` (`costumes.py`) replaces such an SVG with a 480×360
+  stage-sized SVG and drops its `<g transform>`, so the costume's bytes (and md5)
+  change and any layout that relied on the transform is lost. This is sb2gs's
+  workaround for goboscript having no rotation-center syntax (below), so the md5
+  will not match the source project's costume. gobo-agent patches the check to a
+  0.5-unit tolerance, so a merely rounded "centre" (e.g. 1015495507's Cat, 0.41
+  off) is left alone; a genuinely off-centre pivot (e.g. RBMP) is still rewritten.
+- **Bitmap costumes with an off-center rotation center are rewritten** —
+  `fix_bitmap_center` (`costumes.py`) pastes the image onto a 960×720 canvas so
+  the original pivot lands at the canvas centre, changing the costume's bytes
+  (and md5). It **ignores `bitmapResolution`** (and goboscript compiles costumes
+  without it), so 2× bitmaps are re-canvased at the wrong scale — on the
+  texture-atlas project 1047137851 the tiles survived while the font text
+  rendered scrambled. Only genuinely off-centre pivots are affected (the
+  0.5-unit/±1-pixel tolerance above leaves rounded centres alone).
+
+**goboscript** (handled by gobo-agent's bundled build)
+
+- **Costume rotation centers can't be set** — the `costumes` statement takes only
+  file paths/`as`/globs (no rotation-center option), and the compiled costume
+  omits `rotationCenterX`/`rotationCenterY`/`bitmapResolution`; the Scratch VM
+  then falls back to the rendered skin's center (`scratch-vm` `loadCostume`), so
+  every costume rotates about its image center. This is upstream
+  [#269](https://github.com/aspizu/goboscript/issues/269) (closed *not planned*:
+  the maintainer's answer is to convert costumes with sb2gs — i.e. the
+  `fix_vector_center` step above). Projects that depend on an off-center pivot or
+  on Scratch's rotated-bounding-box quirk (e.g. RBMP packing,
+  [project 1387642307](https://scratch.mit.edu/projects/1387642307)) cannot be
+  reproduced — the decompiled project builds but renders blank, even if the
+  original SVGs are preserved.
+- Negative number literals are rejected by the last *release* (3.2.1; upstream
+  #158 fixed only on `main`) — gobo-agent installs a pinned prebuilt of `main`.
+- The standard-library update calls the GitHub API when its cache is stale;
+  gobo-agent's prebuilt is patched to fall back offline.
+
+**gobo-agent patches to the installed sb2gs** (applied by `setup`):
+
+- **`--id` downloader** — one pooled HTTP connection (`GSDEV_SB2GS_WORKERS`,
+  default 16), a content-addressed asset cache
+  (`%LOCALAPPDATA%\gobo-agent\asset-cache`; `GSDEV_SB2GS_CACHE` to relocate,
+  `GSDEV_SB2GS_NO_CACHE=1` to disable), retries with backoff, the endpoint's
+  zip-wrapped/raw project data, and the sb2gs-required defaults a sparse save
+  omits. Large imports are ~20× faster and re-imports are offline.
+- **Pen color-parameter menu** — sb2gs read the `COLOR_PARAM` menu as a block
+  field, so every `pen_setPenColorParamTo`/`...By` collapsed to the default
+  `*_hue` block and brightness/saturation/transparency were lost (e.g. 1127053411
+  rendered inverted). The patch flattens the menu so the right block is emitted.
+- **Missing costume pivot** — newer saves omit `rotationCenterX`/`rotationCenterY`
+  (the VM then uses the skin centre), which sb2gs dereferenced directly, so the
+  import failed with `AttributeError`. The patch treats a missing pivot as
+  centred, so those projects import (verified: 1307268012).
+- **Initial costume** — sb2gs ignored `currentCostume`, so a sprite started on the
+  first listed costume instead of the saved one (wrong for a static costume, e.g.
+  1015495507's `cat-chess`, whose first listed costume is empty). The patch emits
+  `onflag { switch_costume "<name>"; }` for the saved costume — a bare
+  `switch_costume` isn't a valid top-level sprite-init statement. Verified: the
+  cat-chess floor returns.
+- **Drag mode** — sb2gs emitted a nonexistent `set_draggable;`
+  (`decompile_sprite.py:81`) for a draggable sprite, which goboscript rejects. The
+  patch emits `onflag { set_drag_mode_draggable; }` instead. Verified: 1047137851's
+  atlas builds.
+- **`control_for_each`** — sb2gs had no decompiler and dropped the loop body
+  (upstream [#15](https://github.com/aspizu/sb2gs/issues/15)). The VM treats it as
+  a counted loop (variable = 1-based index, run `Number(VALUE)` times), so the
+  patch lowers it to `<var> = 0; repeat <VALUE> { <var> += 1; <body> }`. Verified:
+  1291298236 now builds (347 vs 72 blocks) and runs its scanner. Caveat: the
+  counter *is* the loop variable, so a body that writes that variable diverges
+  (the VM re-assigns it each iteration; the lowered loop would be disturbed).
+- **Same-named variables/lists** — sb2gs emitted both `var x` and `list x`, or a
+  duplicate `var x`/`list x`, on one target, which goboscript rejects ("already
+  defined"); its identifier cache maps two identical source names to one
+  identifier. The patch renames the colliding entries before decompiling (in the
+  variable/list tables and every block field/input that references their id).
+  Verified: 1193224850 now builds (2041 blocks).
+- **Monitors** — sb2gs ignored the project's `monitors` array, so on-stage
+  variable/list readouts lost their positions and slider modes. sb2gs now records
+  each monitor (with its compiled variable/list name) in a **`monitors.json`**
+  sidecar at the project root, and `build`/`run`/`screenshot`/`test` re-inject the
+  full `monitors` array into the **built sb3** (`inject_monitors` in `gsdev.py`),
+  mapping each by name to the compiled id — restoring positions, slider
+  mode/min-max and visibility. Verified: 1113180719's positioned readouts and the
+  `Render: stickman` slider return. Labels show the compiled identifier (`camz`,
+  not `@camZ`), since that is the runtime name. A per-target
+  `onflag { show/hide }` script is still emitted as a visibility fallback for a
+  build made without the injection.
+
+**gobo-agent mitigations:** for large or known-problematic projects, download the
+`.sb3` in a browser and pass the local file (`gsdev sb2gs <file.sb3>`);
+`gsdev sb2gs` bounds the run and cleans partial `.sb3`/output on failure.
 
 ## Everyday loop, builds, profiling
 
@@ -218,6 +343,12 @@ The warm edit-and-check loop, `--mode debug|release`, input injection, screensho
 and the profiler are identical to the repo's own workflow — see the
 [README](../README.md) for the verb reference. The only difference is the launcher
 path: `gobo-agent/runtime/tools/gsdev.*` instead of `tools/gsdev.*`.
+
+`preflight` checks the built artifact (or `--sb3 FILE`) offline against Scratch's
+project.json/asset/list limits and the mobile **memory** budget — no browser needed;
+`--json` for a machine report, `--strict` to exit non-zero on warnings too. It
+reports exact numbers (e.g. the binary 5 MiB project.json budget) rather than
+"5 MB", and flags unmeasured assets so a pass can't hide them.
 
 ## VS Code
 

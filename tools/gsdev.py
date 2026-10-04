@@ -90,6 +90,7 @@ import shutil
 import signal
 import socket
 import statistics
+import struct
 import subprocess
 import sys
 import tempfile
@@ -97,6 +98,8 @@ import time
 import urllib.error
 import urllib.parse
 import urllib.request
+import xml.etree.ElementTree as ET
+import zipfile
 import uuid
 from pathlib import Path
 
@@ -737,7 +740,11 @@ def find_editor_pids(port: int, process_name: str, profile_dir: Path) -> list[in
         pids: set[int] = set()
         for owner in owners:
             for pid in _process_subtree(owner, table):
-                if pid == owner or names.get(pid) == wanted:
+                # Only processes that really are the browser: the debug-port owner
+                # may be a foreign process (e.g. a gsdev host server) if the caller
+                # passed the host-server port instead of the CDP port, and we must
+                # never kill or mislabel that as ours.
+                if names.get(pid) == wanted:
                     pids.add(pid)
         pids.discard(os.getpid())
         return sorted(pids)
@@ -891,6 +898,18 @@ def write_host_state(**fields) -> None:
         _host_state_write_path().write_text(json.dumps(fields), encoding="utf-8")
     except OSError:
         pass
+
+
+def update_host_state(**fields) -> None:
+    """Merge fields into the host state, preserving the server token/pid.
+
+    ``write_host_state`` overwrites the whole file, so the browser's CDP port is
+    added here rather than with a second full write that would drop the server's
+    ownership token.
+    """
+    state = read_host_state()
+    state.update(fields)
+    write_host_state(**state)
 
 
 def clear_host_state() -> None:
@@ -1174,6 +1193,9 @@ def ensure_host(port: int, headless: bool, software: bool) -> tuple[CDP, bool]:
     flags.append(host_url())
     log(f"launching {Path(browser).name}{' headless' if headless else ''}")
     subprocess.Popen(flags, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, **_detached_kwargs())
+    # Record the CDP port so a later `close` (with no --port) can find this
+    # browser instead of guessing the default.
+    update_host_state(cdpPort=port)
     # Two phases so a browser that never attaches fails fast, while a slow cold
     # page load still gets time: HOST_ATTACH_TIMEOUT for a debuggable page to
     # appear, then HOST_READY_TIMEOUT for window.__host to come up.
@@ -1352,6 +1374,580 @@ def resolve_mode(args=None) -> str:
     return mode if mode in MODE_MACROS else "debug"
 
 
+def inject_monitors(sb3_path: Path, root: Path) -> None:
+    """Re-inject the source project's monitors into a built sb3.
+
+    goboscript emits an empty `monitors` array, so monitor positions, slider
+    modes and visibility are lost. sb2gs records them in `monitors.json` (with the
+    compiled variable/list name); this maps each back to the compiled id and
+    writes the array into the sb3. Best-effort: a missing/invalid sidecar is a
+    no-op.
+    """
+    sidecar = root / "monitors.json"
+    if not sidecar.is_file():
+        return
+    try:
+        records = json.loads(sidecar.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return
+    if not isinstance(records, list) or not records:
+        return
+    try:
+        with zipfile.ZipFile(sb3_path) as archive:
+            project = json.loads(archive.read("project.json"))
+            members = [
+                (name, archive.read(name))
+                for name in archive.namelist()
+                if name != "project.json"
+            ]
+    except (OSError, ValueError, zipfile.BadZipFile):
+        return
+    targets: dict[str | None, dict] = {
+        None: next((t for t in project["targets"] if t.get("isStage")), None)
+    }
+    for target in project["targets"]:
+        if not target.get("isStage"):
+            targets[target["name"]] = target
+    monitors = []
+    for record in records:
+        target = targets.get(record.get("target"))
+        if target is None:
+            continue
+        is_list = record.get("kind") == "list"
+        name = record.get("name")
+        table = target.get("lists" if is_list else "variables", {})
+        var_id = next((vid for vid, entry in table.items() if entry[0] == name), None)
+        if var_id is None:
+            continue
+        monitors.append({
+            "id": var_id,
+            "mode": record.get("mode", "default"),
+            "opcode": "data_listcontents" if is_list else "data_variable",
+            "params": {"LIST" if is_list else "VARIABLE": name},
+            "spriteName": record.get("target"),
+            "value": 0,
+            "width": 0,
+            "height": 0,
+            "x": record.get("x", 0),
+            "y": record.get("y", 0),
+            "visible": bool(record.get("visible", False)),
+            "sliderMin": record.get("sliderMin", 0),
+            "sliderMax": record.get("sliderMax", 100),
+            "isDiscrete": record.get("isDiscrete", True),
+        })
+    if not monitors:
+        return
+    project["monitors"] = monitors
+    tmp = sb3_path.with_name(sb3_path.name + ".tmp")
+    try:
+        with zipfile.ZipFile(tmp, "w", zipfile.ZIP_DEFLATED) as archive:
+            archive.writestr("project.json", json.dumps(project, ensure_ascii=False))
+            for name, data in members:
+                archive.writestr(name, data)
+        os.replace(tmp, sb3_path)
+    except OSError:
+        try:
+            tmp.unlink()
+        except OSError:
+            pass
+
+
+def inject_costumes(sb3_path: Path, root: Path) -> None:
+    """Set the source rotation centers on a built sb3's costumes.
+
+    sb2gs preserves costumes byte-for-byte, so the compiled costumes have no
+    `rotationCenterX`/`rotationCenterY`/`bitmapResolution`; this restores them from
+    the `costumes.json` sidecar (matched by target + costume name, else order).
+    Best-effort.
+    """
+    sidecar = root / "costumes.json"
+    if not sidecar.is_file():
+        return
+    try:
+        records = json.loads(sidecar.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return
+    if not isinstance(records, list) or not records:
+        return
+    try:
+        with zipfile.ZipFile(sb3_path) as archive:
+            project = json.loads(archive.read("project.json"))
+            members = [
+                (name, archive.read(name))
+                for name in archive.namelist()
+                if name != "project.json"
+            ]
+    except (OSError, ValueError, zipfile.BadZipFile):
+        return
+    targets: dict[str | None, dict] = {
+        None: next((t for t in project["targets"] if t.get("isStage")), None)
+    }
+    for target in project["targets"]:
+        if not target.get("isStage"):
+            targets[target["name"]] = target
+    applied = 0
+    for record in records:
+        target = targets.get(record.get("target"))
+        rcx = record.get("rotationCenterX")
+        rcy = record.get("rotationCenterY")
+        if target is None or rcx is None or rcy is None:
+            continue
+        costumes = target.get("costumes", [])
+        name = record.get("name")
+        matches = [c for c in costumes if c.get("name") == name]
+        if len(matches) == 1:
+            costume = matches[0]
+        else:
+            index = record.get("index")
+            costume = (
+                costumes[index]
+                if isinstance(index, int) and 0 <= index < len(costumes)
+                else None
+            )
+        if costume is None:
+            continue
+        costume["rotationCenterX"] = rcx
+        costume["rotationCenterY"] = rcy
+        costume["bitmapResolution"] = record.get("bitmapResolution", 1)
+        applied += 1
+    if not applied:
+        return
+    tmp = sb3_path.with_name(sb3_path.name + ".tmp")
+    try:
+        with zipfile.ZipFile(tmp, "w", zipfile.ZIP_DEFLATED) as archive:
+            archive.writestr("project.json", json.dumps(project, ensure_ascii=False))
+            for name, data in members:
+                archive.writestr(name, data)
+        os.replace(tmp, sb3_path)
+    except OSError:
+        try:
+            tmp.unlink()
+        except OSError:
+            pass
+
+
+# --- Preflight: Scratch compatibility + memory (offline, no browser) ----------
+
+PREFLIGHT_SCHEMA = 1
+_PREFLIGHT_DEFAULTS = {
+    "jsonBudget": 5 * 1024 * 1024,      # Scratch's "5 MB" = 5 MiB
+    "assetBudget": 10 * 1024 * 1024,    # Scratch's "10 MB" = 10 MiB
+    "listLimit": 200_000,
+    "memoryBudget": 2 * 1024 ** 3,      # observed ~2 GiB browser ceiling (empirical)
+    "svgMemoryFactor": 2,               # SVG pays texture + per-skin canvas (~2x bitmap)
+    "svgMaxWidth": 2400,
+    "svgMaxHeight": 1800,
+}
+
+
+def _memory_suggestions(report: dict, budgets: dict) -> list[str]:
+    memory = report['memory']
+    suggestions = []
+    if memory['svgPx'] > 0:
+        suggestions.append(
+            f"convert SVG costumes to bitmap (~{budgets['svgMemoryFactor']}x saving on those)")
+    if memory['bitmapPx'] + memory['svgPx'] > 0:
+        suggestions.append('downscale costumes/frames (memory scales with area)')
+    suggestions.append('reduce stored frames or pack into a spritesheet with fewer, smaller frames')
+    if report['sounds']['decodedBytes'] > 0:
+        suggestions.append('shorten or drop large sounds (decoded to whole-file PCM in memory)')
+    suggestions.append('remove unused costumes and sounds')
+    return suggestions
+
+
+def preflight_budgets() -> dict:
+    """Thresholds: ``GSDEV_PREFLIGHT_*`` env -> gobo-agent.json -> conservative default."""
+    values = {}
+    for key, default in _PREFLIGHT_DEFAULTS.items():
+        camel = "preflight" + key[0].upper() + key[1:]
+        env = "GSDEV_PREFLIGHT_" + re.sub(r"(?<!^)(?=[A-Z])", "_", key).upper()
+        values[key] = _int_setting(env, camel, default)
+    return values
+
+
+def _png_dims(data: bytes):
+    if data[:8] != b"\x89PNG\r\n\x1a\n" or len(data) < 24:
+        return None
+    return struct.unpack(">II", data[16:24])
+
+
+def _jpeg_dims(data: bytes):
+    i, end = 2, len(data)
+    while i + 9 < end:
+        if data[i] != 0xFF:
+            i += 1
+            continue
+        marker = data[i + 1]
+        if marker in (0xD8, 0x01) or 0xD0 <= marker <= 0xD7:
+            i += 2
+            continue
+        if i + 4 > end:
+            break
+        size = struct.unpack(">H", data[i + 2:i + 4])[0]
+        if marker in (0xC0, 0xC1, 0xC2, 0xC3, 0xC5, 0xC6, 0xC7, 0xC9, 0xCA, 0xCB, 0xCD, 0xCE, 0xCF):
+            h, w = struct.unpack(">HH", data[i + 5:i + 9])
+            return (w, h)
+        if size < 2:
+            break
+        i += 2 + size
+    return None
+
+
+def _bmp_dims(data: bytes):
+    if data[:2] != b"BM" or len(data) < 26:
+        return None
+    w, h = struct.unpack("<ii", data[18:26])
+    return (abs(w), abs(h))
+
+
+def _gif_dims(data: bytes):
+    if data[:3] != b"GIF" or len(data) < 10:
+        return None
+    return struct.unpack("<HH", data[6:10])
+
+
+def _svg_dims(data: bytes) -> dict:
+    head = data[:4000]
+    if b"<!DOCTYPE" in head or b"<!ENTITY" in head:
+        return {"status": "unresolved", "reason": "doctype"}
+    try:
+        root = ET.fromstring(data)
+    except ET.ParseError:
+        return {"status": "unresolved", "reason": "parse"}
+
+    def scalar(value):
+        if not value:
+            return None
+        match = re.match(r"^\s*([0-9]*\.?[0-9]+)\s*(px)?\s*$", value)
+        return float(match.group(1)) if match else None
+
+    width, height = scalar(root.attrib.get("width")), scalar(root.attrib.get("height"))
+    if width and height:
+        return {"status": "px", "width": width, "height": height}
+    view_box = root.attrib.get("viewBox")
+    if view_box:
+        parts = view_box.replace(",", " ").split()
+        if len(parts) == 4:
+            try:
+                return {"status": "viewbox", "width": abs(float(parts[2])), "height": abs(float(parts[3]))}
+            except ValueError:
+                pass
+    return {"status": "unresolved", "reason": "dim"}
+
+
+def _pf(level: str, code: str, message: str, detail=None) -> dict:
+    finding = {'level': level, 'code': code, 'message': message}
+    if detail is not None:
+        finding['detail'] = detail
+    return finding
+
+
+def preflight_scan(sb3_path: Path) -> dict:
+    """Offline Scratch compatibility/size/memory check on an sb3 (no browser)."""
+    budgets = preflight_budgets()
+    findings: list[dict] = []
+    report = {
+        'schema': PREFLIGHT_SCHEMA,
+        'artifact': str(sb3_path),
+        'sha256': _sha256_file(sb3_path),
+        'budgets': budgets,
+        'json': {'bytes': 0, 'budget': budgets['jsonBudget'], 'over': False},
+        'assets': {'count': 0, 'totalBytes': 0, 'over': [], 'largest': []},
+        'lists': {'max': 0, 'over': [], 'atLimit': []},
+        'memory': {
+            'bitmapPx': 0, 'svgPx': 0, 'svgUnresolved': 0,
+            'svgMemoryFactor': budgets['svgMemoryFactor'], 'effectivePx': 0,
+            'bytes': 0, 'budget': budgets['memoryBudget'], 'percent': 0.0,
+            'overDimension': [], 'largest': [],
+        },
+        'sounds': {'count': 0, 'bytes': 0, 'decodedBytes': 0, 'unresolved': 0},
+        'coverage': {'unresolved': 0},
+        'findings': findings,
+    }
+    try:
+        with zipfile.ZipFile(sb3_path) as archive:
+            names = archive.namelist()
+            if len(set(names)) != len(names):
+                findings.append(_pf('error', 'duplicate-zip-entries', 'archive has duplicate entry names'))
+            if 'project.json' not in names:
+                findings.append(_pf('error', 'missing-project-json', 'no project.json in the archive'))
+                return report
+            project_bytes = archive.read('project.json')
+            sizes = {n: archive.getinfo(n).file_size for n in names if n != 'project.json'}
+            total_uncompressed = sum(sizes.values()) + len(project_bytes)
+            if len(names) > _PREFLIGHT_MAX_ENTRIES or total_uncompressed > _PREFLIGHT_MAX_UNCOMPRESSED:
+                findings.append(_pf('error', 'scan-incomplete',
+                                    f"archive too large to scan safely "
+                                    f"({len(names)} entries, {total_uncompressed:,} bytes uncompressed)"))
+                return report
+            data = json.loads(project_bytes)
+            targets = data.get('targets', [])
+
+            report['assets']['count'] = len(sizes)
+            report['assets']['totalBytes'] = sum(sizes.values())
+            over_assets = [{'name': n, 'bytes': s} for n, s in sizes.items() if s > budgets['assetBudget']]
+            report['assets']['over'] = sorted(over_assets, key=lambda x: -x['bytes'])[:10]
+            report['assets']['largest'] = sorted(
+                ({'name': n, 'bytes': s} for n, s in sizes.items()), key=lambda x: -x['bytes']
+            )[:10]
+            if over_assets:
+                findings.append(_pf('error', 'asset-over-budget',
+                                    f"{len(over_assets)} asset(s) exceed {budgets['assetBudget']} bytes",
+                                    {'assets': report['assets']['over'],
+                                     'suggestions': ['compress or downscale the asset below 10 MiB',
+                                                     'split a long sound into shorter pieces']}))
+
+            cache: dict[str, dict] = {}
+            costume_px: list[tuple] = []
+            for target in targets:
+                for costume in target.get('costumes', []):
+                    fmt = costume.get('dataFormat')
+                    md5ext = costume.get('md5ext') or f"{costume.get('assetId')}.{fmt}"
+                    info = cache.get(md5ext)
+                    if info is None:
+                        info = {'kind': fmt, 'dims': None, 'unresolved': False}
+                        try:
+                            blob = archive.read(md5ext)
+                        except KeyError:
+                            info['unresolved'] = True
+                        else:
+                            if fmt == 'png':
+                                dims = _png_dims(blob)
+                            elif fmt in ('jpg', 'jpeg'):
+                                dims = _jpeg_dims(blob)
+                            elif fmt == 'bmp':
+                                dims = _bmp_dims(blob)
+                            elif fmt == 'gif':
+                                dims = _gif_dims(blob)
+                            elif fmt == 'svg':
+                                dims = _svg_dims(blob)
+                            else:
+                                dims = None
+                            if isinstance(dims, dict):
+                                if dims.get('status') == 'unresolved':
+                                    info['unresolved'] = True
+                                else:
+                                    info['dims'] = (dims['width'], dims['height'])
+                            elif dims:
+                                info['dims'] = dims
+                            else:
+                                info['unresolved'] = True
+                        cache[md5ext] = info
+                    if info['unresolved'] or not info['dims']:
+                        report['coverage']['unresolved'] += 1
+                        if info['kind'] == 'svg':
+                            report['memory']['svgUnresolved'] += 1
+                        continue
+                    width, height = info['dims']
+                    pixels = int(round(width * height))
+                    if info['kind'] == 'svg':
+                        report['memory']['svgPx'] += pixels
+                        if width > budgets['svgMaxWidth'] or height > budgets['svgMaxHeight']:
+                            report['memory']['overDimension'].append(
+                                {'sprite': target.get('name'), 'costume': costume.get('name'),
+                                 'width': width, 'height': height})
+                    else:
+                        report['memory']['bitmapPx'] += pixels
+                    costume_px.append((pixels, target.get('name'), costume.get('name'), info['kind']))
+
+            for target in targets:
+                for entry in target.get('lists', {}).values():
+                    count = len(entry[1]) if isinstance(entry[1], list) else 0
+                    report['lists']['max'] = max(report['lists']['max'], count)
+                    if count > budgets['listLimit']:
+                        report['lists']['over'].append(
+                            {'sprite': target.get('name'), 'list': entry[0], 'items': count})
+                    elif count == budgets['listLimit']:
+                        report['lists']['atLimit'].append(
+                            {'sprite': target.get('name'), 'list': entry[0], 'items': count})
+            if report['lists']['over']:
+                findings.append(_pf('error', 'list-over-capacity',
+                                    f"list(s) exceed {budgets['listLimit']} items", report['lists']['over']))
+            if report['lists']['atLimit']:
+                findings.append(_pf('warning', 'list-at-capacity',
+                                    f"list(s) at the {budgets['listLimit']}-item limit", report['lists']['atLimit']))
+
+            for target in targets:
+                for sound in target.get('sounds', []):
+                    fmt = sound.get('dataFormat')
+                    md5ext = sound.get('md5ext') or f"{sound.get('assetId')}.{fmt}"
+                    report['sounds']['count'] += 1
+                    report['sounds']['bytes'] += sizes.get(md5ext, 0)
+                    try:
+                        blob = archive.read(md5ext)
+                    except KeyError:
+                        report['sounds']['unresolved'] += 1
+                        continue
+                    pcm = _sound_pcm_bytes(blob, fmt, len(blob))
+                    if pcm is None:
+                        report['sounds']['unresolved'] += 1
+                    else:
+                        report['sounds']['decodedBytes'] += pcm
+
+        report['json']['bytes'] = len(project_bytes)
+        report['json']['over'] = len(project_bytes) > budgets['jsonBudget']
+        if budgets['jsonBudget']:
+            report['json']['percent'] = round(len(project_bytes) / budgets['jsonBudget'] * 100, 1)
+        if report['json']['over']:
+            findings.append(_pf('error', 'json-over-budget',
+                                f"project.json is {len(project_bytes):,} bytes > {budgets['jsonBudget']:,}",
+                                {'suggestions': [
+                                    'clean up lists: drop duplicate/unused list data and list-monitor entries',
+                                    'remove redundant shadow blocks (unused menu/shadow inputs) from project.json',
+                                    'shorten large list literals / long strings',
+                                    'remove unused blocks, variables and lists',
+                                    'move big data into assets instead of project.json',
+                                ]}))
+        elif len(project_bytes) >= budgets['jsonBudget'] * 9 // 10:
+            findings.append(_pf('warning', 'json-near-budget',
+                                f"project.json is {len(project_bytes):,} bytes "
+                                f"(~{report['json']['percent']}% of {budgets['jsonBudget']:,})"))
+        report['memory']['largest'] = [
+            {'pixels': p, 'sprite': s, 'costume': c, 'kind': k}
+            for p, s, c, k in sorted(costume_px, reverse=True)[:10]
+        ]
+        memory = report['memory']
+        memory['effectivePx'] = int(memory['bitmapPx'] + budgets['svgMemoryFactor'] * memory['svgPx'])
+        memory['bytes'] = memory['effectivePx'] * 4 + report['sounds']['decodedBytes']
+        memory['percent'] = round(memory['bytes'] / budgets['memoryBudget'] * 100, 1) if budgets['memoryBudget'] else 0.0
+        if memory['bytes'] > budgets['memoryBudget']:
+            findings.append(_pf('error', 'memory-over-budget',
+                f"estimated memory ~{memory['bytes'] / 2 ** 30:.2f} GiB "
+                f"({memory['percent']}% of {budgets['memoryBudget'] / 2 ** 30:.0f} GiB)",
+                {'bitmapPx': memory['bitmapPx'], 'svgPx': int(memory['svgPx']),
+                 'svgFactor': budgets['svgMemoryFactor'],
+                 'soundPcmBytes': report['sounds']['decodedBytes'],
+                 'suggestions': _memory_suggestions(report, budgets)}))
+        if memory['overDimension']:
+            findings.append(_pf('warning', 'svg-over-dimension',
+                                f"{len(memory['overDimension'])} SVG(s) exceed "
+                                f"{budgets['svgMaxWidth']}x{budgets['svgMaxHeight']}",
+                                memory['overDimension'][:10]))
+        if report['coverage']['unresolved']:
+            findings.append(_pf('warning', 'unresolved-assets',
+                                f"{report['coverage']['unresolved']} asset(s) had no measurable "
+                                'dimensions (estimate is partial)'))
+        if report['sounds']['decodedBytes'] > 100_000_000:
+            findings.append(_pf('warning', 'sounds-decoded-large',
+                                f"decoded sound PCM ~{report['sounds']['decodedBytes']:,} bytes "
+                                f"({report['sounds']['unresolved']} unmeasured)"))
+    except (OSError, zipfile.BadZipFile, ValueError) as error:
+        findings.append(_pf('error', 'invalid-archive', f'cannot read archive: {error}'))
+    return report
+
+
+def print_preflight(report: dict) -> None:
+    j, m, a, l = report['json'], report['memory'], report['assets'], report['lists']
+    print(f"project.json: {j['bytes']:,} / {j['budget']:,} bytes"
+          f" ({j.get('percent', 0.0)}%)" + ('  OVER' if j['over'] else ''))
+    print(f"assets: {a['count']} unique, {a['totalBytes']:,} bytes total, "
+          f"{len(a['over'])} over {report['budgets']['assetBudget']:,}")
+    print(f"memory: ~{m['bytes'] / 2 ** 30:.2f} GiB ({m['percent']}% of {m['budget'] / 2 ** 30:.0f} GiB)"
+          f"  = (bitmap {m['bitmapPx']:,} px + svg {int(m['svgPx']):,} px x{m['svgMemoryFactor']}) x4"
+          f" + {report['sounds']['decodedBytes']:,} B sound PCM")
+    print(f"svg unresolved: {m['svgUnresolved']}")
+    print(f"largest list: {l['max']:,} / {report['budgets']['listLimit']:,} items")
+    s = report['sounds']
+    print(f"sounds: {s['count']} ({s['bytes']:,} bytes, ~{s['decodedBytes']:,} PCM, "
+          f"{s['unresolved']} unmeasured)")
+    print(f"measurement gaps: {report['coverage']['unresolved']}")
+    print(f"sha256: {report.get('sha256', '')[:16]}...")
+    for item in report['memory']['largest'][:5]:
+        print(f"  largest: {item['sprite']}::{item['costume']} {item['pixels']:,} px ({item['kind']})")
+    for finding in report['findings']:
+        print(f"[{finding['level']:7}] {finding['code']}: {finding['message']}")
+        detail = finding.get('detail')
+        if isinstance(detail, dict):
+            for suggestion in detail.get('suggestions', []):
+                print(f"            -> {suggestion}")
+
+
+def cmd_preflight(args: argparse.Namespace) -> int:
+    ensure_dependencies(need_bundles=False)
+    if getattr(args, 'sb3', ''):
+        path = Path(args.sb3).expanduser()
+        if not path.is_absolute():
+            path = PROJECT_ROOT / path
+        if not path.is_file():
+            raise SystemExit(f'--sb3 not found: {path}')
+    else:
+        path = build_project(resolve_mode(args))
+    report = preflight_scan(path)
+    errors = [f for f in report['findings'] if f['level'] == 'error']
+    warnings = [f for f in report['findings'] if f['level'] == 'warning']
+    if getattr(args, 'json', False):
+        print(json.dumps(report, ensure_ascii=False, indent=2))
+    else:
+        print_preflight(report)
+    if errors or (getattr(args, 'strict', False) and warnings):
+        return 1
+    return 0
+
+
+_PREFLIGHT_MAX_ENTRIES = 200_000
+_PREFLIGHT_MAX_UNCOMPRESSED = 2 * 1024 ** 3
+_PREFLIGHT_MAX_SVG_READ = 32 * 1024 * 1024
+
+
+def _sha256_file(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open('rb') as handle:
+        for chunk in iter(lambda: handle.read(1024 * 1024), b''):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+_MP3_BITRATES = {
+    1: [0, 32, 40, 48, 56, 64, 80, 96, 112, 128, 160, 192, 224, 256, 320],
+    2: [0, 8, 16, 24, 32, 40, 48, 56, 64, 80, 96, 112, 128, 144, 160],
+}
+_MP3_RATES = {3: [44100, 48000, 32000], 2: [22050, 24000, 16000], 0: [11025, 12000, 8000]}
+
+
+def _wav_pcm_bytes(data: bytes):
+    if data[:4] != b'RIFF' or data[8:12] != b'WAVE':
+        return None
+    i = 12
+    while i + 8 <= len(data):
+        chunk = data[i:i + 4]
+        size = struct.unpack('<I', data[i + 4:i + 8])[0]
+        body = i + 8
+        if chunk == b'data':
+            return size
+        i = body + size + (size & 1)
+    return None
+
+
+def _mp3_pcm_bytes(data: bytes, file_bytes: int):
+    for i in range(min(len(data) - 4, 8192)):
+        if data[i] == 0xFF and (data[i + 1] & 0xE0) == 0xE0:
+            version_bits = (data[i + 1] >> 3) & 0x03
+            bitrate_index = (data[i + 2] >> 4) & 0x0F
+            rate_index = (data[i + 2] >> 2) & 0x03
+            if version_bits == 1 or bitrate_index in (0, 15) or rate_index == 3:
+                continue
+            table = _MP3_BITRATES[1 if version_bits == 3 else 2]
+            rates = _MP3_RATES.get(version_bits)
+            if not rates:
+                continue
+            bitrate = table[bitrate_index] * 1000
+            rate = rates[rate_index]
+            channels = 1 if ((data[i + 3] >> 6) & 0x03) == 3 else 2
+            if bitrate <= 0:
+                continue
+            seconds = file_bytes * 8 / bitrate
+            return int(seconds * rate * channels * 2)
+    return None
+
+
+def _sound_pcm_bytes(data: bytes, fmt: str, file_bytes: int):
+    if fmt == 'wav':
+        return _wav_pcm_bytes(data)
+    if fmt == 'mp3':
+        return _mp3_pcm_bytes(data, file_bytes)
+    return None
+
+
 def build_project_at(root: Path, mode: str = "debug") -> Path:
     goboscript = resolve_goboscript()
     if goboscript is None:
@@ -1392,6 +1988,8 @@ def build_project_at(root: Path, mode: str = "debug") -> Path:
             mode_file.write_text(original, encoding="utf-8")
     if result.returncode != 0:
         raise SystemExit(f"goboscript build failed (exit {result.returncode}).")
+    inject_monitors(sb3_path, root)
+    inject_costumes(sb3_path, root)
     return sb3_path
 
 
@@ -1416,10 +2014,24 @@ def cmd_build(args: argparse.Namespace) -> int:
     return 0
 
 
+def artifact_path(args: argparse.Namespace) -> Path:
+    """The sb3 to load: ``--sb3 PATH`` when given, else the project's build output."""
+    given = getattr(args, "sb3", "")
+    if given:
+        path = Path(given).expanduser()
+        if not path.is_absolute():
+            path = PROJECT_ROOT / path
+        if not path.is_file():
+            raise SystemExit(f"--sb3 not found: {path}")
+        return path
+    return SB3_PATH
+
+
 def cmd_run(args: argparse.Namespace) -> int:
     ensure_dependencies(need_bundles=True)
-    if not args.no_build and not args.no_reload:
+    if not getattr(args, "sb3", "") and not args.no_build and not args.no_reload:
         build_project(resolve_mode(args))
+    artifact = artifact_path(args)
     t0 = time.monotonic()
     cdp, launched = ensure_host(args.port, args.headless, args.software)
     dismiss_browser_dialogs(args.port)
@@ -1432,7 +2044,7 @@ def cmd_run(args: argparse.Namespace) -> int:
                 "reusing the running project (--no-reload)"
             )
         else:
-            info = load_host_project(cdp, SB3_PATH)
+            info = load_host_project(cdp, artifact)
             log(
                 f"host {'launched' if launched else 'warm'}: browser {ready:.2f}s, "
                 f"load {info['load']:.0f} ms"
@@ -1484,8 +2096,9 @@ def cmd_run(args: argparse.Namespace) -> int:
 
 def cmd_screenshot(args: argparse.Namespace) -> int:
     ensure_dependencies(need_bundles=True)
-    if not args.no_build:
+    if not getattr(args, "sb3", "") and not args.no_build:
         build_project(resolve_mode(args))
+    artifact = artifact_path(args)
     out_path = Path(args.out).expanduser() if args.out else DEBUG_DIR / "stage.png"
     if not out_path.is_absolute():
         out_path = PROJECT_ROOT / out_path
@@ -1493,7 +2106,7 @@ def cmd_screenshot(args: argparse.Namespace) -> int:
     dismiss_browser_dialogs(args.port)
     apply_cpu_throttle(cdp, getattr(args, "cpu", 0.0))
     try:
-        load_host_project(cdp, SB3_PATH)
+        load_host_project(cdp, artifact)
         time.sleep(max(0, args.delay) / 1000.0)
         rect = host_stage_rect(cdp)
         data = cdp.call(
@@ -1527,7 +2140,15 @@ def cmd_stop(args: argparse.Namespace) -> int:
 
 
 def cmd_close(args: argparse.Namespace) -> int:
-    close_host(args.port)
+    port = args.port
+    if port is None:
+        # Prefer the CDP port the running host recorded; fall back to the
+        # remembered auto port (or a fresh one) when there is no recorded host.
+        recorded = read_host_state().get("cdpPort")
+        port = recorded if isinstance(recorded, int) and recorded > 0 else resolve_port(0)
+    else:
+        port = resolve_port(port)
+    close_host(port)
     return 0
 
 
@@ -3789,20 +4410,169 @@ def cmd_setup(args: argparse.Namespace) -> int:
     return bootstrap.run_setup(only=args.only, force=args.force, offline=args.offline)
 
 
+def _sb2gs_paths(argv: list[str]) -> tuple[Path | None, Path | None]:
+    """Input `.sb3` and output directory from sb2gs's positional args."""
+    positionals: list[str] = []
+    skip = False
+    for arg in argv:
+        if skip:
+            skip = False
+            continue
+        if arg == "--id":
+            skip = True
+            continue
+        if arg.startswith("-"):
+            continue
+        positionals.append(arg)
+    if not positionals:
+        return None, None
+    input_path = Path(positionals[0])
+    output_path = (
+        Path(positionals[1]) if len(positionals) > 1
+        else input_path.parent / input_path.stem
+    )
+    return input_path, output_path
+
+
+def _clean_sb2gs_failure(
+    input_path: Path | None, output_path: Path | None,
+    input_existed: bool, output_existed: bool, verify: bool = False,
+) -> None:
+    """Remove artifacts this failed run created, so a retry starts clean.
+
+    A partial `.sb3` would make sb2gs skip the download and then fail on a
+    corrupt archive; a partial output dir makes it refuse ("use --overwrite").
+    Only artifacts that did not exist before this run are removed, and a valid
+    `.sb3` is kept so a retry skips the download.
+
+    With ``--verify`` a *complete* decompile (its config was written) is kept for
+    inspection even though goboscript rejected it; a partial decompile is removed.
+    """
+    import zipfile
+
+    if (input_path is not None and not input_existed and input_path.exists()
+            and not zipfile.is_zipfile(input_path)):
+        try:
+            input_path.unlink()
+            log(f"removed incomplete download: {input_path}")
+        except OSError:
+            pass
+    config = output_path / "goboscript.toml" if output_path is not None else None
+    decompiled = bool(config is not None and config.is_file() and config.stat().st_size > 0)
+    if (output_path is not None and not output_existed
+            and not (verify and decompiled) and output_path.is_dir()):
+        try:
+            shutil.rmtree(output_path)
+            log(f"removed incomplete output: {output_path}")
+        except OSError:
+            pass
+
+
+def _sb2gs_project_id(argv: list[str]) -> str | None:
+    """The `--id` project id, if passed (`--id N` or `--id=N`)."""
+    for index, arg in enumerate(argv):
+        if arg == "--id" and index + 1 < len(argv):
+            return argv[index + 1]
+        if arg.startswith("--id="):
+            return arg[len("--id="):]
+    return None
+
+
+def _write_provenance(project_id: str, output_dir: Path) -> None:
+    """Write provenance.json for a Scratch project imported with `--id`.
+
+    Best-effort: a metadata fetch failure warns but never fails the import, and
+    the file is only meaningful for projects hosting their source on Scratch.
+    """
+    request = urllib.request.Request(
+        f"https://api.scratch.mit.edu/projects/{project_id}",
+        headers={"User-Agent": "gobo-agent"},
+    )
+    try:
+        with urllib.request.urlopen(request, timeout=30) as response:
+            data = json.loads(response.read().decode("utf-8"))
+    except (OSError, ValueError) as error:
+        log(f"provenance: could not fetch metadata for {project_id}: {error}")
+        return
+    history = data.get("history") or {}
+    author = data.get("author") or {}
+    username = author.get("username")
+    canonical_id = data.get("id", project_id)
+    record = {
+        "title": data.get("title"),
+        "username": username,
+        "projectid": canonical_id,
+        "releasedate": history.get("shared"),
+        "instructions": data.get("instructions"),
+        "notes_and_credits": data.get("description"),
+        "url": f"https://scratch.mit.edu/projects/{canonical_id}",
+        "author_url": f"https://scratch.mit.edu/users/{username}/" if username else None,
+        "retrieved": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+    }
+    try:
+        output_dir.mkdir(parents=True, exist_ok=True)
+        (output_dir / "provenance.json").write_text(
+            json.dumps(record, indent=2, ensure_ascii=False) + "\n",
+            encoding="utf-8", newline="\n",
+        )
+    except OSError as error:
+        log(f"provenance: could not write provenance.json: {error}")
+        return
+    log(f"provenance: wrote {output_dir / 'provenance.json'}")
+
+
 def _run_sb2gs(argv: list[str]) -> int:
     """Run a user-installed sb2gs if present, else install ours (only if missing)."""
-    system = bootstrap.system_sb2gs()
-    if system:
-        return subprocess.run([system, *argv]).returncode
-    if not bootstrap.sb2gs_present():
-        if os.environ.get("GSDEV_NO_AUTO_SETUP", "").strip().lower() in ("1", "true", "yes"):
-            raise SystemExit("sb2gs is not installed; run `gsdev setup --only sb2gs`")
-        log("sb2gs not installed; downloading it (no admin)")
-        bootstrap.run_setup(only="sb2gs")
+    input_path, output_path = _sb2gs_paths(argv)
+    verify = "--verify" in argv
+    # An existing but invalid .sb3 (a partial download from a previous failure)
+    # would make sb2gs skip the download and fail on decompile; drop it first.
+    if "--id" in argv and input_path is not None and input_path.exists():
+        import zipfile
+        if not zipfile.is_zipfile(input_path):
+            try:
+                input_path.unlink()
+                log(f"removed incomplete download: {input_path}")
+            except OSError:
+                pass
+    input_existed = input_path.exists() if input_path is not None else True
+    output_existed = output_path.exists() if output_path is not None else True
+
     try:
-        return bootstrap.run_sb2gs(argv)
+        timeout = float(os.environ.get("GSDEV_SB2GS_TIMEOUT", "1800"))
+    except ValueError:
+        raise SystemExit("GSDEV_SB2GS_TIMEOUT is not a number")
+
+    system = bootstrap.system_sb2gs()
+    try:
+        if system:
+            code = subprocess.run(
+                [system, *argv], timeout=timeout, env=bootstrap.sb2gs_env()
+            ).returncode
+        else:
+            if not bootstrap.sb2gs_present():
+                if os.environ.get("GSDEV_NO_AUTO_SETUP", "").strip().lower() in ("1", "true", "yes"):
+                    raise SystemExit("sb2gs is not installed; run `gsdev setup --only sb2gs`")
+                log("sb2gs not installed; downloading it (no admin)")
+                bootstrap.run_setup(only="sb2gs")
+            code = bootstrap.run_sb2gs(argv)
+    except subprocess.TimeoutExpired:
+        _clean_sb2gs_failure(input_path, output_path, input_existed, output_existed, verify=verify)
+        raise SystemExit(
+            f"sb2gs timed out after {int(timeout)}s (slow/stalled network?); "
+            "download the .sb3 in a browser and pass the local file instead"
+        )
     except bootstrap.SetupError as error:
+        _clean_sb2gs_failure(input_path, output_path, input_existed, output_existed, verify=verify)
         raise SystemExit(str(error))
+
+    if code != 0:
+        _clean_sb2gs_failure(input_path, output_path, input_existed, output_existed, verify=verify)
+    else:
+        project_id = _sb2gs_project_id(argv)
+        if project_id and output_path is not None and output_path.is_dir():
+            _write_provenance(project_id, output_path)
+    return code
 
 
 def cmd_sb2gs(args: argparse.Namespace) -> int:
@@ -4053,6 +4823,54 @@ _SMOKE_TEMPLATE = (
     "expect @rendered > 0\n"
     "expect_no_errors\n"
 )
+
+# `init` merges this into the project's root AGENTS.md (creating the file if
+# needed) so an agentic coder in the adopted project knows the harness is there
+# and how to drive it. The markers let re-runs refresh only our section.
+_AGENTS_BEGIN = "<!-- gobo-agent:begin (managed by `gsdev init`) -->"
+_AGENTS_END = "<!-- gobo-agent:end -->"
+_AGENTS_REPO = "https://github.com/slyi/gobo-agent"
+_AGENTS_SECTION = f"""\
+## gobo-agent
+
+This project is built, run, and tested with **gobo-agent**, a warm-browser GoboScript
+harness under `gobo-agent/`. The launcher is `gobo-agent/runtime/tools/gsdev` (POSIX)
+or `gobo-agent/runtime/tools/gsdev.ps1` (Windows); below, `gsdev` means that. Run
+commands from the project root.
+
+Full harness workflow (the gobo-agent `AGENTS.md`):
+{_AGENTS_REPO}/blob/main/AGENTS.md
+
+The first command installs the pinned tools (goboscript, Scratch host bundles, sb2gs)
+with no admin rights and no Rust; they are shared per user, so later projects download
+nothing.
+
+Core loop:
+
+- `gsdev doctor` — check python, goboscript, host bundles, sb2gs, build readiness.
+- `gsdev build` — compile to `<project>.sb3` at the project root.
+- `gsdev run --duration 2 --leave-running` — build and run in a warm browser with live
+  logs; then `get <sprite.variable>` / `inspect` / `screenshot`, and end with `close`.
+- `gsdev test --manifest gobo-agent/gobo-tests.json --headless` — run the manifest's
+  sessions (`--list` validates read-only).
+- `gsdev set <sprite.var>=<value>` / `set_batch ...` — live edits, no rebuild.
+- `--mode debug|release`; the mode include is `gobo-agent/gsdev_mode.gs`.
+
+Keep the host warm between edits: rebuild/reload after `.gs` changes, but prefer
+`set`/`set_batch` for data. `gobo-agent/gobo-agent.json` can set `prebuild`, `env`,
+`modeInclude`, `hostPort`/`cdpPort`. Prefer a local `.sb3` over `sb2gs --id` for large
+projects.
+
+VS Code: **Ctrl+Shift+B** runs the `gobo-agent: Run` task; the optional Test Explorer
+extension lists the manifest. The upstream `aspizu.goboscript` extension adds syntax
+and a `.sb3` preview but has no debugger (don't press F5 — build with gobo-agent, then
+open the built `.sb3`; set `goboscript.compilerPath` to
+`<tools-root>/goboscript/goboscript.exe`).
+
+Scratch import (`sb2gs`) is best-effort: unsupported opcodes and sprite names that
+aren't valid filenames can fail. See the gobo-agent repository's integration guide
+({_AGENTS_REPO}/blob/main/docs/integration.md) → "Known upstream limitations".
+"""
 
 
 def _sha256_bytes(data: bytes) -> str:
@@ -4325,6 +5143,35 @@ def cmd_init(args: argparse.Namespace) -> int:
         and tasks_existing.get("version") == merged_tasks["version"]
     )
 
+    # AGENTS.md: hand an agentic coder in the adopted project the gobo-agent
+    # workflow. Created if absent; if the file exists only our marked section is
+    # (re)written, so the project's own instructions are preserved.
+    agents_path = project / "AGENTS.md"
+    agents_block = f"{_AGENTS_BEGIN}\n{_AGENTS_SECTION}{_AGENTS_END}\n"
+    agents_marker = re.compile(
+        re.escape(_AGENTS_BEGIN) + r".*?" + re.escape(_AGENTS_END) + r"\n?", re.DOTALL
+    )
+    agents_existing = ""
+    agents_skip = False
+    if agents_path.is_file():
+        try:
+            agents_existing = agents_path.read_text(encoding="utf-8")
+        except (OSError, UnicodeDecodeError):
+            # Free-form user file in another encoding: leave it untouched instead
+            # of crashing or mangling it.
+            agents_skip = True
+    if agents_skip:
+        agents_merged = ""
+        agents_changed = False
+    else:
+        if agents_marker.search(agents_existing):
+            agents_merged = agents_marker.sub(lambda _m: agents_block, agents_existing, count=1)
+        elif agents_existing.strip():
+            agents_merged = agents_existing.rstrip("\n") + "\n\n" + agents_block
+        else:
+            agents_merged = "# AGENTS.md\n\n" + agents_block
+        agents_changed = agents_merged != agents_existing
+
     writes = [p for p in planned if p[0] in ("create", "refresh", "overwrite --force",
                                              "overwrite --force-owned")]
 
@@ -4342,6 +5189,10 @@ def cmd_init(args: argparse.Namespace) -> int:
             print(f"  {'append':>20}  .gitattributes  (+{len(ga_missing)} rules)")
         if tasks_changed:
             print(f"  {'merge':>20}  .vscode/tasks.json  (+{len(generated_tasks)} tasks)")
+        if agents_changed:
+            print(f"  {'merge':>20}  AGENTS.md  (gobo-agent section)")
+        if agents_skip:
+            print(f"  {'skip':>20}  AGENTS.md  (not UTF-8; left untouched)")
         if conflicts:
             print(f"[init] conflicts (left untouched): {', '.join(sorted(set(conflicts)))}")
         print("[init] dry run: nothing written")
@@ -4363,6 +5214,8 @@ def cmd_init(args: argparse.Namespace) -> int:
     if tasks_changed:
         tasks_path.parent.mkdir(parents=True, exist_ok=True)
         tasks_path.write_text(json.dumps(merged_tasks, indent=4) + "\n", encoding="utf-8")
+    if agents_changed:
+        agents_path.write_text(agents_merged, encoding="utf-8")
 
     # Make the copied runtime launchers executable on POSIX (preserve other modes).
     if args.layout == "copy" and os.name != "nt":
@@ -4406,6 +5259,10 @@ def cmd_init(args: argparse.Namespace) -> int:
         log(f"  .gitattributes: +{len(ga_missing)} rules")
     if tasks_changed:
         log(f"  .vscode/tasks.json: {len(generated_tasks)} gobo-agent tasks")
+    if agents_changed:
+        log("  AGENTS.md: gobo-agent section")
+    if agents_skip:
+        log("  AGENTS.md: not UTF-8; left untouched")
     if conflicts:
         log(f"conflicts (left untouched): {', '.join(sorted(set(conflicts)))}")
 
@@ -4426,13 +5283,12 @@ def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     subparsers = parser.add_subparsers(dest="command", required=True)
 
-    def add_port(sub: argparse.ArgumentParser) -> None:
-        sub.add_argument(
-            "--port",
-            type=int,
-            default=DEFAULT_PORT,
-            help="CDP port; 0 picks a free port and remembers it (default %(default)s)",
-        )
+    def add_port(
+        sub: argparse.ArgumentParser,
+        default: int | None = DEFAULT_PORT,
+        help_text: str = "CDP port; 0 picks a free port and remembers it (default %(default)s)",
+    ) -> None:
+        sub.add_argument("--port", type=int, default=default, help=help_text)
 
     def add_cpu(sub: argparse.ArgumentParser) -> None:
         sub.add_argument(
@@ -4516,6 +5372,7 @@ def build_parser() -> argparse.ArgumentParser:
     add_cpu(run)
     add_mode(run)
     run.add_argument("--no-build", action="store_true", help="skip goboscript build")
+    run.add_argument("--sb3", default="", help="load this sb3 instead of building")
     run.add_argument(
         "--no-reload",
         action="store_true",
@@ -4536,11 +5393,19 @@ def build_parser() -> argparse.ArgumentParser:
     add_cpu(shot)
     add_mode(shot)
     shot.add_argument("--no-build", action="store_true", help="skip goboscript build")
+    shot.add_argument("--sb3", default="", help="load this sb3 instead of building")
     shot.add_argument("--out", default="", help="output path (default debug/stage.png)")
     shot.add_argument("--delay", type=int, default=1200, help="wait before capture in ms")
     shot.add_argument("--headless", action="store_true", help="no visible browser window")
     add_software(shot)
     shot.set_defaults(func=cmd_screenshot)
+
+    pre = subparsers.add_parser('preflight', help='offline Scratch size/memory/compat check')
+    add_mode(pre)
+    pre.add_argument('--sb3', default='', help='scan this sb3 instead of building')
+    pre.add_argument('--json', action='store_true', help='emit the report as JSON')
+    pre.add_argument('--strict', action='store_true', help='exit non-zero on warnings too')
+    pre.set_defaults(func=cmd_preflight)
 
     stop = subparsers.add_parser("stop", help="stop the running project")
     add_port(stop)
@@ -4882,7 +5747,11 @@ def build_parser() -> argparse.ArgumentParser:
     wait_pixel.set_defaults(func=cmd_wait_pixel)
 
     close = subparsers.add_parser("close", help="close the host browser and server")
-    add_port(close)
+    add_port(
+        close,
+        None,
+        "CDP port of the host to close (default: the host's recorded CDP port)",
+    )
     close.set_defaults(func=cmd_close)
 
     subparsers.choices["build"].set_defaults(func=cmd_build)
@@ -4901,7 +5770,9 @@ def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(raw)
     if getattr(args, "json", False):
         JSON_MODE = True
-    if args.command != "build" and hasattr(args, "port"):
+    # `build` has no port; `close` resolves its own port (the host's recorded CDP
+    # port when none is given) inside cmd_close.
+    if args.command not in ("build", "close") and hasattr(args, "port"):
         args.port = resolve_port(args.port)
     return args.func(args)
 

@@ -100,6 +100,9 @@ tools\gsdev.ps1 init --project my_project            # adopt with gobo-agent
 my_project\gobo-agent\runtime\tools\gsdev.ps1 run    # then use the project's own launcher
 ```
 
+Conversion is best-effort (unsupported opcodes, non-filename sprite names, …); see
+the integration guide's "Known upstream limitations" for the failure classes.
+
 The VS Code tasks (`.vscode/tasks.json`) use the same launchers — `./setup.sh` and
 `./tools/gsdev` on macOS/Linux, `setup.ps1`/`gsdev.ps1` on Windows — so Setup, Build,
 Run, Screenshot, Stop, Close and Check dependencies behave identically on both.
@@ -136,6 +139,9 @@ tools\gsdev.ps1 session --file checks.txt --bundle
 tools\gsdev.ps1 profile --no-reload --no-restart --seconds 2 --no-follow --leave-running
 tools\gsdev.ps1 setprofiling off
 ```
+
+`run` and `screenshot` also take `--sb3 PATH` to load an existing artifact instead
+of building (e.g. an imported or externally built `.sb3`).
 
 An optional extension in `vscode-extension/` surfaces the manifest in VS Code's **Test
 Explorer**: it discovers `gobo-tests.json` (at the workspace root, or under `gobo-agent/`
@@ -295,6 +301,7 @@ Useful inspection commands:
 | Capture changes | `record`, `trace`, `until … --pause` |
 | Check rendering | `screenshot`, `pixel`, session pixel assertions |
 | Check errors | `errors`, `expect_no_errors` |
+| Check Scratch fit before publishing | `preflight` (offline; `--sb3 FILE` to scan an artifact, `--json`, `--strict`) |
 
 The standalone `screenshot` command builds/reloads, captures, then stops the project;
 `--no-build` skips compilation but still reloads. It is not a state-preserving snapshot

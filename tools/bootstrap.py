@@ -657,6 +657,527 @@ raise SystemExit(main())
 """
 
 
+# gobo-agent patch for sb2gs's `--id` downloader. Upstream fetches every asset
+# sequentially with httpx's short default timeout and no retry, so large projects
+# (hundreds of assets) are slow and abort on a single hiccup. This patch:
+#   - reuses one pooled httpx.Client (one TLS handshake per host, not per asset);
+#   - downloads concurrently (GSDEV_SB2GS_WORKERS, default 16);
+#   - caches assets by md5ext on disk (content-addressed; GSDEV_SB2GS_CACHE,
+#     disable with GSDEV_SB2GS_NO_CACHE), so repeat imports are offline;
+#   - retries with backoff, accepts the project-data endpoint's zip-wrapped
+#     response as well as raw JSON, and normalizes the sb3 (fills sb2gs-required
+#     defaults and a missing md5ext). Same public signature.
+SB2GS_DOWNLOADER_PATCH = '''\
+import io
+import json
+import os
+import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from pathlib import Path
+from zipfile import ZipFile
+
+import httpx
+
+_TIMEOUT = httpx.Timeout(60.0, connect=15.0)
+_RETRIES = 4
+_WORKERS = max(1, int(os.environ.get("GSDEV_SB2GS_WORKERS", "16") or "16"))
+_client = httpx.Client(
+    timeout=_TIMEOUT,
+    follow_redirects=True,
+    limits=httpx.Limits(
+        max_connections=max(_WORKERS * 2, 32),
+        max_keepalive_connections=max(_WORKERS, 16),
+    ),
+)
+
+
+def _asset_cache():
+    if os.environ.get("GSDEV_SB2GS_NO_CACHE"):
+        return None
+    override = os.environ.get("GSDEV_SB2GS_CACHE")
+    if override:
+        return Path(override)
+    if os.name == "nt":
+        base = os.environ.get("LOCALAPPDATA") or os.path.expanduser("~")
+    else:
+        base = os.environ.get("XDG_CACHE_HOME") or os.path.join(os.path.expanduser("~"), ".cache")
+    return Path(base) / "gobo-agent" / "asset-cache"
+
+
+def _get(url: str):
+    last = None
+    for attempt in range(_RETRIES):
+        try:
+            response = _client.get(url)
+            response.raise_for_status()
+            return response
+        except Exception as error:  # retry any transient failure
+            last = error
+            time.sleep(min(2 ** attempt, 8))
+    raise last
+
+
+def _md5ext(asset: dict) -> str:
+    # Some projects omit md5ext (newer saves); it is assetId + "." + dataFormat.
+    return asset.get("md5ext") or f"{asset['assetId']}.{asset['dataFormat']}"
+
+
+def _asset_bytes(md5ext: str) -> bytes:
+    cache = _asset_cache()
+    path = (cache / md5ext) if cache else None
+    if path is not None and path.is_file():
+        return path.read_bytes()
+    data = _get(f"https://assets.scratch.mit.edu/internalapi/asset/{md5ext}/get/").content
+    if path is not None:
+        try:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            part = path.with_name(path.name + ".part")
+            part.write_bytes(data)
+            os.replace(part, path)
+        except OSError:
+            pass
+    return data
+
+
+def _target_defaults() -> dict:
+    # Newer saves omit empty/default target keys that sb2gs dereferences directly
+    # (lists, comments, layerOrder, volume, ...). Fill the sb3 defaults.
+    return {
+        "variables": {}, "lists": {}, "broadcasts": {}, "blocks": {}, "comments": {},
+        "costumes": [], "sounds": [], "currentCostume": 0, "volume": 100,
+        "layerOrder": 0, "visible": True, "x": 0, "y": 0, "size": 100,
+        "direction": 90, "draggable": False, "rotationStyle": "all around",
+    }
+
+
+def download_sb3(id: str, outfile: str | Path) -> None:
+    token = _get(f"https://api.scratch.mit.edu/projects/{id}").json()["project_token"]
+    response = _get(f"https://projects.scratch.mit.edu/{id}?token={token}")
+    # The data endpoint returns raw JSON for most projects but a small zip whose
+    # only entry is project.json for others (e.g. newer/svg projects); handle both.
+    if response.content[:2] == b"PK":
+        with ZipFile(io.BytesIO(response.content)) as bundle:
+            data = json.loads(bundle.read("project.json"))
+    else:
+        data = response.json()
+    for target in data["targets"]:
+        for key, value in _target_defaults().items():
+            target.setdefault(key, value)
+        for asset in (*target["costumes"], *target["sounds"]):
+            # sb2gs requires md5ext even when the saved project omitted it.
+            asset.setdefault("md5ext", _md5ext(asset))
+        for block in target["blocks"].values():
+            if isinstance(block, dict):
+                block.setdefault("next", None)
+                block.setdefault("parent", None)
+                block.setdefault("inputs", {})
+                block.setdefault("fields", {})
+                block.setdefault("shadow", False)
+                block.setdefault("topLevel", False)
+    assets = {
+        *(
+            costume["md5ext"]
+            for target in data["targets"]
+            for costume in target["costumes"]
+        ),
+        *(
+            sound["md5ext"]
+            for target in data["targets"]
+            for sound in target["sounds"]
+        ),
+    }
+    cache = _asset_cache()
+    cached = sum(1 for md5ext in assets if cache and (cache / md5ext).is_file())
+    label = f" ({cached} cached)" if cached else ""
+    print(f"downloading {len(assets)} asset(s){label}...", flush=True)
+    with ZipFile(outfile, "w") as archive:
+        archive.writestr("project.json", json.dumps(data))
+        with ThreadPoolExecutor(max_workers=_WORKERS) as pool:
+            pending = {pool.submit(_asset_bytes, md5ext): md5ext for md5ext in assets}
+            for done, future in enumerate(as_completed(pending), 1):
+                archive.writestr(pending[future], future.result())
+                if done % 25 == 0 or done == len(assets):
+                    print(f"  {done}/{len(assets)}", flush=True)
+'''
+
+
+# sb2gs maps the pen color-parameter dropdown as a block *field*, but it lives in
+# a menu input (`pen_menu_colorParam`), so `field="COLOR_PARAM"` never matches and
+# every `pen_setPenColorParamTo`/`...By` collapses to the default `*_hue` block
+# (brightness/saturation/transparency are lost). Flattening the menu first makes
+# the overload apply. Applied to the installed sb2gs in install_sb2gs.
+SB2GS_PEN_FIELD_OLD = 'field="COLOR_PARAM"'
+SB2GS_PEN_FIELD_NEW = 'menu="COLOR_PARAM", field="colorParam"'
+
+# sb2gs assumes every costume has rotationCenterX/Y, but newer saves omit them
+# (Scratch's VM then uses the rendered skin's centre). Dereferencing the missing
+# field raises AttributeError and the import fails, so treat a missing pivot as
+# centred (i.e. skip the rewrite). Applied to the installed sb2gs.
+SB2GS_CENTER_PATCHES = (
+    (
+        """    if (
+        float(root.attrib.get("width", "0")) / 2 == costume.rotationCenterX
+        and float(root.attrib.get("height", "0")) / 2 == costume.rotationCenterY
+    ):
+        return""",
+        """    rcx = costume._.get("rotationCenterX")
+    rcy = costume._.get("rotationCenterY")
+    if rcx is None or rcy is None:
+        return  # absent pivot means centred (newer saves omit it)
+    if (
+        abs(float(root.attrib.get("width", "0")) / 2 - rcx) < 0.5
+        and abs(float(root.attrib.get("height", "0")) / 2 - rcy) < 0.5
+    ):
+        return  # near-centred (rounding); VM centring is close enough""",
+    ),
+    (
+        """    if (
+        costume.rotationCenterX == img.width // 2
+        and costume.rotationCenterY == img.height // 2
+    ):
+        return""",
+        """    rcx = costume._.get("rotationCenterX")
+    rcy = costume._.get("rotationCenterY")
+    if rcx is None or rcy is None:
+        return  # absent pivot means centred (newer saves omit it)
+    if (
+        abs(rcx - img.width // 2) <= 1
+        and abs(rcy - img.height // 2) <= 1
+    ):
+        return  # near-centred (rounding); VM centring is close enough""",
+    ),
+)
+
+# sb2gs emits initial state as top-level sprite-init statements, but goboscript
+# only accepts x/y/size/direction/volume/rotation-style there. It ignores
+# `currentCostume` entirely, and for a draggable sprite it emits a nonexistent
+# `set_draggable;` (the real block is `set_drag_mode_draggable`). Emit both as
+# green-flag scripts instead. Applied to the installed sb2gs
+# (decompile_sprite.py).
+SB2GS_INITIAL_STATE_PATCHES = (
+    (
+        """        self.blocks: dict[str, Block] = target.blocks._
+        self.volume: float = target.volume""",
+        """        self.blocks: dict[str, Block] = target.blocks._
+        self.volume: float = target.volume
+        self.current_costume: int = target._.get("currentCostume", 0) or 0""",
+    ),
+    (
+        """    decompile_rotation_style(ctx)
+    if ctx.draggable:
+        ctx.iprintln("set_draggable;")""",
+        """    decompile_rotation_style(ctx)""",
+    ),
+    (
+        """def decompile_sprite(ctx: Ctx) -> None:
+    _ast.transform(ctx)
+    decompile_properties(ctx)
+    decompile_costumes(ctx)
+    decompile_sounds(ctx)
+    decompile_variables(ctx)
+    decompile_lists(ctx)
+    decompile_events(ctx)""",
+        """def decompile_initial_state(ctx: Ctx) -> None:
+    # Neither the saved current costume nor drag mode is a valid top-level
+    # sprite-init statement in goboscript, so run them on green flag.
+    if not ctx.is_stage and ctx.draggable:
+        ctx.iprintln("onflag {")
+        with ctx.indent():
+            ctx.iprintln("set_drag_mode_draggable;")
+        ctx.iprintln("}")
+    index = ctx.current_costume
+    if not ctx.is_stage and ctx.costumes and 0 < index < len(ctx.costumes):
+        ctx.iprintln("onflag {")
+        with ctx.indent():
+            ctx.iprintln("switch_costume ", syntax.string(ctx.costumes[index].name), ";")
+        ctx.iprintln("}")
+
+
+def decompile_sprite(ctx: Ctx) -> None:
+    _ast.transform(ctx)
+    decompile_properties(ctx)
+    decompile_costumes(ctx)
+    decompile_sounds(ctx)
+    decompile_variables(ctx)
+    decompile_lists(ctx)
+    decompile_initial_state(ctx)
+    decompile_events(ctx)""",
+    ),
+)
+
+# sb2gs ignores the project-level `monitors` array, so on-stage variable/list
+# readouts are lost. goboscript can toggle monitor visibility (`show`/`hide`, not
+# positions), so append a green-flag script per target. Applied to the installed
+# sb2gs (decompile.py).
+SB2GS_MONITOR_PATCHES = (
+    (
+        """from . import costumes
+""",
+        """from . import costumes, syntax
+""",
+    ),
+    (
+        """def decompile(input: Path, output: Path) -> None:
+    shutil.rmtree(output, ignore_errors=True)""",
+        """def monitor_script(project: JSONObject, target: JSONObject) -> str:
+    \"\"\"Restore the initial visibility of the target's variable/list monitors.
+
+    Scratch keeps monitor visibility in a project-level `monitors` array that
+    sb2gs ignores; goboscript can only toggle visibility (not positions), so run
+    it on green flag.
+    \"\"\"
+    owner = None if target.isStage else target.name
+    lines: list[str] = []
+    seen: set[str] = set()
+    for monitor in project._.get("monitors") or []:
+        if (monitor._.get("spriteName") or None) != owner:
+            continue
+        table = target.lists if monitor._.get("opcode") == "data_listcontents" else target.variables
+        for var_id, entry in table._.items():
+            if var_id != monitor._.get("id"):
+                continue
+            name = entry[0]
+            if name not in seen:
+                seen.add(name)
+                verb = "show" if monitor._.get("visible", True) else "hide"
+                lines.append(f"    {verb} {syntax.identifier(name)};")
+            break
+    if not lines:
+        return ""
+    return "onflag {\\n" + "\\n".join(lines) + "\\n}\\n"
+
+
+def decompile(input: Path, output: Path) -> None:
+    shutil.rmtree(output, ignore_errors=True)""",
+    ),
+    (
+        """    ctx = Ctx(stage, assets)
+    with output.joinpath("stage.gs").open("w") as file:
+        decompile_sprite(ctx)
+        file.write(str(ctx))""",
+        """    ctx = Ctx(stage, assets)
+    with output.joinpath("stage.gs").open("w") as file:
+        decompile_sprite(ctx)
+        file.write(str(ctx))
+        file.write(monitor_script(project, stage))""",
+    ),
+    (
+        """        with output.joinpath(f"{target.name}.gs").open("w") as file:
+            decompile_sprite(ctx)
+            file.write(str(ctx))""",
+        """        with output.joinpath(f"{target.name}.gs").open("w") as file:
+            decompile_sprite(ctx)
+            file.write(str(ctx))
+            file.write(monitor_script(project, target))""",
+    ),
+)
+
+# sb2gs has no decompiler for control_for_each and drops its body. The VM treats
+# it as a counted loop: it sets VARIABLE to the 1-based iteration index and runs
+# Number(VALUE) times, so lower it to `set var = 0; repeat VALUE { var += 1; body }`.
+# Applied to the installed sb2gs (decompile_stmt.py).
+SB2GS_FOREACH_PATCHES = (
+    (
+        """    decompile_stack(ctx, inputs.block_id(block.inputs._.get("SUBSTACK")))
+
+
+def decompile_procedures_call(ctx: Ctx, block: Block) -> None:""",
+        """    decompile_stack(ctx, inputs.block_id(block.inputs._.get("SUBSTACK")))
+
+
+def decompile_control_for_each(ctx: Ctx, block: Block) -> None:
+    variable = syntax.identifier(block.fields.VARIABLE[0])
+    ctx.iprintln(variable, " = 0;")
+    ctx.iprint("repeat ")
+    decompile_input(ctx, "VALUE", block)
+    ctx.print(" ")
+    body = inputs.block_id(block.inputs._.get("SUBSTACK"))
+    if body is None:
+        ctx.println("{}")
+        return
+    ctx.println("{")
+    with ctx.indent():
+        ctx.iprintln(variable, " += 1;")
+        child = body
+        while child:
+            decompile_stmt(ctx, ctx.blocks[child])
+            child = ctx.blocks[child].next
+    ctx.iprintln("}")
+
+
+def decompile_procedures_call(ctx: Ctx, block: Block) -> None:""",
+    ),
+)
+
+# goboscript rejects both `var x;` and `list x;` on one target, and sb2gs's
+# identifier cache maps two identical source names to a single identifier, so a
+# variable and list sharing a name collide. Rename the list (in its table and
+# every block field/input that references its id) before decompiling. Applied to
+# the installed sb2gs (decompile.py).
+SB2GS_CLASH_PATCHES = (
+    (
+        """        project = json.load(f, object_hook=JSONObject)
+        assets = get_asset_names(project, "costumes")""",
+        """        project = json.load(f, object_hook=JSONObject)
+        fix_name_clashes(project)
+        assets = get_asset_names(project, "costumes")""",
+    ),
+    (
+        """def decompile(input: Path, output: Path) -> None:
+    shutil.rmtree(output, ignore_errors=True)""",
+        """def fix_name_clashes(project: JSONObject) -> None:
+    \"\"\"Make variable/list names unique within each target.
+
+    goboscript rejects a duplicate `var x;` or `list x;`, and sb2gs's identifier
+    cache maps two identical source names to one identifier, so a variable and
+    list sharing a name (or two same-named variables/lists) collide. Keep the
+    first entry's name and rename the later ones, in their tables and every block
+    field/input that references their id.
+    \"\"\"
+    for target in project.targets:
+        entries = [("var", vid, entry) for vid, entry in target.variables._.items()]
+        entries += [("list", lid, entry) for lid, entry in target.lists._.items()]
+        used = {entry[0] for _, _, entry in entries}
+        seen: set[str] = set()
+        for kind, eid, entry in entries:
+            if entry[0] not in seen:
+                seen.add(entry[0])
+                continue
+            new_name = f"{entry[0]} {kind}"
+            while new_name in used:
+                new_name += " x"
+            used.add(new_name)
+            entry[0] = new_name
+            for block in target.blocks._.values():
+                fields = getattr(block, "fields", None)
+                if fields is not None:
+                    for field in fields._.values():
+                        if isinstance(field, list) and len(field) >= 2 and field[1] == eid:
+                            field[0] = new_name
+                inputs = getattr(block, "inputs", None)
+                if inputs is not None:
+                    for inp in inputs._.values():
+                        if isinstance(inp, list) and len(inp) >= 3 and inp[0] in (12, 13) and inp[2] == eid:
+                            inp[1] = new_name
+
+
+def decompile(input: Path, output: Path) -> None:
+    shutil.rmtree(output, ignore_errors=True)""",
+    ),
+)
+
+
+# goboscript emits no `monitors` array, so monitor positions and slider modes are
+# lost. sb2gs records each monitor (with the compiled variable/list name) in a
+# `monitors.json` sidecar; gobo-agent re-injects the array into the built sb3 (see
+# gsdev.inject_monitors). Applied to the installed sb2gs (decompile.py).
+SB2GS_MONITOR_SIDECAR_PATCHES = (
+    (
+        """    write_config(decompile_config(project), output)""",
+        """    write_monitors(project, output)
+    write_config(decompile_config(project), output)""",
+    ),
+    (
+        """def decompile(input: Path, output: Path) -> None:
+    shutil.rmtree(output, ignore_errors=True)""",
+        """def write_monitors(project: JSONObject, output: Path) -> None:
+    \"\"\"Record each monitor's settings with the compiled variable/list name.\"\"\"
+    targets = {None: next((t for t in project.targets if t.isStage), None)}
+    for target in project.targets:
+        if not target.isStage:
+            targets[target.name] = target
+    records = []
+    for monitor in project._.get("monitors") or []:
+        owner = monitor._.get("spriteName") or None
+        target = targets.get(owner)
+        if target is None:
+            continue
+        is_list = monitor._.get("opcode") == "data_listcontents"
+        table = (target.lists._ if is_list else target.variables._)
+        mid = monitor._.get("id")
+        name = next((entry[0] for vid, entry in table.items() if vid == mid), None)
+        if name is None:
+            continue
+        records.append({
+            "target": owner,
+            "kind": "list" if is_list else "variable",
+            "name": syntax.identifier(name),
+            "mode": monitor._.get("mode", "default"),
+            "x": monitor._.get("x", 0),
+            "y": monitor._.get("y", 0),
+            "visible": bool(monitor._.get("visible", False)),
+            "sliderMin": monitor._.get("sliderMin", 0),
+            "sliderMax": monitor._.get("sliderMax", 100),
+            "isDiscrete": monitor._.get("isDiscrete", True),
+        })
+    output.joinpath("monitors.json").write_text(
+        json.dumps(records, indent=2, ensure_ascii=False) + "\\n", encoding="utf-8"
+    )
+
+
+def decompile(input: Path, output: Path) -> None:
+    shutil.rmtree(output, ignore_errors=True)""",
+    ),
+)
+
+
+# Preserve costumes byte-for-byte (no lossy pivot rewrites) and record their
+# source rotationCenterX/Y/bitmapResolution in a `costumes.json` sidecar; gobo-agent
+# sets them on the compiled costumes at build time (gsdev.inject_costumes). Applied
+# to the installed sb2gs (costumes.py + decompile.py).
+SB2GS_CENTER_DISABLE_PATCHES = (
+    (
+        """def fix_center(costume: JSONObject, path: Path, fixed: set[str]) -> None:
+    if costume.md5ext in fixed:
+        return
+    fixed.add(costume.md5ext)
+    if costume.dataFormat == "svg":
+        fix_vector_center(costume, path)
+    else:
+        fix_bitmap_center(costume, path)""",
+        """def fix_center(costume: JSONObject, path: Path, fixed: set[str]) -> None:
+    # gobo-agent preserves costumes byte-for-byte and re-injects the source
+    # rotationCenterX/Y/bitmapResolution into the built sb3 (gsdev.inject_costumes),
+    # so the lossy 480x360 / re-canvas rewrites are disabled.
+    return""",
+    ),
+)
+
+SB2GS_COSTUME_SIDECAR_PATCHES = (
+    (
+        """    write_config(decompile_config(project), output)""",
+        """    write_costumes(project, output)
+    write_config(decompile_config(project), output)""",
+    ),
+    (
+        """def decompile(input: Path, output: Path) -> None:
+    shutil.rmtree(output, ignore_errors=True)""",
+        """def write_costumes(project: JSONObject, output: Path) -> None:
+    \"\"\"Record each costume's pivot/bitmapResolution (by target and order) so a
+    later build can set them on the compiled costumes.\"\"\"
+    records = []
+    for target in project.targets:
+        owner = None if target.isStage else target.name
+        for index, costume in enumerate(target.costumes):
+            records.append({
+                "target": owner,
+                "index": index,
+                "name": costume._.get("name"),
+                "rotationCenterX": costume._.get("rotationCenterX"),
+                "rotationCenterY": costume._.get("rotationCenterY"),
+                "bitmapResolution": costume._.get("bitmapResolution", 1),
+            })
+    output.joinpath("costumes.json").write_text(
+        json.dumps(records, indent=2, ensure_ascii=False) + "\\n", encoding="utf-8"
+    )
+
+
+def decompile(input: Path, output: Path) -> None:
+    shutil.rmtree(output, ignore_errors=True)""",
+    ),
+)
+
+
 def _unzip_into(data: bytes, destination: Path) -> None:
     import io
 
@@ -713,6 +1234,84 @@ def install_sb2gs(force: bool = False, offline: bool = False) -> None:
             written += 1
     if not written:
         raise SetupError("sb2gs source archive had no src/sb2gs files")
+    # Patched downloader: robust `sb2gs --id` for large projects (retry, timeout,
+    # concurrent asset downloads). See SB2GS_DOWNLOADER_PATCH.
+    (source / "sb2gs" / "sb3_downloader.py").write_text(
+        SB2GS_DOWNLOADER_PATCH, encoding="utf-8"
+    )
+    # Fix the pen color-parameter menu (see SB2GS_PEN_FIELD_*): without it,
+    # brightness/saturation/transparency collapse to set_pen_hue.
+    stmt = source / "sb2gs" / "decompile_stmt.py"
+    if stmt.is_file():
+        text = stmt.read_text(encoding="utf-8")
+        if text.count(SB2GS_PEN_FIELD_OLD) == 2:
+            stmt.write_text(
+                text.replace(SB2GS_PEN_FIELD_OLD, SB2GS_PEN_FIELD_NEW),
+                encoding="utf-8",
+            )
+    # Treat a missing costume pivot as centred (see SB2GS_CENTER_PATCHES): without
+    # it, newer saves that omit rotationCenterX/Y fail to import.
+    cos = source / "sb2gs" / "costumes.py"
+    if cos.is_file():
+        text = cos.read_text(encoding="utf-8")
+        for old, new in SB2GS_CENTER_PATCHES:
+            if old in text:
+                text = text.replace(old, new, 1)
+        cos.write_text(text, encoding="utf-8")
+    # Preserve the saved initial costume and drag mode (see
+    # SB2GS_INITIAL_STATE_PATCHES).
+    sprite = source / "sb2gs" / "decompile_sprite.py"
+    if sprite.is_file():
+        text = sprite.read_text(encoding="utf-8")
+        for old, new in SB2GS_INITIAL_STATE_PATCHES:
+            if old in text:
+                text = text.replace(old, new, 1)
+        sprite.write_text(text, encoding="utf-8")
+    # Restore monitor visibility (see SB2GS_MONITOR_PATCHES).
+    decomp = source / "sb2gs" / "decompile.py"
+    if decomp.is_file():
+        text = decomp.read_text(encoding="utf-8")
+        for old, new in SB2GS_MONITOR_PATCHES:
+            if old in text:
+                text = text.replace(old, new, 1)
+        decomp.write_text(text, encoding="utf-8")
+    # Add a control_for_each decompiler (see SB2GS_FOREACH_PATCHES).
+    stmts = source / "sb2gs" / "decompile_stmt.py"
+    if stmts.is_file():
+        text = stmts.read_text(encoding="utf-8")
+        for old, new in SB2GS_FOREACH_PATCHES:
+            if old in text:
+                text = text.replace(old, new, 1)
+        stmts.write_text(text, encoding="utf-8")
+    # Rename same-named variables/lists (see SB2GS_CLASH_PATCHES).
+    if decomp.is_file():
+        text = decomp.read_text(encoding="utf-8")
+        for old, new in SB2GS_CLASH_PATCHES:
+            if old in text:
+                text = text.replace(old, new, 1)
+        decomp.write_text(text, encoding="utf-8")
+    # Record monitors for post-build re-injection (see SB2GS_MONITOR_SIDECAR_PATCHES).
+    if decomp.is_file():
+        text = decomp.read_text(encoding="utf-8")
+        for old, new in SB2GS_MONITOR_SIDECAR_PATCHES:
+            if old in text:
+                text = text.replace(old, new, 1)
+        decomp.write_text(text, encoding="utf-8")
+    # Record costume pivots (see SB2GS_COSTUME_SIDECAR_PATCHES).
+    if decomp.is_file():
+        text = decomp.read_text(encoding="utf-8")
+        for old, new in SB2GS_COSTUME_SIDECAR_PATCHES:
+            if old in text:
+                text = text.replace(old, new, 1)
+        decomp.write_text(text, encoding="utf-8")
+    # Disable the lossy costume rewrites (see SB2GS_CENTER_DISABLE_PATCHES).
+    cos = source / "sb2gs" / "costumes.py"
+    if cos.is_file():
+        text = cos.read_text(encoding="utf-8")
+        for old, new in SB2GS_CENTER_DISABLE_PATCHES:
+            if old in text:
+                text = text.replace(old, new, 1)
+        cos.write_text(text, encoding="utf-8")
 
     site = sb2gs_site_dir()
     key: str | None = None
@@ -755,6 +1354,20 @@ def install_sb2gs(force: bool = False, offline: bool = False) -> None:
     _log(f"sb2gs -> {source}")
 
 
+def sb2gs_env() -> dict:
+    """Environment for the sb2gs process.
+
+    Puts the pinned goboscript on PATH so sb2gs's ``--verify`` (which shells out
+    to ``goboscript``) works without a system compiler.
+    """
+    env = dict(os.environ)
+    env["PATH"] = str(goboscript_dir()) + os.pathsep + env.get("PATH", "")
+    # sb2gs opens output files without an explicit encoding; UTF-8 mode keeps
+    # non-ASCII sprite/layer names working regardless of the OS locale.
+    env["PYTHONUTF8"] = "1"
+    return env
+
+
 def run_sb2gs(argv: list[str]) -> int:
     if not sb2gs_present():
         raise SetupError("sb2gs is not installed; run `gsdev setup` first")
@@ -763,7 +1376,24 @@ def run_sb2gs(argv: list[str]) -> int:
             f"sb2gs needs Python 3.14+ (found {platform.python_version()}); run gsdev "
             "with the portable Python or a 3.14+ interpreter"
         )
-    return subprocess.run([sys.executable, str(sb2gs_run_py()), *argv]).returncode
+    raw = os.environ.get("GSDEV_SB2GS_TIMEOUT", "1800")
+    try:
+        timeout = float(raw)
+    except ValueError:
+        raise SetupError(f"GSDEV_SB2GS_TIMEOUT={raw!r} is not a number")
+    try:
+        return subprocess.run(
+            [sys.executable, str(sb2gs_run_py()), *argv],
+            timeout=timeout, env=sb2gs_env(),
+        ).returncode
+    except subprocess.TimeoutExpired:
+        # Never hang (and strand a child): kill it and fail with guidance. The
+        # patched downloader already retries/times out per request; this is the
+        # overall guard.
+        raise SetupError(
+            f"sb2gs timed out after {int(timeout)}s (slow/stalled network?); "
+            "download the .sb3 in a browser and pass the local file instead"
+        )
 
 
 def _goboscript_version(binary) -> str:

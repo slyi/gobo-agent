@@ -56,13 +56,16 @@ mode, or `close` it first rather than starting a second browser.
 | Repeatable test from reloaded state | `test FILE --headless --json` |
 | Find expensive procedures, keep execution | `profile --no-reload --no-restart --seconds 2 --no-follow --leave-running`, then `setprofiling off` |
 | Capture a freshly loaded image | `screenshot --no-build` (skips compile but reloads/stops the project) |
+| Check Scratch size/memory fit | `preflight` — offline scan (no browser); `--sb3 FILE`, `--json`, `--strict` |
 | End project execution | `stop` — host stays available |
 | Finish an owned session | `close`, once work using it is done |
 
 `--no-build` is valid only when source is unchanged; it still reloads. `--no-reload`
-preserves loaded code/state. Live data edits never replace code. Cold starts are
-justified for initial setup, a deliberate browser-mode change, or a lifecycle test;
-otherwise use warm iteration. Keep independent hosts on explicit ports;
+preserves loaded code/state. `run`/`screenshot --sb3 PATH` load a given artifact
+instead of building (an imported or externally built `.sb3`). Live data edits never
+replace code. Cold starts are justified for initial setup, a deliberate browser-mode
+change, or a lifecycle test; otherwise use warm iteration. Keep independent hosts on
+explicit ports;
 `--port 0` remembers its choice. A warm host in the wrong headed/headless mode must be
 closed or moved; inspect conflicts, never kill unrelated listeners.
 
@@ -94,14 +97,19 @@ changes in release; only diagnostic code belongs in these macros.
 ```powershell
 tools\gsdev.ps1 run --headless --duration 2 --leave-running   # keep the host warm
 tools\gsdev.ps1 get main.tx main.ty
-tools\gsdev.ps1 set_batch main.tx=120 main.ty=0               # one evaluation
+tools\gsdev.ps1 set main.tx 120                               # poke one value
+tools\gsdev.ps1 set_batch main.tx=120 main.ty=0               # several, one evaluation
 tools\gsdev.ps1 screenshot --headless --out debug/check.png
 ```
 
-Prefer live variable edits for iteration: tune with `set`, read the next frame — no
-rebuild/reload/restart. Prefer `set_batch` when changing several related values so the
-VM cannot step between writes (it is not a rollback transaction if a write fails).
-`GSDEV_PROJECT=DIR` runs another project with the same host page.
+Poke live values instead of rebuilding: `set SELECTOR VALUE` writes one variable and
+`set_batch name=value …` writes several in a single VM evaluation (`set` is
+space-separated — `set main.tx 120`, not `set main.tx=120`). Both change data only, so
+tune and read the next frame (`get`, `screenshot`) with no rebuild/reload/restart.
+Prefer `set_batch` for related values so the VM cannot step between writes (it is not a
+rollback transaction if a write fails). Selectors use the **compiled** name, which
+goboscript may have normalised — see "Selectors" below. `GSDEV_PROJECT=DIR` runs another
+project with the same host page.
 
 ## Profiling: find hotspots before guessing
 
@@ -231,7 +239,11 @@ execution stays in the harness. It is not required by end users.
 ## Selectors, waits and input
 
 Selectors are `sprite.variable`, `sprite.list[index]` (1-based), a bare name (Stage
-global), or `sprite#N` clones (indices stable only within a frame). Discover names with
+global), or `sprite#N` clones (indices stable only within a frame). Names are the
+**compiled** goboscript identifiers, not the original Scratch names: goboscript
+lowercases them, strips leading/trailing `_`, maps whitespace/`.`/`-`/`:` to `_`, drops
+other symbols, and appends `_`/a number to dodge a keyword or collision — so
+`Render._stickman` becomes `Render.stickman`. Discover the real names with
 `inspect`/`props`/`clones`. A leading `@` selects a harness metric, not a project
 variable. Quote `@` selectors in PowerShell.
 
