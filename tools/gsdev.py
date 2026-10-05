@@ -1569,10 +1569,11 @@ def _memory_suggestions(report: dict, budgets: dict) -> list[str]:
     suggestions = []
     if memory['svgPx'] > 0:
         suggestions.append(
-            f"convert SVG costumes to bitmap (~{budgets['svgMemoryFactor']}x saving on those)")
+            'convert SVG costumes to bitmap (primary fix:'
+            f" ~{budgets['svgMemoryFactor']}x fewer pixels than SVG, no per-costume canvas)")
+    suggestions.append('pack frames into a spritesheet with fewer, smaller frames (keeps crisp SVG)')
     if memory['bitmapPx'] + memory['svgPx'] > 0:
         suggestions.append('downscale costumes/frames (memory scales with area)')
-    suggestions.append('reduce stored frames or pack into a spritesheet with fewer, smaller frames')
     if report['sounds']['decodedBytes'] > 0:
         suggestions.append('shorten or drop large sounds (decoded to whole-file PCM in memory)')
     suggestions.append('remove unused costumes and sounds')

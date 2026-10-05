@@ -435,9 +435,10 @@ JSON):
   list-monitor entries); remove redundant shadow blocks; shorten large list
   literals/long strings; remove unused blocks, variables and lists; move big data
   into assets.
-- `memory-over-budget` — convert SVG costumes to bitmap; downscale costumes/frames;
-  reduce stored frames or pack into a spritesheet with fewer, smaller frames;
-  shorten or drop large sounds; remove unused costumes and sounds.
+- `memory-over-budget` — **convert SVG costumes to bitmap** (primary fix for an
+  SVG-heavy project); pack frames into a spritesheet with fewer, smaller frames
+  (keeps crisp SVG); downscale costumes/frames; shorten or drop large sounds;
+  remove unused costumes and sounds.
 - `asset-over-budget` — compress or downscale the asset below 10 MiB; split a long
   sound into shorter pieces.
 
@@ -454,6 +455,12 @@ is why bitmap-heavy projects (e.g. 1056403018, 503 AVIFs) pass.
 and every finding.
 
 ## SVG spritesheets for mobile memory
+
+**Converting SVG costumes to bitmap is the primary fix** for an SVG-heavy project
+(it removes the per-costume SVG canvas and the 4× pixel cost — see the preflight
+suggestions). Spritesheets are the alternative when you want to keep the **crisp
+vector** look instead of a pixelated bitmap: packing many frames into one costume
+cuts the costume/texture count while preserving the SVG art.
 
 A project that plays many full-screen frames (video-like animation) crashes phones
 for **two independent reasons**, both measured on-device with
