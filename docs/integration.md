@@ -390,7 +390,6 @@ Without `--sb3` it builds the project first and scans the build output.
 | `memoryBudget` | 512 MiB | worst-case decoded memory (mobile-safe) |
 | `svgMemoryFactor` | 4 | SVG needs **4× the pixels** of its nominal size (before ×4 bytes) |
 | `svgMaxWidth` / `svgMaxHeight` | 2400 / 1800 | per-SVG dimension ceiling (Android) |
-| `svgCostumeLimit` | 128 | warn above this many SVG costumes (phones cap the per-costume canvases/textures) |
 
 Override any key with `GSDEV_PREFLIGHT_<KEY>` (e.g.
 `GSDEV_PREFLIGHT_MEMORY_BUDGET=2147483648`) or `gobo-agent.json`
@@ -426,12 +425,11 @@ so the default `memoryBudget` is set for mobile, not desktop.
 **Errors:** `json-over-budget`, `memory-over-budget`, `asset-over-budget`,
 `list-over-capacity`, `invalid-archive`, `duplicate-zip-entries`,
 `missing-project-json`, `scan-incomplete`.
-**Warnings:** `json-near-budget` (>=90%), `svg-costumes-over-limit`,
-`list-at-capacity`, `svg-over-dimension` (>2400×1800), `unresolved-assets`,
-`sounds-decoded-large`.
+**Warnings:** `json-near-budget` (>=90%), `list-at-capacity`, `svg-over-dimension`
+(>2400×1800), `unresolved-assets`, `sounds-decoded-large`.
 
-Error findings — and the `svg-costumes-over-limit` warning — carry
-`detail.suggestions` (printed under the finding, and in the JSON):
+Error findings carry `detail.suggestions` (printed under the finding, and in the
+JSON):
 
 - `json-over-budget` — clean up lists (drop duplicate/unused list data and
   list-monitor entries); remove redundant shadow blocks; shorten large list
@@ -442,27 +440,14 @@ Error findings — and the `svg-costumes-over-limit` warning — carry
   shorten or drop large sounds; remove unused costumes and sounds.
 - `asset-over-budget` — compress or downscale the asset below 10 MiB; split a long
   sound into shorter pieces.
-- `svg-costumes-over-limit` — pack frames into spritesheets (fewer, larger
-  costumes); convert SVG costumes to bitmap (no per-costume canvas); remove unused
-  costumes/frames.
 
-**Why SVG has *two* limits (not just bytes):** phones pay per SVG costume, but raw
-and base64-wrapped costumes fail for different reasons (all measured on 957967074
-and synthetic projects):
-
-- **raw SVG** → rasterised-*pixel* ceiling (~10M px): 50 × 480×360 survives,
-  100 × 480×360 crashes at ~55; 1000 × 4×4 raw SVGs are smooth.
-- **base64 `<image>`** → per-*costume* ceiling (~30–90), independent of size: 156
-  costumes at 480×360 (116 MB) *and* at 48×36 (15 MB) both crash; the same frames
-  packed into 34 (2×3) or 10 (5×5) costumes are smooth.
-
-So the actionable finding is "fewer, packed SVG costumes" (spritesheets). The
-`svgCostumeLimit` check (default 128) is a **warning**, not an error, because it is
-only a coarse guard: raw-SVG projects are caught by the pixel
-(`memory-over-budget`) side, base64 projects just under 128 can still be near the
-phone's real limit, and a project with many *tiny* SVGs (e.g. 1000 × 4×4) is fine
-despite the count. Bitmaps don't add a per-costume canvas, which is why bitmap-heavy
-projects (e.g. 1056403018, 503 AVIFs) pass.
+**Why SVG crashes on mobile:** the driver is the **rasterised SVG pixels**, which the
+memory model already tracks (`svgPx × svgMemoryFactor × 4`). Measured on-device,
+working projects sit ≤ ~0.33 GiB (e.g. 1382435697: **284** SVG costumes but only
+7.4M px → 0.11 GiB), while crashers sit ≥ ~0.97 GiB (945139239 at 65M px;
+957967074 at 70M px). A costume *count* is therefore not a useful signal — 284 small
+SVGs are fine, 156 large ones are not. Bitmaps don't add a per-costume canvas, which
+is why bitmap-heavy projects (e.g. 1056403018, 503 AVIFs) pass.
 
 `--json` also carries `assets` (count/bytes/over/largest), `memory` (`svgPx`,
 `bitmapPx`, `overDimension`, `largest`), `lists`, `sounds`, `coverage`, `sha256`

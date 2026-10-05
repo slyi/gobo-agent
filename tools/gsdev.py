@@ -1561,7 +1561,6 @@ _PREFLIGHT_DEFAULTS = {
     "svgMemoryFactor": 4,               # SVG needs 4x the pixels (then *4 bytes)
     "svgMaxWidth": 2400,
     "svgMaxHeight": 1800,
-    "svgCostumeLimit": 128,             # phones render one canvas/texture per SVG costume
 }
 
 
@@ -1741,7 +1740,7 @@ def preflight_scan(sb3_path: Path) -> dict:
         'assets': {'count': 0, 'totalBytes': 0, 'over': [], 'largest': []},
         'lists': {'max': 0, 'over': [], 'atLimit': []},
         'memory': {
-            'bitmapPx': 0, 'svgPx': 0, 'svgCostumes': 0, 'svgUnresolved': 0,
+            'bitmapPx': 0, 'svgPx': 0, 'svgUnresolved': 0,
             'svgMemoryFactor': budgets['svgMemoryFactor'], 'effectivePx': 0,
             'bytes': 0, 'budget': budgets['memoryBudget'], 'percent': 0.0,
             'overDimension': [], 'largest': [],
@@ -1825,7 +1824,6 @@ def preflight_scan(sb3_path: Path) -> dict:
                     pixels = int(round(pixels))
                     if is_svg:
                         report['memory']['svgPx'] += pixels
-                        report['memory']['svgCostumes'] += 1
                         if width > budgets['svgMaxWidth'] or height > budgets['svgMaxHeight']:
                             report['memory']['overDimension'].append(
                                 {'sprite': target.get('name'), 'costume': costume.get('name'),
@@ -1907,18 +1905,6 @@ def preflight_scan(sb3_path: Path) -> dict:
                                 f"{len(memory['overDimension'])} SVG(s) exceed "
                                 f"{budgets['svgMaxWidth']}x{budgets['svgMaxHeight']}",
                                 memory['overDimension'][:10]))
-        if memory['svgCostumes'] > budgets['svgCostumeLimit']:
-            findings.append(_pf('warning', 'svg-costumes-over-limit',
-                                f"{memory['svgCostumes']} SVG costumes exceed "
-                                f"{budgets['svgCostumeLimit']} (phones render one canvas/texture "
-                                'per SVG costume and can crash)', {
-                                    'svgCostumes': memory['svgCostumes'],
-                                    'limit': budgets['svgCostumeLimit'],
-                                    'suggestions': [
-                                        'pack frames into spritesheets (fewer, larger costumes)',
-                                        'convert SVG costumes to bitmap (no per-costume canvas)',
-                                        'remove unused costumes/frames',
-                                    ]}))
         if report['coverage']['unresolved']:
             findings.append(_pf('warning', 'unresolved-assets',
                                 f"{report['coverage']['unresolved']} asset(s) had no measurable "
