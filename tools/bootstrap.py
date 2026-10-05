@@ -1178,6 +1178,149 @@ def decompile(input: Path, output: Path) -> None:
 )
 
 
+# `syntax.scratch_number` (patch[0]) mirrors Scratch's arithmetic coercion
+# (non-numeric -> 0) and is used by the constant-switch fold below. Patch[1] emits
+# the coerced number for the *arithmetic operators* whose operands Scratch coerces
+# (so `1 / ""` -> `1 / 0`, and `"last" + ""` -> `0 + 0`, which goboscript otherwise
+# rejects as string arithmetic). It is guarded to those operators only: sb2gs also
+# packs menu values and list specials ("last"/"random"/"any") into MATH_NUM inputs,
+# and coercing *those* would blank `key_pressed("w")`, `start_sound "x"`,
+# `distance_to(...)` and `x_list["last"]` to 0 and corrupt the project.
+SB2GS_NUMBER_PATCHES = (
+    (
+        """def value(text: float | str) -> str:
+    if isinstance(text, (int, float)):
+        return number(text)
+    if is_goboscript_literal(text):
+        return text
+    return string(text)""",
+        """def value(text: float | str) -> str:
+    if isinstance(text, (int, float)):
+        return number(text)
+    if is_goboscript_literal(text):
+        return text
+    return string(text)
+
+
+def scratch_number(text: float | str) -> float:
+    # Scratch coerces arithmetic inputs to numbers (non-numeric -> 0).
+    if isinstance(text, (int, float)):
+        return text
+    try:
+        parsed = float(text)
+    except (TypeError, ValueError):
+        return 0
+    return int(parsed) if parsed.is_integer() else parsed""",
+    ),
+    (
+        """    if input_type in {InputType.VAR, InputType.LIST}:
+        ctx.print(syntax.identifier(input_value))
+        return
+    ctx.print(syntax.value(input_value))""",
+        """    if input_type in {InputType.VAR, InputType.LIST}:
+        ctx.print(syntax.identifier(input_value))
+        return
+    if input_type in {InputType.MATH_NUM, InputType.POSITIVE_NUM, InputType.WHOLE_NUM,
+                      InputType.INTEGER_NUM, InputType.ANGLE_NUM} and block.opcode in {
+            "operator_add", "operator_subtract", "operator_multiply",
+            "operator_divide", "operator_mod", "operator_round", "operator_mathop",
+            "operator_random",
+    }:
+        # Scratch coerces arithmetic operands (non-numeric -> 0) and goboscript
+        # rejects string arithmetic. Only these operators are coerced, so menu
+        # values and list specials packed into MATH_NUM inputs stay strings.
+        ctx.print(syntax.number(syntax.scratch_number(input_value)))
+        return
+    ctx.print(syntax.value(input_value))""",
+    ),
+)
+
+# goboscript's switch_costume/switch_backdrop accept a costume/backdrop *name* only
+# (there is no index or relative form). When a project switches by a constant number
+# (e.g. `("last" + "")` -> 0 -> last costume), fold it to the name. Applied to the
+# installed sb2gs (decompile_stmt.py).
+SB2GS_SWITCH_FOLD_PATCHES = (
+    (
+        """from . import _ast, custom_blocks, inputs, syntax""",
+        """import math
+
+from . import _ast, custom_blocks, inputs, syntax""",
+    ),
+    (
+        """def decompile_block(ctx: Ctx, block: Block) -> None:
+    signature = deepcopy(BLOCKS[block.opcode])""",
+        """_ARITH_OPS = {
+    "operator_add": lambda a, b: a + b,
+    "operator_subtract": lambda a, b: a - b,
+    "operator_multiply": lambda a, b: a * b,
+    "operator_divide": lambda a, b: (a / b) if b else 0,
+    "operator_mod": lambda a, b: (a % b) if b else 0,
+}
+
+
+def _fold_input_number(ctx: Ctx, block: Block, name: str):
+    raw = block.inputs._.get(name)
+    if not isinstance(raw, list) or len(raw) < 2:
+        return None
+    value = raw[1]
+    if isinstance(value, str) and value in ctx.blocks:
+        return _fold_block_number(ctx, ctx.blocks[value])
+    if isinstance(value, list) and value and value[0] in (4, 5, 6, 7, 8):
+        return syntax.scratch_number(value[1])
+    return None
+
+
+def _fold_block_number(ctx: Ctx, block: Block):
+    if block.opcode == "operator_round":
+        inner = _fold_input_number(ctx, block, "NUM")
+        return round(inner) if inner is not None else None
+    function = _ARITH_OPS.get(block.opcode)
+    if function is None:
+        return None
+    left = _fold_input_number(ctx, block, "NUM1")
+    right = _fold_input_number(ctx, block, "NUM2")
+    if left is None or right is None:
+        return None
+    return function(left, right)
+
+
+def _indexed_name(costumes, index):
+    if not costumes:
+        return None
+    total = len(costumes)
+    position = math.floor(index)
+    if position < 1:
+        position += total
+    if 1 <= position <= total:
+        return costumes[position - 1].name
+    return None
+
+
+def _decompile_constant_switch(ctx: Ctx, block: Block) -> bool:
+    if block.opcode == "looks_switchcostumeto":
+        keyword, input_name = "switch_costume", "COSTUME"
+    elif block.opcode == "looks_switchbackdropto":
+        keyword, input_name = "switch_backdrop", "BACKDROP"
+    else:
+        return False
+    index = _fold_input_number(ctx, block, input_name)
+    if index is None:
+        return False
+    name = _indexed_name(getattr(ctx, "costumes", None), index)
+    if name is None:
+        return False
+    ctx.iprintln(keyword, " ", syntax.string(name), ";")
+    return True
+
+
+def decompile_block(ctx: Ctx, block: Block) -> None:
+    if _decompile_constant_switch(ctx, block):
+        return
+    signature = deepcopy(BLOCKS[block.opcode])""",
+    ),
+)
+
+
 def _unzip_into(data: bytes, destination: Path) -> None:
     import io
 
@@ -1312,6 +1455,24 @@ def install_sb2gs(force: bool = False, offline: bool = False) -> None:
             if old in text:
                 text = text.replace(old, new, 1)
         cos.write_text(text, encoding="utf-8")
+    # Coerce arithmetic operands and fold constant costume/backdrop switches (see
+    # SB2GS_NUMBER_PATCHES / SB2GS_SWITCH_FOLD_PATCHES).
+    for filename, patches in (("decompile_input.py", SB2GS_NUMBER_PATCHES),
+                              ("decompile_stmt.py", SB2GS_SWITCH_FOLD_PATCHES)):
+        target = source / "sb2gs" / filename
+        if target.is_file():
+            text = target.read_text(encoding="utf-8")
+            for old, new in patches:
+                if old in text:
+                    text = text.replace(old, new, 1)
+            target.write_text(text, encoding="utf-8")
+    syn = source / "sb2gs" / "syntax.py"
+    if syn.is_file():
+        text = syn.read_text(encoding="utf-8")
+        for old, new in SB2GS_NUMBER_PATCHES[:1]:
+            if old in text:
+                text = text.replace(old, new, 1)
+        syn.write_text(text, encoding="utf-8")
 
     site = sb2gs_site_dir()
     key: str | None = None

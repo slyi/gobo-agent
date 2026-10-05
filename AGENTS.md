@@ -264,6 +264,12 @@ Prefer the `gsdev:frame`/`gsdev:render` events over repeated CDP polling. Pixel 
 must account for sprite visibility, costume silhouettes and renderer alignment: pen
 widths 1 and 3 have a half-pixel rule, and canvas-edge clicks may lie outside the stage.
 
+Variable/list **monitors** (the on-stage readouts) are drawn by the scratch-gui layer,
+not the local canvas-only host, so they never appear in `screenshot`. This does not
+block agentic work: read the same values live with `get`/`inspect`/`record`. Monitors
+only matter to a human viewing real Scratch, where they do render (also on the
+gsbridge `editor`/`github` targets).
+
 ## Live-site checks
 
 ```powershell

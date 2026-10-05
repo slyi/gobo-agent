@@ -1089,8 +1089,13 @@ def browser_flags(browser: str, port: int, profile) -> list[str]:
     Both launchers must use the same settings or their runs are not comparable
     (perf numbers, dialog suppression, GPU/occlusion behavior). Callers append
     their own extras and the target URL.
+
+    ``GSDEV_MAX_OLD_SPACE_MB`` caps the V8 heap (``--js-flags=--max-old-space-size``)
+    to emulate a low-memory device; ``GSDEV_DPR`` sets ``--force-device-scale-factor``
+    (2-3 for HiDPI phones). Like the other flags they take effect at launch, so
+    ``close`` a warm host before changing them.
     """
-    return [
+    flags = [
         browser, f"--remote-debugging-port={port}", f"--user-data-dir={profile}",
         "--no-first-run", "--no-default-browser-check",
         "--disable-background-timer-throttling", "--disable-renderer-backgrounding",
@@ -1116,6 +1121,24 @@ def browser_flags(browser: str, port: int, profile) -> list[str]:
         # does not disable all Finch experiments in branded Chrome/Edge.
         "--disable-field-trial-config",
     ]
+    mem_mb = os.environ.get("GSDEV_MAX_OLD_SPACE_MB", "").strip()
+    if mem_mb:
+        try:
+            flags.append(f"--js-flags=--max-old-space-size={int(float(mem_mb))}")
+        except ValueError:
+            pass
+    dpr = os.environ.get("GSDEV_DPR", "").strip()
+    if dpr:
+        try:
+            flags.append(f"--force-device-scale-factor={float(dpr):g}")
+        except ValueError:
+            pass
+    if os.environ.get("GSDEV_LOW_END", "").strip().lower() not in ("", "0", "false"):
+        flags.append("--enable-low-end-device-mode")
+    extra = os.environ.get("GSDEV_BROWSER_ARGS", "").strip()
+    if extra:
+        flags.extend(extra.split())
+    return flags
 
 
 def _assert_host_identity(conn: CDP, port: int) -> None:
@@ -1533,10 +1556,12 @@ _PREFLIGHT_DEFAULTS = {
     "jsonBudget": 5 * 1024 * 1024,      # Scratch's "5 MB" = 5 MiB
     "assetBudget": 10 * 1024 * 1024,    # Scratch's "10 MB" = 10 MiB
     "listLimit": 200_000,
-    "memoryBudget": 2 * 1024 ** 3,      # observed ~2 GiB browser ceiling (empirical)
-    "svgMemoryFactor": 2,               # SVG pays texture + per-skin canvas (~2x bitmap)
+    "memoryBudget": 512 * 1024 ** 2,    # mobile-safe ceiling: iOS/Android OOM well below
+                                        # the ~2 GiB desktop browser limit (raise for desktop)
+    "svgMemoryFactor": 4,               # SVG needs 4x the pixels (then *4 bytes)
     "svgMaxWidth": 2400,
     "svgMaxHeight": 1800,
+    "svgCostumeLimit": 128,             # phones render one canvas/texture per SVG costume
 }
 
 
@@ -1553,6 +1578,10 @@ def _memory_suggestions(report: dict, budgets: dict) -> list[str]:
         suggestions.append('shorten or drop large sounds (decoded to whole-file PCM in memory)')
     suggestions.append('remove unused costumes and sounds')
     return suggestions
+
+
+def _budget_text(budget: int) -> str:
+    return f"{budget / 2 ** 20:.0f} MiB" if budget < 2 ** 30 else f"{budget / 2 ** 30:g} GiB"
 
 
 def preflight_budgets() -> dict:
@@ -1606,6 +1635,63 @@ def _gif_dims(data: bytes):
     return struct.unpack("<HH", data[6:10])
 
 
+def _webp_dims(data: bytes):
+    if data[:4] != b"RIFF" or data[8:12] != b"WEBP" or len(data) < 30:
+        return None
+    fourcc = data[12:16]
+    if fourcc == b"VP8X":
+        return (1 + int.from_bytes(data[24:27], "little"),
+                1 + int.from_bytes(data[27:30], "little"))
+    if fourcc == b"VP8 ":
+        if data[23:26] != b"\x9d\x01\x2a":
+            return None
+        return (int.from_bytes(data[26:28], "little") & 0x3FFF,
+                int.from_bytes(data[28:30], "little") & 0x3FFF)
+    if fourcc == b"VP8L":
+        if data[20] != 0x2F:
+            return None
+        bits = int.from_bytes(data[21:25], "little")
+        return ((bits & 0x3FFF) + 1, ((bits >> 14) & 0x3FFF) + 1)
+    return None
+
+
+def _avif_dims(data: bytes):
+    # AVIF/HEIF are ISO-BMFF: only brand-marked files (not an SVG that happens to
+    # contain the bytes "ispe"), then read the ImageSpatialExtents ('ispe') box.
+    if len(data) < 12 or data[4:8] != b"ftyp":
+        return None
+    brand = data[8:12]
+    if brand not in (b"avif", b"avis") and b"avif" not in data[8:32] and b"mif1" not in data[8:32]:
+        return None
+    idx = data.find(b"ispe")
+    while idx != -1:
+        if idx + 16 <= len(data):
+            width, height = struct.unpack(">II", data[idx + 8:idx + 16])
+            if 0 < width < 100_000 and 0 < height < 100_000:
+                return (width, height)
+        idx = data.find(b"ispe", idx + 4)
+    return None
+
+
+def _image_dims(data: bytes, fmt):
+    """(kind, dims) by magic bytes, so AVIF-in-a-`.png` etc. is measured correctly."""
+    if data[:8] == b"\x89PNG\r\n\x1a\n":
+        return "png", _png_dims(data)
+    if data[:2] == b"\xff\xd8":
+        return "jpg", _jpeg_dims(data)
+    if data[:3] == b"GIF":
+        return "gif", _gif_dims(data)
+    if data[:2] == b"BM":
+        return "bmp", _bmp_dims(data)
+    if data[:4] == b"RIFF" and data[8:12] == b"WEBP":
+        return "webp", _webp_dims(data)
+    if data[4:8] == b"ftyp":
+        return "avif", _avif_dims(data)
+    if fmt == "svg" or data.lstrip()[:1] == b"<":
+        return "svg", _svg_dims(data)
+    return (fmt or "?"), None
+
+
 def _svg_dims(data: bytes) -> dict:
     head = data[:4000]
     if b"<!DOCTYPE" in head or b"<!ENTITY" in head:
@@ -1655,7 +1741,7 @@ def preflight_scan(sb3_path: Path) -> dict:
         'assets': {'count': 0, 'totalBytes': 0, 'over': [], 'largest': []},
         'lists': {'max': 0, 'over': [], 'atLimit': []},
         'memory': {
-            'bitmapPx': 0, 'svgPx': 0, 'svgUnresolved': 0,
+            'bitmapPx': 0, 'svgPx': 0, 'svgCostumes': 0, 'svgUnresolved': 0,
             'svgMemoryFactor': budgets['svgMemoryFactor'], 'effectivePx': 0,
             'bytes': 0, 'budget': budgets['memoryBudget'], 'percent': 0.0,
             'overDimension': [], 'largest': [],
@@ -1711,18 +1797,8 @@ def preflight_scan(sb3_path: Path) -> dict:
                         except KeyError:
                             info['unresolved'] = True
                         else:
-                            if fmt == 'png':
-                                dims = _png_dims(blob)
-                            elif fmt in ('jpg', 'jpeg'):
-                                dims = _jpeg_dims(blob)
-                            elif fmt == 'bmp':
-                                dims = _bmp_dims(blob)
-                            elif fmt == 'gif':
-                                dims = _gif_dims(blob)
-                            elif fmt == 'svg':
-                                dims = _svg_dims(blob)
-                            else:
-                                dims = None
+                            kind, dims = _image_dims(blob, fmt)
+                            info['kind'] = kind
                             if isinstance(dims, dict):
                                 if dims.get('status') == 'unresolved':
                                     info['unresolved'] = True
@@ -1735,13 +1811,21 @@ def preflight_scan(sb3_path: Path) -> dict:
                         cache[md5ext] = info
                     if info['unresolved'] or not info['dims']:
                         report['coverage']['unresolved'] += 1
-                        if info['kind'] == 'svg':
+                        if fmt == 'svg':
                             report['memory']['svgUnresolved'] += 1
                         continue
                     width, height = info['dims']
-                    pixels = int(round(width * height))
-                    if info['kind'] == 'svg':
+                    is_svg = info['kind'] == 'svg'
+                    pixels = width * height
+                    if not is_svg:
+                        # Scratch's texture is the stored bitmap at
+                        # bitmapResolution (2x saves -> quarter the pixels).
+                        res = costume.get('bitmapResolution', 1) or 1
+                        pixels = pixels / (res * res)
+                    pixels = int(round(pixels))
+                    if is_svg:
                         report['memory']['svgPx'] += pixels
+                        report['memory']['svgCostumes'] += 1
                         if width > budgets['svgMaxWidth'] or height > budgets['svgMaxHeight']:
                             report['memory']['overDimension'].append(
                                 {'sprite': target.get('name'), 'costume': costume.get('name'),
@@ -1812,8 +1896,8 @@ def preflight_scan(sb3_path: Path) -> dict:
         memory['percent'] = round(memory['bytes'] / budgets['memoryBudget'] * 100, 1) if budgets['memoryBudget'] else 0.0
         if memory['bytes'] > budgets['memoryBudget']:
             findings.append(_pf('error', 'memory-over-budget',
-                f"estimated memory ~{memory['bytes'] / 2 ** 30:.2f} GiB "
-                f"({memory['percent']}% of {budgets['memoryBudget'] / 2 ** 30:.0f} GiB)",
+                f"worst-case memory (all costumes loaded) ~{memory['bytes'] / 2 ** 30:.2f} GiB "
+                f"({memory['percent']}% of {_budget_text(budgets['memoryBudget'])})",
                 {'bitmapPx': memory['bitmapPx'], 'svgPx': int(memory['svgPx']),
                  'svgFactor': budgets['svgMemoryFactor'],
                  'soundPcmBytes': report['sounds']['decodedBytes'],
@@ -1823,6 +1907,18 @@ def preflight_scan(sb3_path: Path) -> dict:
                                 f"{len(memory['overDimension'])} SVG(s) exceed "
                                 f"{budgets['svgMaxWidth']}x{budgets['svgMaxHeight']}",
                                 memory['overDimension'][:10]))
+        if memory['svgCostumes'] > budgets['svgCostumeLimit']:
+            findings.append(_pf('warning', 'svg-costumes-over-limit',
+                                f"{memory['svgCostumes']} SVG costumes exceed "
+                                f"{budgets['svgCostumeLimit']} (phones render one canvas/texture "
+                                'per SVG costume and can crash)', {
+                                    'svgCostumes': memory['svgCostumes'],
+                                    'limit': budgets['svgCostumeLimit'],
+                                    'suggestions': [
+                                        'pack frames into spritesheets (fewer, larger costumes)',
+                                        'convert SVG costumes to bitmap (no per-costume canvas)',
+                                        'remove unused costumes/frames',
+                                    ]}))
         if report['coverage']['unresolved']:
             findings.append(_pf('warning', 'unresolved-assets',
                                 f"{report['coverage']['unresolved']} asset(s) had no measurable "
@@ -1842,7 +1938,7 @@ def print_preflight(report: dict) -> None:
           f" ({j.get('percent', 0.0)}%)" + ('  OVER' if j['over'] else ''))
     print(f"assets: {a['count']} unique, {a['totalBytes']:,} bytes total, "
           f"{len(a['over'])} over {report['budgets']['assetBudget']:,}")
-    print(f"memory: ~{m['bytes'] / 2 ** 30:.2f} GiB ({m['percent']}% of {m['budget'] / 2 ** 30:.0f} GiB)"
+    print(f"memory (worst case): ~{m['bytes'] / 2 ** 30:.2f} GiB ({m['percent']}% of {_budget_text(m['budget'])})"
           f"  = (bitmap {m['bitmapPx']:,} px + svg {int(m['svgPx']):,} px x{m['svgMemoryFactor']}) x4"
           f" + {report['sounds']['decodedBytes']:,} B sound PCM")
     print(f"svg unresolved: {m['svgUnresolved']}")
@@ -4568,10 +4664,12 @@ def _run_sb2gs(argv: list[str]) -> int:
 
     if code != 0:
         _clean_sb2gs_failure(input_path, output_path, input_existed, output_existed, verify=verify)
-    else:
-        project_id = _sb2gs_project_id(argv)
-        if project_id and output_path is not None and output_path.is_dir():
-            _write_provenance(project_id, output_path)
+    # Provenance tracks the source project, independent of whether the generated
+    # code compiles, so write it whenever the decompile produced output - even if
+    # --verify failed.
+    project_id = _sb2gs_project_id(argv)
+    if project_id and output_path is not None and output_path.is_dir():
+        _write_provenance(project_id, output_path)
     return code
 
 

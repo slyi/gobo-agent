@@ -331,7 +331,26 @@ and compare (e.g. `gsdev run` + `screenshot`) rather than assuming equivalence.
   `Render: stickman` slider return. Labels show the compiled identifier (`camz`,
   not `@camZ`), since that is the runtime name. A per-target
   `onflag { show/hide }` script is still emitted as a visibility fallback for a
-  build made without the injection.
+  build made without the injection. Note the monitors are **not** visible in
+  `gsdev` screenshots: the local host renders only the `scratch-render` canvas,
+  and Scratch draws variable/list monitors in the GUI layer. They *do* render on
+  full scratch-gui — verified live on the `gsbridge` `editor` and `github`
+  targets (`fps`/`drawcount`/`frame`) and in the Scratch editor. The conversion
+  preserves them regardless.
+- **Numeric inputs and constant costume/backdrop switches** — goboscript rejects
+  string arithmetic, and its `switch_costume`/`switch_backdrop` accept a *name*
+  only, while Scratch coerces arithmetic operands (non-numeric → 0) and allows a
+  numeric costume index (0 or ≤0 → last). The patch installs a
+  `syntax.scratch_number` helper, coerces the operands of the arithmetic operators
+  (`operator_add`/`subtract`/`multiply`/`divide`/`mod`/`round`/`mathop`/`random`,
+  so `1 / ""` → `1 / 0`), and folds a *constant* switch index to the
+  costume/backdrop name (`"last" + ""` → last costume). It is **not** applied to
+  other numeric-typed inputs: sb2gs packs menu values and list specials
+  (`"last"`/`"random"`/`"any"`) into `MATH_NUM` inputs, so coercing those would
+  blank `key_pressed("w")`, `start_sound "x"`, `distance_to(...)` and
+  `x_list["last"]` to `0` (1193224850 rendered correctly only with that
+  restriction). Verified: 941195677 builds and runs, 1193224850 renders. A
+  runtime-computed switch index still cannot be reproduced.
 
 **gobo-agent mitigations:** for large or known-problematic projects, download the
 `.sb3` in a browser and pass the local file (`gsdev sb2gs <file.sb3>`);
@@ -345,10 +364,156 @@ and the profiler are identical to the repo's own workflow — see the
 path: `gobo-agent/runtime/tools/gsdev.*` instead of `tools/gsdev.*`.
 
 `preflight` checks the built artifact (or `--sb3 FILE`) offline against Scratch's
-project.json/asset/list limits and the mobile **memory** budget — no browser needed;
-`--json` for a machine report, `--strict` to exit non-zero on warnings too. It
-reports exact numbers (e.g. the binary 5 MiB project.json budget) rather than
-"5 MB", and flags unmeasured assets so a pass can't hide them.
+project.json/asset/list limits and the mobile **memory** budget — no browser needed.
+See the **Preflight** section below for the budget model, findings and suggestions.
+
+## Preflight (memory + size budgets)
+
+`preflight` scans a built `.sb3` **offline** (no browser) against Scratch's hard
+limits and a mobile memory budget. Default output is a short report; `--json`
+writes the full machine-readable report to stdout. It exits non-zero when an
+**error** finding is present, and, with `--strict`, when a **warning** is present.
+
+```powershell
+<gobo>\tools\gsdev.ps1 preflight [--sb3 FILE] [--json] [--strict]
+```
+
+Without `--sb3` it builds the project first and scans the build output.
+
+### Budgets (defaults; all overridable)
+
+| key | default | meaning |
+| --- | --- | --- |
+| `jsonBudget` | 5 MiB = 5,242,880 | Scratch's `project.json` ceiling (binary MB) |
+| `assetBudget` | 10 MiB = 10,485,760 | per-asset ceiling |
+| `listLimit` | 200,000 | Scratch's per-list item cap |
+| `memoryBudget` | 512 MiB | worst-case decoded memory (mobile-safe) |
+| `svgMemoryFactor` | 4 | SVG needs **4× the pixels** of its nominal size (before ×4 bytes) |
+| `svgMaxWidth` / `svgMaxHeight` | 2400 / 1800 | per-SVG dimension ceiling (Android) |
+| `svgCostumeLimit` | 128 | warn above this many SVG costumes (phones cap the per-costume canvases/textures) |
+
+Override any key with `GSDEV_PREFLIGHT_<KEY>` (e.g.
+`GSDEV_PREFLIGHT_MEMORY_BUDGET=2147483648`) or `gobo-agent.json`
+`preflight<Key>` (e.g. `"preflightMemoryBudget": 2147483648`,
+`"preflightListLimit": 300000`). Raise `memoryBudget` for desktop; lower it for a
+specific phone class.
+
+### Memory model (worst case)
+
+The estimate is deliberately **worst case = every costume loaded**, because the VM
+creates a texture per costume and never unloads it:
+
+```text
+bytes = (bitmapPx + svgMemoryFactor * svgPx) * 4 + soundDecodedBytes
+```
+
+- Dimensions come from the **asset bytes by magic number** (PNG/JPEG/GIF/BMP/WebP/
+  AVIF/SVG), not the file extension, so AVIF stored as `.png` and base64-wrapped SVG
+  are still measured. `svgPx`/`bitmapPx` sum every costume's `width*height`.
+- Bitmap pixels are divided by `bitmapResolution²` (SC3 stores 2× bitmaps; the
+  texture is the logical size). SVG uses `svgMemoryFactor` — **4**, because an SVG
+  costume needs 4× the pixels of its nominal size (then ×4 bytes for RGBA).
+- `soundDecodedBytes` decodes each sound to whole-file PCM from its real header.
+- Assets that can't be measured are counted as **unresolved** and reported under
+  `measurement gaps`, so a pass can't hide them.
+
+Peak ~= that total plus the browser's own footprint. On a phone the tab dies when
+the sum exceeds the device's budget; on desktop it may pass and still OOM on mobile,
+so the default `memoryBudget` is set for mobile, not desktop.
+
+### Findings
+
+**Errors:** `json-over-budget`, `memory-over-budget`, `asset-over-budget`,
+`list-over-capacity`, `invalid-archive`, `duplicate-zip-entries`,
+`missing-project-json`, `scan-incomplete`.
+**Warnings:** `json-near-budget` (>=90%), `svg-costumes-over-limit`,
+`list-at-capacity`, `svg-over-dimension` (>2400×1800), `unresolved-assets`,
+`sounds-decoded-large`.
+
+Error findings — and the `svg-costumes-over-limit` warning — carry
+`detail.suggestions` (printed under the finding, and in the JSON):
+
+- `json-over-budget` — clean up lists (drop duplicate/unused list data and
+  list-monitor entries); remove redundant shadow blocks; shorten large list
+  literals/long strings; remove unused blocks, variables and lists; move big data
+  into assets.
+- `memory-over-budget` — convert SVG costumes to bitmap; downscale costumes/frames;
+  reduce stored frames or pack into a spritesheet with fewer, smaller frames;
+  shorten or drop large sounds; remove unused costumes and sounds.
+- `asset-over-budget` — compress or downscale the asset below 10 MiB; split a long
+  sound into shorter pieces.
+- `svg-costumes-over-limit` — pack frames into spritesheets (fewer, larger
+  costumes); convert SVG costumes to bitmap (no per-costume canvas); remove unused
+  costumes/frames.
+
+**Why SVG has *two* limits (not just bytes):** phones pay per SVG costume, but raw
+and base64-wrapped costumes fail for different reasons (all measured on 957967074
+and synthetic projects):
+
+- **raw SVG** → rasterised-*pixel* ceiling (~10M px): 50 × 480×360 survives,
+  100 × 480×360 crashes at ~55; 1000 × 4×4 raw SVGs are smooth.
+- **base64 `<image>`** → per-*costume* ceiling (~30–90), independent of size: 156
+  costumes at 480×360 (116 MB) *and* at 48×36 (15 MB) both crash; the same frames
+  packed into 34 (2×3) or 10 (5×5) costumes are smooth.
+
+So the actionable finding is "fewer, packed SVG costumes" (spritesheets). The
+`svgCostumeLimit` check (default 128) is a **warning**, not an error, because it is
+only a coarse guard: raw-SVG projects are caught by the pixel
+(`memory-over-budget`) side, base64 projects just under 128 can still be near the
+phone's real limit, and a project with many *tiny* SVGs (e.g. 1000 × 4×4) is fine
+despite the count. Bitmaps don't add a per-costume canvas, which is why bitmap-heavy
+projects (e.g. 1056403018, 503 AVIFs) pass.
+
+`--json` also carries `assets` (count/bytes/over/largest), `memory` (`svgPx`,
+`bitmapPx`, `overDimension`, `largest`), `lists`, `sounds`, `coverage`, `sha256`
+and every finding.
+
+## SVG spritesheets for mobile memory
+
+A project that plays many full-screen frames (video-like animation) crashes phones
+for **two independent reasons**, both measured on-device with
+[957967074](https://scratch.mit.edu/projects/957967074):
+
+- **Raw SVG costumes hit a rasterised-pixel ceiling** (~10M px): 50 × 480×360
+  survives (stutters), 100 × 480×360 crashes at ~55, while **1000 × 4×4 raw SVGs
+  are smooth** — so for raw SVG it is the rasterised size, not the count.
+- **base64 `<image>` costumes hit a per-costume ceiling** (~30–90) regardless of
+  size: 156 costumes at 480×360 (116 MB) *and* at 48×36 (15 MB) both stutter then
+  "Aw, Snap!".
+
+The fix is therefore **fewer, packed costumes** — spritesheets. Verified: 156
+frames → **10 costumes** (5×5 sheets) runs perfectly on Android, where the same
+frames as 156 individual costumes crashed.
+
+Per sprite:
+
+1. **Crop each frame around its rotation centre.** What a sprite shows is the
+   480×360 stage window centred on the costume's `rotationCenterX/Y` — *not* the
+   canvas centre and *not* a `slice` crop (the subject is intentionally clipped,
+   e.g. the bird's legs/tail). Crop each source SVG to
+   `viewBox="(rcx-240) (rcy-180) 480 360"`.
+2. **Pack 5×5 cells** (25 frames) per sheet, with a **small viewBox** and the sprite
+   scaled up: sheet `viewBox="0 0 240 180"` (cells 48×36), each an
+   `<image width="48" height="36" href="data:image/svg+xml;base64,…">` of the
+   cropped frame, and **`set_size 1000;`**. Scratch rasterises an SVG at the
+   drawable's size, so the sheet is sharp at 2400×1800 (the Android cap) while its
+   stored texture stays 240×180. The `<image>`/base64 wrapper is what makes the
+   browser rasterise each cell at the display resolution — a plain small vector is
+   rasterised *tiny* and upscaled, so it looks blurry; the small viewBox keeps the
+   texture cheap. (A baked `960×1080` sheet at 100% is the CPU-cheap fallback.)
+3. **Inject the pivot.** goboscript has no rotation-centre syntax and derives the
+   pivot from the SVG content, which is wrong for a sheet. After `build`, set each
+   sheet costume's `rotationCenterX/Y` to the sheet canvas centre — `120,90` for
+   `240×180`, `48,54` for `96×108` — the same idea as sb2gs's `costumes.json` /
+   `inject_costumes`. Then place cell `c` (0..24) with
+   `x = 960 - 480 * (c mod 5)`, `y = 360 * floor(c / 5) - 720`.
+4. **Keep the scripts.** Convert from the **sb2gs GoboScript** and rewrite only the
+   costume switches: `switch_costume "costumeN"` →
+   `frame = N; update_frame;`, `next_costume` → `frame += 1; update_frame;`, and
+   `costume_number()` → `frame`, with
+   `proc update_frame { switch_costume framecostume[frame]; goto framex[frame], framey[frame]; }`.
+   Backdrop switches, `broadcast`/`on "…"` hats, waits and effects are untouched, so
+   a broadcast-sequenced animation runs in the same order as the original.
 
 ## VS Code
 
