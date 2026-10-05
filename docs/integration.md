@@ -475,7 +475,9 @@ for **two independent reasons**, both measured on-device with
 
 The fix is therefore **fewer, packed costumes** — spritesheets. Verified: 156
 frames → **10 costumes** (5×5 sheets) runs perfectly on Android, where the same
-frames as 156 individual costumes crashed.
+frames as 156 individual costumes crashed. The working build is published as
+[scratch.mit.edu/projects/1388281452](https://scratch.mit.edu/projects/1388281452)
+(the 480×360 form below; preflight 5,291,429 px → 0.10 GiB).
 
 Per sprite:
 
@@ -484,19 +486,20 @@ Per sprite:
    canvas centre and *not* a `slice` crop (the subject is intentionally clipped,
    e.g. the bird's legs/tail). Crop each source SVG to
    `viewBox="(rcx-240) (rcy-180) 480 360"`.
-2. **Pack 5×5 cells** (25 frames) per sheet, with a **small viewBox** and the sprite
-   scaled up: sheet `viewBox="0 0 240 180"` (cells 48×36), each an
-   `<image width="48" height="36" href="data:image/svg+xml;base64,…">` of the
-   cropped frame, and **`set_size 1000;`**. Scratch rasterises an SVG at the
-   drawable's size, so the sheet is sharp at 2400×1800 (the Android cap) while its
-   stored texture stays 240×180. The `<image>`/base64 wrapper is what makes the
-   browser rasterise each cell at the display resolution — a plain small vector is
-   rasterised *tiny* and upscaled, so it looks blurry; the small viewBox keeps the
-   texture cheap. (A baked `960×1080` sheet at 100% is the CPU-cheap fallback.)
+2. **Pack 5×5 cells** (25 frames) per sheet: sheet `viewBox="0 0 480 360"`
+   (cells 96×72), each an `<image width="96" height="72"
+   href="data:image/svg+xml;base64,…">` of the cropped frame, and
+   **`set_size 500;`**. Scratch rasterises an SVG at the drawable's size, so the
+   sheet is sharp at 2400×1800 (the Android cap). The `<image>`/base64 wrapper is
+   what makes the browser rasterise each cell at the display resolution — a plain
+   small vector is rasterised *tiny* and upscaled, so it looks blurry. A 480×360
+   sheet (cells 96×72, `set_size 500`) is a touch sharper than the 240×180 form
+   (cells 48×36, `set_size 1000`) for about +1.3M px; both are sharp, so either
+   works. (A baked `2400×1800` sheet at 100% is the CPU-cheap fallback.)
 3. **Inject the pivot.** goboscript has no rotation-centre syntax and derives the
    pivot from the SVG content, which is wrong for a sheet. After `build`, set each
-   sheet costume's `rotationCenterX/Y` to the sheet canvas centre — `120,90` for
-   `240×180`, `48,54` for `96×108` — the same idea as sb2gs's `costumes.json` /
+   sheet costume's `rotationCenterX/Y` to the sheet canvas centre — `240,180` for
+   `480×360`, `120,90` for `240×180` — the same idea as sb2gs's `costumes.json` /
    `inject_costumes`. Then place cell `c` (0..24) with
    `x = 960 - 480 * (c mod 5)`, `y = 360 * floor(c / 5) - 720`.
 4. **Keep the scripts.** Convert from the **sb2gs GoboScript** and rewrite only the
