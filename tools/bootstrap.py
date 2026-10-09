@@ -1235,6 +1235,44 @@ def scratch_number(text: float | str) -> float:
     ),
 )
 
+# goboscript has no Infinity/NaN literal, so sb2gs's json.dumps emits the bare
+# words "Infinity"/"NaN" (Python's json accepts them) and is_goboscript_literal
+# then treats them as literals, which goboscript rejects as an unknown variable.
+# Emit a runtime expression instead (Scratch's `/` yields Infinity/NaN), and route
+# numeric literals through number() so a numeric input holding "Infinity"/"NaN"/
+# "-Infinity" (a common `set size to (Infinity)` hack) is handled too. Both are
+# parenthesised so they are safe inside a larger expression. Applied to the
+# installed sb2gs (syntax.py), after SB2GS_NUMBER_PATCHES[:1].
+SB2GS_NONFINITE_PATCHES = (
+    (
+        """def number(value: float) -> str:
+    return json.dumps(value)""",
+        """def number(value: float) -> str:
+    if isinstance(value, float):
+        if value != value:
+            return "(0 / 0)"
+        if value == float("inf"):
+            return "(1 / 0)"
+        if value == float("-inf"):
+            return "(-1 / 0)"
+    return json.dumps(value)""",
+    ),
+    (
+        """def value(text: float | str) -> str:
+    if isinstance(text, (int, float)):
+        return number(text)
+    if is_goboscript_literal(text):
+        return text
+    return string(text)""",
+        """def value(text: float | str) -> str:
+    if isinstance(text, (int, float)):
+        return number(text)
+    if is_goboscript_literal(text):
+        return number(json.loads(text))
+    return string(text)""",
+    ),
+)
+
 # goboscript's switch_costume/switch_backdrop accept a costume/backdrop *name* only
 # (there is no index or relative form). When a project switches by a constant number
 # (e.g. `("last" + "")` -> 0 -> last costume), fold it to the name. Applied to the
@@ -1469,7 +1507,7 @@ def install_sb2gs(force: bool = False, offline: bool = False) -> None:
     syn = source / "sb2gs" / "syntax.py"
     if syn.is_file():
         text = syn.read_text(encoding="utf-8")
-        for old, new in SB2GS_NUMBER_PATCHES[:1]:
+        for old, new in SB2GS_NUMBER_PATCHES[:1] + SB2GS_NONFINITE_PATCHES:
             if old in text:
                 text = text.replace(old, new, 1)
         syn.write_text(text, encoding="utf-8")

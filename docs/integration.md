@@ -351,6 +351,15 @@ and compare (e.g. `gsdev run` + `screenshot`) rather than assuming equivalence.
   `x_list["last"]` to `0` (1193224850 rendered correctly only with that
   restriction). Verified: 941195677 builds and runs, 1193224850 renders. A
   runtime-computed switch index still cannot be reproduced.
+- **Non-finite numbers (`Infinity`/`NaN`)** — Python's `json.dumps` emits a
+  non-finite float as the bare words `Infinity`/`NaN`, which `is_goboscript_literal`
+  then treats as a literal — but goboscript has no such literal, so the build fails
+  on an unknown identifier (a common source is the `set size to (Infinity)` hack).
+  The patch makes `syntax.number` emit the runtime expression Scratch's `/`
+  produces (`(1 / 0)` / `(-1 / 0)` / `(0 / 0)`) and routes numeric literals through
+  it, so a numeric input holding `"Infinity"`/`"-Infinity"`/`"NaN"` is handled too.
+  Checked at the helper: `number(float("inf"))` → `(1 / 0)`, `value("Infinity")` →
+  `(1 / 0)`, finite numbers unchanged.
 
 **gobo-agent mitigations:** for large or known-problematic projects, download the
 `.sb3` in a browser and pass the local file (`gsdev sb2gs <file.sb3>`);
