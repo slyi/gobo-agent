@@ -850,10 +850,10 @@ SB2GS_CENTER_PATCHES = (
 
 # sb2gs emits initial state as top-level sprite-init statements, but goboscript
 # only accepts x/y/size/direction/volume/rotation-style there. It ignores
-# `currentCostume` entirely, and for a draggable sprite it emits a nonexistent
-# `set_draggable;` (the real block is `set_drag_mode_draggable`). Emit both as
-# green-flag scripts instead. Applied to the installed sb2gs
-# (decompile_sprite.py).
+# `currentCostume` entirely (so a sprite or the stage starts on the wrong costume /
+# backdrop), and for a draggable sprite it emits a nonexistent `set_draggable;`
+# (the real block is `set_drag_mode_draggable`). Emit both as green-flag scripts
+# instead. Applied to the installed sb2gs (decompile_sprite.py).
 SB2GS_INITIAL_STATE_PATCHES = (
     (
         """        self.blocks: dict[str, Block] = target.blocks._
@@ -886,10 +886,11 @@ SB2GS_INITIAL_STATE_PATCHES = (
             ctx.iprintln("set_drag_mode_draggable;")
         ctx.iprintln("}")
     index = ctx.current_costume
-    if not ctx.is_stage and ctx.costumes and 0 < index < len(ctx.costumes):
+    if ctx.costumes and 0 < index < len(ctx.costumes):
+        verb = "switch_backdrop" if ctx.is_stage else "switch_costume"
         ctx.iprintln("onflag {")
         with ctx.indent():
-            ctx.iprintln("switch_costume ", syntax.string(ctx.costumes[index].name), ";")
+            ctx.iprintln(verb, " ", syntax.string(ctx.costumes[index].name), ";")
         ctx.iprintln("}")
 
 
@@ -1063,6 +1064,250 @@ SB2GS_CLASH_PATCHES = (
 
 def decompile(input: Path, output: Path) -> None:
     shutil.rmtree(output, ignore_errors=True)""",
+    ),
+)
+
+
+# A declared name is not always the name sb2gs emits: `syntax.identifier` lowercases
+# and strips variables/lists ("3" -> "_3", "色" -> "_N") and `fix_name_clashes`
+# renames duplicates. Blocks that reference a name by *string* (sensing_of's
+# property, target menus, the broadcast hat and its messages) kept the original
+# text, so a renamed variable read as "" (a costume switch stuck on one costume in
+# the Blink Remix) and a renamed broadcast never matched its hat. Resolve every such
+# reference through the names the declarations actually use, matching
+# case-insensitively so a merely re-cased reference still lands. Applied to the
+# installed sb2gs (decompile_expr.py, decompile.py, decompile_input.py,
+# decompile_events.py).
+SB2GS_NAMES_EXPR_PATCHES = (
+    (
+        """def decompile_sensing_of(ctx: Ctx, block: Block) -> None:
+    from .decompile_input import decompile_input
+
+    decompile_input(ctx, "OBJECT", block)
+    ctx.print(".", syntax.string(block.fields.PROPERTY[0]))""",
+        """VARIABLE_MAP: dict[str, dict[str, str]] = {}
+SPRITE_NAMES: set[str] = set()
+BROADCAST_NAMES: set[str] = set()
+ALL_NAMES: set[str] = set()
+SPRITE_CANON: dict[str, str] = {}
+BROADCAST_CANON: dict[str, str] = {}
+
+
+def _raw(value):
+    return value._ if hasattr(value, "_") else value
+
+
+def _broadcast_names(project) -> list[str]:
+    # A broadcast is defined by its hat and referenced by its messages, and
+    # goboscript stores its id as the name string, so both spellings have to agree.
+    # The hat's spelling is canonical, then the messages, then the project table.
+    hats: list[str] = []
+    messages: list[str] = []
+    for target in project.targets:
+        for block in target.blocks._.values():
+            opcode = block._.get("opcode")
+            fields = _raw(block._.get("fields")) or {}
+            inputs = _raw(block._.get("inputs")) or {}
+            if opcode == "event_whenbroadcastreceived":
+                option = fields.get("BROADCAST_OPTION")
+                if isinstance(option, list) and option and isinstance(option[0], str):
+                    hats.append(option[0])
+            elif opcode in ("event_broadcast", "event_broadcastandwait"):
+                broadcast = inputs.get("BROADCAST_INPUT")
+                if (isinstance(broadcast, list) and len(broadcast) > 1
+                        and isinstance(broadcast[1], list) and len(broadcast[1]) > 1
+                        and isinstance(broadcast[1][1], str)):
+                    messages.append(broadcast[1][1])
+    table = _raw(project._.get("broadcasts"))
+    listed: list[str] = []
+    if isinstance(table, dict):
+        listed = [v for v in table.values() if isinstance(v, str)]
+    elif isinstance(table, list):
+        listed = [v for v in table if isinstance(v, str)]
+    return hats + messages + listed
+
+
+def register_names(project) -> None:
+    # A name reference has to resolve the way the *reference site* sees it: a
+    # global `i` on the Stage and a local `_i` that normalizes to `i` are different
+    # variables, and a broadcast is project-wide. Collect that before any target is
+    # decompiled.
+    for target in project.targets:
+        table: dict[str, str] = {}
+        for entry in target.variables._.values():
+            table[entry[0]] = syntax.identifier(entry[0])
+        for entry in target.lists._.values():
+            table[entry[0]] = syntax.identifier(entry[0])
+        VARIABLE_MAP["_stage_" if target.isStage else target.name] = table
+        ALL_NAMES.update(table)
+        if not target.isStage:
+            SPRITE_NAMES.add(target.name)
+    for name in _broadcast_names(project):
+        # The hat's spelling wins the case-insensitive fallback; only canonical
+        # names are "known", so a message that differs in case still resolves.
+        BROADCAST_CANON.setdefault(name.lower(), name)
+        BROADCAST_NAMES.add(BROADCAST_CANON[name.lower()])
+    for name in SPRITE_NAMES:
+        SPRITE_CANON.setdefault(name.lower(), name)
+
+
+def canonical_broadcast(name: str) -> str:
+    if name in BROADCAST_NAMES:
+        return name
+    return BROADCAST_CANON.get(name.lower(), name)
+
+
+def canonical_sprite(name: str) -> str:
+    if name in SPRITE_NAMES:
+        return name
+    return SPRITE_CANON.get(name.lower(), name)
+
+
+def sensing_object(ctx: Ctx, block: Block) -> str:
+    menu = inputs.block(ctx, block, "OBJECT")
+    if menu is not None:
+        value = menu.fields._.get("OBJECT")
+        if isinstance(value, list) and value:
+            return value[0]
+    return "_stage_"
+
+
+def decompile_sensing_of(ctx: Ctx, block: Block) -> None:
+    from .decompile_input import decompile_input
+
+    name = block.fields.PROPERTY[0]
+    # PROPERTY names a built-in property ("x position", "costume #", ...) or one of
+    # the target named in the OBJECT menu; the latter are declared under a
+    # normalized identifier, so resolve against that target or the reporter reads a
+    # variable that does not exist and returns "".
+    table = VARIABLE_MAP.get(sensing_object(ctx, block))
+    if table and name in table:
+        name = table[name]
+    elif name in ALL_NAMES:
+        name = syntax.identifier(name)
+    decompile_input(ctx, "OBJECT", block)
+    ctx.print(".", syntax.string(name))""",
+    ),
+    (
+        """def decompile_menu(ctx: Ctx, block: Block) -> None:
+    input_name, is_input = MENUS[block.opcode]
+    data = block.inputs if is_input else block.fields
+    ctx.print(syntax.string(data._[input_name][0]))""",
+        """def decompile_menu(ctx: Ctx, block: Block) -> None:
+    input_name, is_input = MENUS[block.opcode]
+    data = block.inputs if is_input else block.fields
+    value = data._[input_name][0]
+    if block.opcode == "sensing_of_object_menu":
+        value = canonical_sprite(value)
+    ctx.print(syntax.string(value))""",
+    ),
+)
+
+SB2GS_NAMES_DECOMPILE_PATCHES = (
+    (
+        """        fix_name_clashes(project)
+        assets = get_asset_names(project, "costumes")""",
+        """        fix_name_clashes(project)
+        from .decompile_expr import register_names
+        register_names(project)
+        assets = get_asset_names(project, "costumes")""",
+    ),
+)
+
+# A broadcast message arrives as a BROADCAST primitive input, so resolve it here.
+SB2GS_NAMES_INPUT_PATCHES = (
+    (
+        """    ctx.print(syntax.value(input_value))""",
+        """    if input_type == InputType.BROADCAST:
+        from .decompile_expr import canonical_broadcast
+
+        input_value = canonical_broadcast(str(input_value))
+    ctx.print(syntax.value(input_value))""",
+    ),
+)
+
+# The broadcast hat resolves its name the same way, `when stage clicked` is
+# polyfilled onto `onclick`, and a procedure keeps its original Scratch label as a
+# comment: goboscript has no stage-clicked hat, but scratch-vm starts
+# `event_whenthisspriteclicked` hats on the Stage for a stage click (verified in the
+# scratch-gui player) so `onclick` in stage.gs reproduces it rather than dropping the
+# script; and a procedure's identifier *is* its compiled label (`go to x: %s ...` ->
+# `go_to_x_y_dir_xorigin_yorigin`), so the original text only survives in a comment.
+SB2GS_EVENTS_PATCHES = (
+    (
+        """def decompile_procedures_definition(ctx: Ctx, block: Block) -> None:
+    custom = ctx.blocks[unwrap(inputs.block_id(block.inputs.custom_block))]
+    args = json.loads(custom.mutation.argumentnames)
+    logger.debug("custom block %s", custom)
+    if custom.mutation.warp == "false":""",
+        """def decompile_procedures_definition(ctx: Ctx, block: Block) -> None:
+    custom = ctx.blocks[unwrap(inputs.block_id(block.inputs.custom_block))]
+    args = json.loads(custom.mutation.argumentnames)
+    logger.debug("custom block %s", custom)
+    # goboscript has no display label for a procedure, so the compiled block is
+    # named after the identifier emitted below. Only explain the name when the
+    # mangling actually hid something — dropped punctuation or case, as in
+    # `go to x: %s y: %s …` -> `go_to_x_y_dir_xorigin_yorigin`; a label that is just
+    # words (`DrawQuad %s …` -> `drawquad`) needs no note. The comment is a `//` line,
+    # which the gobo-agent build moves inside the body so the proc explains itself.
+    label = custom_blocks.get_name(custom)
+    identifier = syntax.identifier(label)
+    words = "".join(ch if ch.isalnum() or ch == "_" else " " for ch in label)
+    readable = "_".join(words.split()).strip("_").lower()
+    if identifier != readable or any(not (ch.isalnum() or ch in "_ \t") for ch in label):
+        ctx.iprintln("// ", custom.mutation.proccode)
+    if custom.mutation.warp == "false":""",
+    ),
+    (
+        """def decompile_event_whenbroadcastreceived(ctx: Ctx, block: Block) -> None:
+    ctx.iprint("on ", syntax.string(block.fields.BROADCAST_OPTION[0]), " ")
+    decompile_stack(ctx, block.next)""",
+        """def decompile_event_whenbroadcastreceived(ctx: Ctx, block: Block) -> None:
+    from .decompile_expr import canonical_broadcast
+
+    name = canonical_broadcast(block.fields.BROADCAST_OPTION[0])
+    ctx.iprint("on ", syntax.string(name), " ")
+    decompile_stack(ctx, block.next)""",
+    ),
+    (
+        """def decompile_event_whenthisspriteclicked(ctx: Ctx, block: Block) -> None:
+    ctx.iprint("onclick ")
+    decompile_stack(ctx, block.next)""",
+        """def decompile_event_whenthisspriteclicked(ctx: Ctx, block: Block) -> None:
+    ctx.iprint("onclick ")
+    decompile_stack(ctx, block.next)
+
+
+def decompile_event_whenstageclicked(ctx: Ctx, block: Block) -> None:
+    ctx.iprint("onclick ")
+    decompile_stack(ctx, block.next)""",
+    ),
+)
+
+
+# Scratch allows two custom blocks to share a label when they differ in arity
+# ("scan2" next to "scan2 %s"); goboscript has no overloading, so both decompile to
+# `proc scan2` and the build fails with "procedure 'scan2' is already defined".
+# Give every distinct proccode its own name, in a cache shared by the definitions
+# and the calls. Applied to the installed sb2gs (custom_blocks.py).
+SB2GS_CUSTOM_BLOCK_PATCHES = (
+    (
+        """def get_name(block: Block) -> str:
+    return PROCCODE_ARG_RE.sub("", block.mutation.proccode).strip()""",
+        """_name_cache: dict[str, str] = {}
+
+
+def get_name(block: Block) -> str:
+    proccode = block.mutation.proccode
+    if proccode not in _name_cache:
+        base = PROCCODE_ARG_RE.sub("", proccode).strip()
+        name = base
+        i = 2
+        while name in _name_cache.values():
+            name = f"{base}_{i}"
+            i += 1
+        _name_cache[proccode] = name
+    return _name_cache[proccode]""",
     ),
 )
 
@@ -1471,6 +1716,30 @@ def install_sb2gs(force: bool = False, offline: bool = False) -> None:
             if old in text:
                 text = text.replace(old, new, 1)
         decomp.write_text(text, encoding="utf-8")
+    # Resolve string name references to the emitted names, and polyfill the
+    # stage-clicked hat (see the SB2GS_NAMES_* / SB2GS_EVENTS_PATCHES groups).
+    for groups, module in (
+        (SB2GS_NAMES_EXPR_PATCHES, "decompile_expr.py"),
+        (SB2GS_NAMES_DECOMPILE_PATCHES, "decompile.py"),
+        (SB2GS_NAMES_INPUT_PATCHES, "decompile_input.py"),
+        (SB2GS_EVENTS_PATCHES, "decompile_events.py"),
+    ):
+        path = source / "sb2gs" / module
+        if not path.is_file():
+            continue
+        text = path.read_text(encoding="utf-8")
+        for old, new in groups:
+            if old in text:
+                text = text.replace(old, new, 1)
+        path.write_text(text, encoding="utf-8")
+    # Disambiguate same-labelled custom blocks (see SB2GS_CUSTOM_BLOCK_PATCHES).
+    custom = source / "sb2gs" / "custom_blocks.py"
+    if custom.is_file():
+        text = custom.read_text(encoding="utf-8")
+        for old, new in SB2GS_CUSTOM_BLOCK_PATCHES:
+            if old in text:
+                text = text.replace(old, new, 1)
+        custom.write_text(text, encoding="utf-8")
     # Record monitors for post-build re-injection (see SB2GS_MONITOR_SIDECAR_PATCHES).
     if decomp.is_file():
         text = decomp.read_text(encoding="utf-8")

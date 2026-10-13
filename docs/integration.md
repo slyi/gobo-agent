@@ -360,6 +360,51 @@ and compare (e.g. `gsdev run` + `screenshot`) rather than assuming equivalence.
   it, so a numeric input holding `"Infinity"`/`"-Infinity"`/`"NaN"` is handled too.
   Checked at the helper: `number(float("inf"))` → `(1 / 0)`, `value("Infinity")` →
   `(1 / 0)`, finite numbers unchanged.
+- **Procedure names (block labels)** — goboscript has no display label for a custom
+  block: the proc *name* **is** the compiled block label, so a Scratch label has to
+  become an identifier, and it is mangled. `custom_blocks.get_name` first drops the
+  `%s`/`%b` placeholders, then `syntax.identifier` maps every run of `[\s.\-:]` to
+  `_`, removes anything outside `[A-Za-z0-9_]`, lowercases and strips outer
+  underscores; argument names mangle the same way. So
+  `go to x: %s y: %s dir: %s xOrigin: %s yOrigin: %s` becomes
+  `go_to_x_y_dir_xorigin_yorigin` (the colon belongs to the whitespace class, so each
+  `x:  ` run collapses to a single `_`), with arguments `x, y, dir, xo, yo`; that is
+  `Render.go_to_x_y_dir_xorigin_yorigin` as a selector (1110356115). The patch notes
+  the original label as a `//` comment above the definition, but only when the mangling
+  actually hid something — dropped punctuation, case or non-ASCII — as in
+  `// go to x: %s y: %s dir: %s xOrigin: %s yOrigin: %s` above
+  `proc go_to_x_y_dir_xorigin_yorigin x, y, dir, xo, yo {`; a label that is only words
+  (`DrawQuad %s …` → `drawquad`) gets no note, since it reads fine. The build moves the
+  note inside the body, so the compiled proc's first block is that `//` text and the
+  name explains itself (9 of 1110356115's 32 procs — the ones with punctuation — and it
+  builds and runs at 30 fps with 0 errors). It is **not idempotent**: the built
+  project's label is regenerated as `<name> x: %s y: …`, so re-importing the *built*
+  sb3 yields a longer name (`go_to_x_y_dir_xorigin_yorigin_x_y_dir_xo_yo`).
+- **Comments that must stay visible in the editor** — `#` comments are compile-time
+  only, so they never reach the Scratch editor, and a comment carrier cannot be
+  *named* `//` or `#`: goboscript needs an identifier, `#` starts a comment and `/` is
+  dropped. The **label** is free text though — the VM matches a call to its definition
+  by the proccode string and does not care (verified: labels restyled to `# …` and
+  `// …` load and run in scratch-gui at 30 fps, 0 errors). `build`/`run`/`screenshot`/
+  `test` therefore accept a line-leading `//` in a `.gs` as a comment that survives:
+  `rewrite_comments` turns it into a call to a stub proc for the duration of the
+  compile (restoring the sources byte-for-byte afterwards, like the mode include) and
+  `inject_comments` then strips that proc's definition — an undefined call is inert —
+  and relabels the calls to the free text `// %s`, so the editor shows `// note` and
+  nothing runs. Rules: a `//` inside a body (brace depth > 0, tracked ignoring braces
+  inside strings) stays where it is, whatever its indentation — including above a
+  `local` declaration; a flush-left `//` directly above a proc/hat moves *inside* that
+  body (so it follows the definition in the built project); any other top-level `//` —
+  above `costumes`, a `var`/`list` declaration, or the end of file — is ignored,
+  because there is no script for it to live in.
+  Verified: 1329541958 (280 comments, whose calls were already dangling in the source
+  and so made the build fail with `unrecognized procedure`) now builds — 280 `// %s`
+  blocks, 0 leftover carrier definitions, runs at 30 fps with 0 errors. Cost: only the
+  caller's own block dispatch, so keep comment calls out of hot loops; real sticky
+  notes (`target.comments`) would be the zero-cost form if that ever matters. This is a
+  gobo-agent build feature: `//` is not goboscript syntax, so a `.gs` containing it
+  builds only through `gsdev` — plain `goboscript build` and the upstream VS Code
+  extension flag it (the compiler itself is left alone).
 
 **gobo-agent mitigations:** for large or known-problematic projects, download the
 `.sb3` in a browser and pass the local file (`gsdev sb2gs <file.sb3>`);

@@ -2031,6 +2031,186 @@ def _sound_pcm_bytes(data: bytes, fmt: str, file_bytes: int):
     return None
 
 
+# A `// ...` line is not a goboscript comment (only `#` is) and `#` comments are
+# dropped at compile time, so neither can carry a comment into the compiled project.
+# A line-leading `//` is therefore rewritten for the duration of the build into a
+# call to a stub proc that carries its text, and the built sb3 then has that stub's
+# definition removed — an undefined call is inert — with every call relabelled to
+# free text the VM does not interpret. Net effect: the editor shows the comment and
+# the project pays nothing beyond the caller's own block dispatch. Building twice
+# from the same source is idempotent; the source itself is restored afterwards.
+_COMMENT_RE = re.compile(r"^([ \t]*)// ?(.*)$")
+_STRING_RE = re.compile(r'"(?:\\.|[^"\\])*"')
+
+
+def _brace_delta(line: str) -> int:
+    """Net ``{``/``}`` on a line, ignoring braces inside string literals."""
+    code = _STRING_RE.sub('""', line)
+    return code.count("{") - code.count("}")
+_COMMENT_PROC = "__gobo_comment"
+_COMMENT_PROCCODE = f"{_COMMENT_PROC} text: %s"
+_COMMENT_LABEL = "// %s"
+# The body mentions the argument so the compiler does not warn about it being
+# unused; `log` is a plain statement with no visual side effect, and the whole
+# definition is stripped from the built project anyway.
+_COMMENT_STUB = f"\nproc {_COMMENT_PROC} text {{\n    log $text;\n}}\n"
+
+
+def rewrite_comments(root: Path) -> list[tuple[Path, bytes]]:
+    """Rewrite ``//`` comments into calls to the carrier stub.
+
+    A ``//`` inside a body (brace depth > 0) is kept where it is, whatever its
+    indentation. A flush-left ``//`` at the top level belongs to the proc/hat opened
+    by the next line, so it moves *inside* that body and follows the definition in
+    the compiled project; any other top-level flush-left ``//`` (above ``costumes``,
+    a ``var``/``list`` declaration, or the end of file) is ignored, since there is no
+    script for it to live in.
+
+    Returns the changed files with their original bytes so the caller can restore
+    them byte-for-byte after the build (building must not change the working tree).
+    """
+    backups: list[tuple[Path, bytes]] = []
+    for path in sorted(root.glob("*.gs")):
+        raw = path.read_bytes()
+        text = raw.decode("utf-8")
+        if "//" not in text:
+            continue
+        nl = "\r\n" if "\r\n" in text else "\n"
+        out: list[str] = []
+        changed = False
+        needs_stub = False
+        pending: list[str] = []
+        depth = 0
+
+        def flush_as_comment() -> None:
+            nonlocal changed
+            for awaiting in pending:
+                out.append(f"# {awaiting}{nl}")
+                changed = True
+            pending.clear()
+
+        def emit_carrier(indent: str, body: str) -> None:
+            nonlocal changed, needs_stub
+            out.append(f"{indent}{_COMMENT_PROC} {json.dumps(body.strip())};{nl}")
+            changed = True
+            needs_stub = True
+
+        for line in text.splitlines(keepends=True):
+            stripped = line.rstrip("\r\n")
+            match = _COMMENT_RE.match(stripped)
+            if match is not None:
+                indent, body = match.groups()
+                if depth > 0:
+                    # Inside a body: it stays there, so it survives as a block.
+                    flush_as_comment()
+                    emit_carrier(indent, body)
+                elif indent:
+                    # Indented but outside any body: nothing to attach it to.
+                    flush_as_comment()
+                    out.append(f"# {body}{nl}")
+                    changed = True
+                else:
+                    pending.append(body)
+                continue
+            if stripped.lstrip().startswith("#"):
+                out.append(line)
+                continue
+            if not stripped.strip():
+                flush_as_comment()
+                out.append(line)
+                continue
+            if pending and depth == 0 and stripped.rstrip().endswith("{"):
+                out.append(line)
+                for awaiting in pending:
+                    emit_carrier("    ", awaiting)
+                pending.clear()
+                depth += _brace_delta(stripped)
+                continue
+            flush_as_comment()
+            out.append(line)
+            depth = max(0, depth + _brace_delta(stripped))
+        flush_as_comment()
+        if not changed:
+            continue
+        rewritten = "".join(out)
+        if needs_stub and f"proc {_COMMENT_PROC}" not in rewritten:
+            rewritten += _COMMENT_STUB.replace("\n", nl)
+        backups.append((path, raw))
+        path.write_bytes(rewritten.encode("utf-8"))
+    return backups
+
+
+def restore_sources(backups: list[tuple[Path, bytes]]) -> None:
+    for path, raw in backups:
+        path.write_bytes(raw)
+
+
+def inject_comments(sb3_path: Path) -> None:
+    """Drop the carrier's definition and relabel its calls to ``// %s``."""
+    try:
+        with zipfile.ZipFile(sb3_path) as archive:
+            project = json.loads(archive.read("project.json"))
+            members = [
+                (name, archive.read(name))
+                for name in archive.namelist()
+                if name != "project.json"
+            ]
+    except (OSError, ValueError, zipfile.BadZipFile):
+        return
+    changed = False
+    for target in project["targets"]:
+        blocks = target.get("blocks")
+        if not isinstance(blocks, dict):
+            continue
+        for block_id, block in list(blocks.items()):
+            if not isinstance(block, dict):
+                continue
+            if block.get("opcode") != "procedures_definition":
+                continue
+            proto_id = (block.get("inputs") or {}).get("custom_block", [None, None])[1]
+            proto = blocks.get(proto_id)
+            if not isinstance(proto, dict):
+                continue
+            if (proto.get("mutation") or {}).get("proccode") != _COMMENT_PROCCODE:
+                continue
+            stack = {block_id, proto_id}
+            next_id = block.get("next")
+            while next_id:
+                stack.add(next_id)
+                next_id = (blocks.get(next_id) or {}).get("next")
+            for member_id in stack:
+                blocks.pop(member_id, None)
+            comments = target.get("comments")
+            if isinstance(comments, dict):
+                for comment_id, comment in list(comments.items()):
+                    if isinstance(comment, dict) and comment.get("blockId") in stack:
+                        del comments[comment_id]
+            changed = True
+        for block in blocks.values():
+            if not isinstance(block, dict):
+                continue
+            if block.get("opcode") != "procedures_call":
+                continue
+            mutation = block.get("mutation")
+            if isinstance(mutation, dict) and mutation.get("proccode") == _COMMENT_PROCCODE:
+                mutation["proccode"] = _COMMENT_LABEL
+                changed = True
+    if not changed:
+        return
+    tmp = sb3_path.with_name(sb3_path.name + ".tmp")
+    try:
+        with zipfile.ZipFile(tmp, "w", zipfile.ZIP_DEFLATED) as archive:
+            archive.writestr("project.json", json.dumps(project, ensure_ascii=False))
+            for name, data in members:
+                archive.writestr(name, data)
+        os.replace(tmp, sb3_path)
+    except OSError:
+        try:
+            tmp.unlink()
+        except OSError:
+            pass
+
+
 def build_project_at(root: Path, mode: str = "debug") -> Path:
     goboscript = resolve_goboscript()
     if goboscript is None:
@@ -2051,6 +2231,7 @@ def build_project_at(root: Path, mode: str = "debug") -> Path:
         log(f"building {root} ({mode})")
     else:
         log(f"building {root}")
+    comment_backups = rewrite_comments(root)
     sb3_path = root / (root.name + ".sb3")
     # Rely on cwd for the input (3.2.1 uses -i/--input, older builds a positional).
     command = [goboscript, "build", "-o", str(sb3_path)]
@@ -2069,8 +2250,10 @@ def build_project_at(root: Path, mode: str = "debug") -> Path:
     finally:
         if original is not None:
             mode_file.write_text(original, encoding="utf-8")
+        restore_sources(comment_backups)
     if result.returncode != 0:
         raise SystemExit(f"goboscript build failed (exit {result.returncode}).")
+    inject_comments(sb3_path)
     inject_monitors(sb3_path, root)
     inject_costumes(sb3_path, root)
     return sb3_path

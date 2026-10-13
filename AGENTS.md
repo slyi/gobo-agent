@@ -85,6 +85,18 @@ unchanged. Release expands the macros to nothing, erasing the call **and its arg
 at compile time. Switching modes needs a rebuild. Keep safety checks and real state
 changes in release; only diagnostic code belongs in these macros.
 
+A line-leading `//` in a `.gs` is a comment that survives into the compiled project
+(`#` is compile-time only): `build` carries it through the compile as a carrier call,
+then strips that carrier's definition and relabels the calls, leaving an inert
+`// note` block the editor shows. A `//` inside a body stays where it is, whatever its
+indentation; a flush-left `//` directly above a proc/hat moves inside that body; any
+other top-level `//` (above `costumes`, a `var`/`list` declaration, end of file) is
+ignored. The source is restored byte-for-byte, and the only cost is the caller's own
+block dispatch — keep comment calls out of hot loops. This is a gobo-agent build
+feature (`gsdev`/`gsdev.ps1`): plain `goboscript build` and the upstream VS Code
+extension still see `//` as a syntax error, so such a `.gs` builds only through the
+harness.
+
 ## Ground rules
 
 - Run browsers **headless** unless a visible investigation is requested.
