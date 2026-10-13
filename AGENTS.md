@@ -42,7 +42,13 @@ tools\gsdev.ps1 session --file checks.txt --bundle
 
 Default agent work is **headless** unless a visible run is requested. Bound every `run`
 with `--duration` and add `--leave-running` when later commands must observe running
-scripts. The user's VS Code run task (Ctrl+Shift+B) opens a **visible** host: match that
+scripts. `--leave-running` keeps the *host*, not the project: `run` returns as soon as
+the VM goes idle (it logs `project stopped`), so a one-shot project that finishes its
+scripts leaves a stopped runtime. There `get`/`set`/`inspect` still read and write
+state, but triggers (`broadcast`, `key`, `click`, `mouse`) do nothing until the runtime
+is stepping again — `restart` re-runs the green-flag scripts in the warm host without
+reloading, which is the way back (a rebuild/reload still needs a plain `run`). The
+user's VS Code run task (Ctrl+Shift+B) opens a **visible** host: match that
 mode, or `close` it first rather than starting a second browser.
 
 ## Decide which operation you need
@@ -58,6 +64,8 @@ mode, or `close` it first rather than starting a second browser.
 | Capture a freshly loaded image | `screenshot --no-build` (skips compile but reloads/stops the project) |
 | Check Scratch size/memory fit | `preflight` — offline scan (no browser); `--sb3 FILE`, `--json`, `--strict` |
 | End project execution | `stop` — host stays available |
+| Re-run the green flag after it went idle | `restart` — warm host, no reload |
+| Time a one-shot run (scan, batch, level) | `wait_stopped --timeout MS` — resolves on the VM's stop event (or at once when already idle) |
 | Finish an owned session | `close`, once work using it is done |
 
 `--no-build` is valid only when source is unchanged; it still reloads. `--no-reload`
@@ -259,8 +267,46 @@ other symbols, and appends `_`/a number to dodge a keyword or collision — so
 `inspect`/`props`/`clones`. A leading `@` selects a harness metric, not a project
 variable. Quote `@` selectors in PowerShell.
 
+`get` reads a variable **or a whole list**: omit the index (`get stage.img`) and the
+value comes back as that list's full contents in one call — a big list is one big JSON
+line, so use `get --out FILE` to write it (UTF-8) instead of printing or piping it
+(a PowerShell 5.1 pipe is not UTF-8), and parse the file rather than reading element by
+element (`set 'stage.img[7]' "v"` writes one element, 1-based). `--out` prints a
+one-line summary with the byte count and item count. Each selector maps to an object, so
+the list itself is under `["value"]` — `--out` and stdout produce the same shape, so one
+parse works for both:
+
+```python
+import json
+shot = json.load(open("stage.img.json", encoding="utf-8"))["stage.img"]["value"]
+print(len(shot), shot[0])   # 0-based array; selectors like img[1] are 1-based
+```
+
+A whole-list read of 200k items
+measured 0.2–0.6 s; one live read/write gets `READ_TIMEOUT` (**5 s**, `GSDEV_READ_TIMEOUT`
+to override) so an unresponsive page fails fast instead of hanging for half a minute.
+
+Launching and readiness have their own budgets, each a named constant with an env override;
+they are backstops, not the wait itself (readiness resolves on the page's `gsdev:ready`
+event, and the browser's own `DevTools listening` line): `GSDEV_HOSTSERVER_TIMEOUT` (2 s,
+the host server's ready line), `GSDEV_HOST_TIMEOUT` (5 s, attach), `GSDEV_READY_TIMEOUT`
+(10 s, page ready), `GSDEV_CDP_TIMEOUT` (2 s, one CDP call). A launch that yields no
+debuggable page is retried — `GSDEV_LAUNCH_ATTEMPTS` (default 2) — and a retry keeps the
+host server alive, because on Windows `hostserver.py` binds exclusively and a just-closed
+port is in TIME_WAIT, so restarting it immediately fails. The failure path prints the page's
+own state (`location.href`, `document.readyState`, whether `__host`/marks exist, plus a
+`urllib` fetch of the host URL) so a repeated failure is diagnosable without another run.
+`record`/`trace` are frame logs, so they truncate an array to 200 characters; use `get`
+when you need the data.
+
 Prefer event-driven `wait_frame` / `wait_until` / `wait_pixel` (session spellings
 `waitframe` / `waituntil` / `waitpixel`) to sleeps; condition waits fail on timeout.
+`broadcast_wait` broadcasts and waits for its handlers with a **5 s default timeout**,
+which a handler doing real work (a full-stage pixel scan, say) will exceed: pass
+`--timeout MS` (`broadcast_wait scan --timeout 300000`), or the session spelling
+`broadcast_wait scan 300000`. A timed-out wait does not cancel the handler — it keeps
+running, so re-triggering before it finishes leaves several scans interleaved (which
+skews any timing the project itself measures).
 `pause` / `step N` / `resume` control logical steps, not elapsed time — timer and `wait`
 blocks still need real time. Input is VM-level: coordinates are Scratch's (centre `0,0`,
 +x right, +y up). Hold/release keys across frames for polling scripts; it does not
@@ -294,9 +340,19 @@ python tools/gsbridge.py close
 
 Targets are `localhost`, `github`, `editor`, `production` (`--project-id N`), and `url`.
 `--project DIR`/`--sb3 FILE` load a build; production loads what is already on the page.
-The bridge uses fresh isolated profiles (CDP 9400 default) and exposes a **subset** of
-gsdev — no `watch`/`record`/`until`/`step`/property tools — but the shared procedure
-profiler works there (`profile`, `profiling`, `setprofiling`, `profilereset`). `run`
+The bridge uses fresh isolated profiles (CDP 9400 default). It is **not** a subset: gsdev and
+gsbridge expose the **same 39 verbs** with identical syntax *and* result shapes, and that is
+enforced rather than assumed — `tools/verb_parity.py` (run by `gsdev selftest`) fails on any
+usage drift, and `tools/test_ready_events.py --with-shapes` diffs the live JSON key sets per
+verb. Everything is shared except:
+
+| verbs | how they differ | why |
+| --- | --- | --- |
+| `run`, `screenshot`, `profile`, `profiling`, `session` | the bridge adds site flags (`--target`, `--project`, `--project-id`, `--browser`, `--ready-timeout`) and has no `--mode`/`--no-build`/`--sb3`/`--no-reload` and no session bundle | the bridge drives a **foreign live page**, so there is nothing local to build, reload or switch mode on |
+| `build`, `setup`, `init`, `sb2gs`, `preflight`, `tasks`, `doctor`, `selftest`, `status` | gsdev only | they install, build or profile a **local** project; a live-site client has no business doing that |
+
+`test` runs the same session files against the live page, so the same `expect`/`capture`
+asserts work in both tools. `run`
 waits for the page's own project before replacing it, so `targets` should list exactly
 `Stage` plus your sprites (re-load, never delete sprites, if a page applies its project
 late). Live variable edits work on `github`/`editor`; key injection can depend on page

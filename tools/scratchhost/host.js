@@ -32,6 +32,13 @@
     window.__host = {
       vm,
       renderer,
+      // Page-side seam for the shared mouse math: gsbridge's shim exposes the same
+      // `stageRect()` (its canvas lookup differs: scratch-gui, not `#stage`), so
+      // gsdev's mouse_js can be reused verbatim against either page.
+      stageRect: () => {
+        const r = canvas.getBoundingClientRect();
+        return { x: r.x, y: r.y, width: r.width, height: r.height };
+      },
       identity: window.__gsdevIdentity || { project: '', fingerprint: '' },
       load: bytes => {
         const promise = vm.loadProject(bytes);
@@ -272,6 +279,37 @@
 
     window.__host.frame = () => gs.frame;
     window.__host.rendered = () => gs.rendered;
+    // Page-readiness wait: resolves immediately when the page is already up, else on
+    // the `gsdev:ready` event (never by polling).
+    window.__host.ready = (timeoutMs) => new Promise(resolve => {
+      if (marks.ready) {
+        return resolve({ ok: true, at: marks.ready, waited: false, fatal: marks.fatal || null });
+      }
+      let done = false;
+      const finish = (ok, why) => {
+        if (done) return;
+        done = true;
+        window.removeEventListener('gsdev:ready', onReady);
+        resolve({ ok, why, at: marks.ready || null, fatal: marks.fatal || null });
+      };
+      const onReady = () => finish(true, 'event');
+      window.addEventListener('gsdev:ready', onReady);
+      if (timeoutMs > 0) setTimeout(() => finish(false, 'timeout'), timeoutMs);
+    });
+    // Wait for the VM's stop event (all scripts finished) rather than polling:
+    // resolves on the next PROJECT_RUN_STOP after `since`, or on timeout.
+    window.__host.stopSeq = () => gs.stopSeq || 0;
+    window.__host.waitStopped = (since, timeoutMs) => new Promise(resolve => {
+      const idle = () => vm.runtime.threads.length === 0;
+      const finish = why => {
+        try { vm.off('PROJECT_RUN_STOP', onStop); } catch (e) {}
+        resolve({ stopped: true, why, seq: gs.stopSeq || 0, frame: gs.frame, threads: vm.runtime.threads.length });
+      };
+      const onStop = () => finish('event');
+      if (idle()) return finish('idle');
+      try { vm.on('PROJECT_RUN_STOP', onStop); } catch (e) { return finish('unavailable'); }
+      if (timeoutMs > 0) setTimeout(() => resolve({ stopped: false, why: 'timeout', seq: gs.stopSeq || 0, frame: gs.frame, threads: vm.runtime.threads.length }), timeoutMs);
+    });
     window.__host.events = () => Object.assign({
       frame: gs.frame, rendered: gs.rendered,
       frameEvents: gs.frameEvents, renderEvents: gs.renderEvents
@@ -469,6 +507,10 @@
       }
       return Object.assign({ ok: true }, targetProps(target));
     };
+    // Non-destructive read of the captured log buffer (`poll` drains it, which a
+    // one-shot `logs` verb must not do).
+    window.__host.logs = () => gs.logs.slice();
+    window.__host.targetNames = () => vm.runtime.targets.map(t => t.getName());
     window.__host.clones = () => {
       const out = {};
       for (const target of vm.runtime.targets) {
@@ -813,11 +855,14 @@
               try {
                 sprite = util && util.target ? util.target.getName() : 'unknown';
               } catch (error) {}
+              // Same entry shape as the bridge shim (seq/frame included), so
+              // `logs --json` is identical on both tools.
               g.logs.push({
+                seq: (g.logSeq = (g.logSeq || 0) + 1),
                 sprite: sprite === 'Stage' ? 'stage' : sprite,
                 level,
                 value: String(value),
-                time: Date.now()
+                frame: gs.frame
               });
               if (level === 'error') g.logErrors += 1;
             }
@@ -831,6 +876,7 @@
       vm.on('PROJECT_RUN_STOP', () => {
         g.logs.push(null);
         g.stopped = true;
+        g.stopSeq = (g.stopSeq || 0) + 1;
         hud('gsdev host \u2014 project stopped');
       });
     } catch (error) {
@@ -841,4 +887,11 @@
     hud('gsdev host error: ' + marks.fatal, true);
   }
   marks.ready = performance.now();
+  // Ready event: lets callers (and the gsdev CLI) wait for the page instead of
+  // polling window.__marks.ready. Fires once per page load.
+  try {
+    window.dispatchEvent(new CustomEvent('gsdev:ready', {
+      detail: { at: marks.ready, fatal: marks.fatal || null },
+    }));
+  } catch (error) {}
 })();

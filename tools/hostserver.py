@@ -22,6 +22,7 @@ import json
 import os
 import posixpath
 import sys
+import threading
 import urllib.parse
 from functools import partial
 from http.server import SimpleHTTPRequestHandler, ThreadingHTTPServer
@@ -30,6 +31,18 @@ _TOKEN = ""
 _DIRECTORY = ""
 _FINGERPRINT = ""
 _BUNDLES = ""
+
+
+class _Server(ThreadingHTTPServer):
+    """Bind exclusively on Windows.
+
+    ``http.server`` sets ``allow_reuse_address`` (SO_REUSEADDR), which on Windows lets
+    a *second* process bind an already-listening port — two harness servers would then
+    share it and neither could tell. On POSIX keep the reuse flag (needed to rebind
+    promptly after a restart).
+    """
+
+    allow_reuse_address = sys.platform != "win32"
 
 
 class NoStoreHandler(SimpleHTTPRequestHandler):
@@ -86,7 +99,23 @@ def main(argv: list[str]) -> int:
     _FINGERPRINT = argv[4] if len(argv) >= 5 else os.environ.get("GSDEV_HOST_FINGERPRINT", "")
     _BUNDLES = argv[5] if len(argv) >= 6 else os.environ.get("GSDEV_BUNDLES", "")
     handler = partial(NoStoreHandler, directory=directory)
-    ThreadingHTTPServer(("127.0.0.1", port), handler).serve_forever()
+    server = _Server(("127.0.0.1", port), handler)
+    # Serve before announcing: the ready line must mean "this endpoint answers", not
+    # merely "the socket is bound", or a concurrent prober sees a dead window between
+    # the bind and serve_forever.
+    serving = threading.Thread(target=server.serve_forever, daemon=True)
+    serving.start()
+    print(
+        f"hostserver ready {server.server_address[1]} {_TOKEN} {os.getpid()}",
+        flush=True,
+    )
+    try:
+        devnull = os.open(os.devnull, os.O_WRONLY)
+        os.dup2(devnull, 1)
+        os.close(devnull)
+    except OSError:
+        pass
+    serving.join()
     return 0
 
 

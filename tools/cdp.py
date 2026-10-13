@@ -60,6 +60,7 @@ class CDP:
             path += "?" + parsed.query
         self._buffer = b""
         self._next_id = 0
+        self._events: list[dict] = []
         self.sock = socket.create_connection((host, port), timeout=timeout)
         self.sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
         self._handshake(host, port, path)
@@ -167,12 +168,43 @@ class CDP:
                 message = json.loads(raw.decode("utf-8"))
             except json.JSONDecodeError:
                 continue
+            if message.get("id") is None:
+                # A CDP event, not a response: keep it so event() can consume it.
+                # The buffer is generous (a headed page emits a lot of UI events
+                # between two of our calls) but bounded: drop the oldest half.
+                self._events.append(message)
+                if len(self._events) > 4096:
+                    del self._events[:2048]
+                continue
             if message.get("id") != request_id:
                 continue
             if "error" in message:
                 error = message["error"]
                 raise CDPError(f"{method}: {error.get('message', error)}")
             return message.get("result", {})
+
+    def event(self, method: Optional[str] = None, timeout: float = 5.0) -> dict:
+        """Wait for the next CDP event, optionally of a specific ``method``.
+
+        Buffered events are consumed first, so a caller that enables a domain right
+        after attaching still sees events that arrived meanwhile. This is the
+        event-driven counterpart to ``call`` (which is request/response only).
+        """
+        deadline = time.monotonic() + timeout
+        while True:
+            for index, message in enumerate(self._events):
+                if method is None or message.get("method") == method:
+                    return self._events.pop(index)
+            raw = self._recv_message(deadline)
+            try:
+                message = json.loads(raw.decode("utf-8"))
+            except json.JSONDecodeError:
+                continue
+            if message.get("id") is not None:
+                continue  # a response to some other request
+            self._events.append(message)
+            if len(self._events) > 512:
+                del self._events[:256]
 
     def evaluate(self, expression: str, await_promise: bool = False, timeout: float = 30.0) -> Any:
         result = self.call(

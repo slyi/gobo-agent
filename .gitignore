@@ -50,9 +50,11 @@ tests/
 # (run them locally when changing the harness itself):
 #   test_perf_controls      perf-run setup (dialogs/occlusion/ports), no browser
 #   test_procedure_profile  profiler attribution invariant, end to end
+#   test_ready_events       readiness/waits/clone/close robustness, browser required
 #   benchmarks/profiling    the fixture that test needs
 tools/test_perf_controls.py
 tools/test_procedure_profile.py
+tools/test_ready_events.py
 tools/test_bridge_targets.py
 tools/test_profiler_aggregation.py
 tools/measure_overhead.py

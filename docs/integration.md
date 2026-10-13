@@ -604,6 +604,19 @@ Three things, often confused:
   bundle. Set `GSDEV_GOBOSCRIPT` to force one; `doctor` reports which is used.
 - **Port already in use.** `GSDEV_HOST_PORT`/`GSDEV_CDP_PORT` (or config
   `hostPort`/`cdpPort`) choose others; `--port 0` auto-picks a CDP port.
+- **"host page did not finish loading" / "no debuggable page appeared".** The browser or
+  its host server did not come up. A launch that yields no debuggable page is retried
+  (`GSDEV_LAUNCH_ATTEMPTS`, default 2), and a retry keeps the host server alive; the failure
+  message prints the page's own state, so read it — `location.href` of
+  `chrome-error://chromewebdata/` means the browser could not reach the host server (a port
+  conflict, or a blocked browser), while a missing `__host` with `readyState: complete`
+  means the page loaded but its script never finished. Raise `GSDEV_HOST_TIMEOUT` (attach),
+  `GSDEV_READY_TIMEOUT` (page ready, default 10 s) or `GSDEV_HOSTSERVER_TIMEOUT` (server
+  ready line, default 2 s) for a slow machine.
+- **`sb2gs` fails with `ModuleNotFoundError: No module named 'rich'`.** The installed sb2gs
+  venv is incomplete (it presents as that import error from `run.py`). Rebuild it with
+  `gsdev setup --only sb2gs --force`, which re-installs its wheels and re-applies
+  gobo-agent's patches.
 - **Generated files show in `git status`.** Ensure `.gitignore` kept the gobo-agent
   rules (`gobo-agent/state/`, `*.sb3`, `debug/`). `init` adds them.
 

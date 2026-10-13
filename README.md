@@ -89,10 +89,12 @@ on macOS/Linux use `./tools/gsdev`, or `python tools/gsdev.py` on any OS.
 upstream `main`), because upstream's newest release predates the goboscript#158
 negative-literal fix; a `goboscript` on `PATH` still takes precedence.
 
-Setup also provides **sb2gs** (the Scratch → GoboScript importer). It uses an
-`sb2gs` already on `PATH` (or `GSDEV_SB2GS`); otherwise it installs a pinned copy
-(source commit + wheels) under the tools root's `sb2gs/`, with no pip/uv. It needs
-Python 3.14+. Decompile a Scratch project and adopt it in one flow:
+Setup also provides **sb2gs** (the Scratch → GoboScript importer). It installs a pinned
+copy (source commit + wheels) under the tools root's `sb2gs/`, with no pip/uv, and runs
+it through the interpreter (`python <tools-root>/sb2gs/run.py …`) after applying
+gobo-agent's patches; an `sb2gs` on `PATH` (or `GSDEV_SB2GS`) is only reported by
+`doctor`, never executed or patched. It needs Python 3.14+. Decompile a Scratch project
+and adopt it in one flow:
 
 ```powershell
 tools\gsdev.ps1 sb2gs --id 12345678 my_project.sb3   # download + decompile
@@ -295,12 +297,13 @@ Useful inspection commands:
 | Need | Commands |
 | --- | --- |
 | Discover state | `inspect`, `props`, `prop`, `clones` |
-| Read/write state | `get`, `set`, `set_batch` |
+| Read/write state | `get` (`--out FILE` writes the JSON: one object per selector, the list under `["value"]`), `set`, `set_batch` |
 | Drive project events | `key`, `mouse`, `click`, `broadcast`, `broadcast_wait` |
 | Wait for behaviour | `wait_frame`, `wait_until`, `wait_pixel` (session forms `waitframe`, `waituntil`, `waitpixel`) |
 | Capture changes | `record`, `trace`, `until … --pause` |
 | Check rendering | `screenshot`, `pixel`, session pixel assertions |
 | Check errors | `errors`, `expect_no_errors` |
+| Lifecycle | `run` (build + green flag; returns when the VM goes idle), `restart` (re-run the green flag, warm host), `wait_stopped` (event-driven wait for the VM stop), `stop`, `close` |
 | Check Scratch fit before publishing | `preflight` (offline; `--sb3 FILE` to scan an artifact, `--json`, `--strict`) |
 
 The standalone `screenshot` command builds/reloads, captures, then stops the project;
@@ -428,9 +431,10 @@ python tools/gsbridge.py close
 Targets are `localhost`, `github`, `editor`, `production` (`--project-id N`), and `url`.
 `production` runs the page's existing project; other loading paths accept a
 project/`.sb3`. Confirm replacement with `targets` (entry: re-load, never delete
-sprites). The bridge exposes a subset of local commands plus the shared profiler — check
-its help rather than assuming parity. Key input can depend on page focus; verify with
-`get`.
+sprites). The bridge shares gsdev's whole verb surface — 39 verbs with identical syntax
+and result shapes (only the build verbs stay gsdev-only) — and that parity is checked by
+`tools/verb_parity.py` via `gsdev selftest`, so the same commands and asserts work against a
+live site. Key input can depend on page focus; verify with `get`.
 
 ## OS and locale support
 
@@ -457,10 +461,16 @@ verdict.
 | `GSDEV_PYTHON`, `GSDEV_PYTHON_DIR` | Interpreter / portable install directory |
 | `GSDEV_GOBOSCRIPT` | Compiler override (else `PATH`, else the pinned bundle) |
 | `GSDEV_TOOLS`, `GSDEV_HOME` | Tools root override / shared per-user home |
-| `GSDEV_SB2GS` | Use this sb2gs command (else `PATH`, else the pinned bundle) |
+| `GSDEV_SB2GS` | A user sb2gs to *report* (`doctor`/`status`); never executed or patched — the harness always runs its own pinned, patched copy |
 | `GSDEV_BROWSER` | Browser executable |
 | `GSDEV_CDP_PORT`, `--port` | Local CDP port (default 9230); `--port 0` picks one |
 | `GSDEV_HOST_PORT` | Local static-server port (default 8077) |
+| `GSDEV_HOSTSERVER_TIMEOUT` | Seconds to wait for the host server's ready line (default 2) |
+| `GSDEV_HOST_TIMEOUT` | Seconds to attach to the browser, and the fallback when it prints no `DevTools listening` line (default 5) |
+| `GSDEV_READY_TIMEOUT` | Seconds for the page to reach `gsdev:ready` (default 10) |
+| `GSDEV_CDP_TIMEOUT` | Seconds for one CDP call (default 2) |
+| `GSDEV_READ_TIMEOUT` | Seconds for one live read/write, e.g. `get`/`set`/`inspect` (default 5) |
+| `GSDEV_LAUNCH_ATTEMPTS` | Browser launches to try before failing; a retry keeps the host server alive (default 2) |
 | `GSBRIDGE_PORT` | Bridge CDP port (default 9400) |
 | `GSDEV_SOFTWARE=1` | Force software rendering |
 | `GSDEV_NO_AUTO_SETUP=1` | Never auto-download dependencies |

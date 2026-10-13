@@ -94,6 +94,7 @@ import struct
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 import urllib.error
 import urllib.parse
@@ -404,12 +405,29 @@ BUNDLES_DIR = bootstrap.bundles_dir()
 # Deliberately short (5s) so a blocked/broken browser fails fast instead of
 # hanging; raise GSDEV_HOST_TIMEOUT for a slow cold start.
 HOST_ATTACH_TIMEOUT = float(os.environ.get("GSDEV_HOST_TIMEOUT", "5"))
+# How many times to launch the browser if it yields no debuggable page at all. Two
+# failure modes look identical from here — a browser that dies during startup, and one
+# that handed off to a stale instance still holding this profile, so our CDP port never
+# opens (observed intermittently on Windows Edge). `abort_host(port)` clears the second
+# before the retry. Raise GSDEV_LAUNCH_ATTEMPTS for a flaky machine.
+LAUNCH_ATTEMPTS = int(os.environ.get("GSDEV_LAUNCH_ATTEMPTS", "2"))
 # Phase 2: once the page exists, how long it may take to expose window.__host
-# (parsing the ~5.8 MB VM on a cold start). Raise GSDEV_READY_TIMEOUT if needed.
-HOST_READY_TIMEOUT = float(os.environ.get("GSDEV_READY_TIMEOUT", "20"))
+# (parsing the ~5.8 MB VM on a cold start), and the budget for the individual
+# navigation/ready steps inside it. Raise GSDEV_READY_TIMEOUT if needed.
+HOST_READY_TIMEOUT = float(os.environ.get("GSDEV_READY_TIMEOUT", "10"))
 # Per-attempt CDP timeout inside those windows, so one unresponsive target cannot
 # consume the whole budget.
 CDP_ATTACH_TIMEOUT = float(os.environ.get("GSDEV_CDP_TIMEOUT", "2"))
+# Budget for one live state read/write (`get`/`set`/`inspect`/`props`/`clones`…). These
+# are single round trips: reading a whole 200k-item list measured 0.2–0.6 s, so this
+# fails fast instead of making an unresponsive page cost 30 s. Raise
+# GSDEV_READ_TIMEOUT for a pathologically large list or a saturated page.
+READ_TIMEOUT = float(os.environ.get("GSDEV_READ_TIMEOUT", "5"))
+# How long to wait for the static host server's ready line. hostserver.py announces
+# on stdout immediately after binding (then detaches it), so this is an event wait
+# rather than a port-probing loop — and it can stay short: a child that fails to bind
+# closes stdout at once, which is detected as an exit instead of a timeout.
+HOST_SERVER_TIMEOUT = float(os.environ.get("GSDEV_HOSTSERVER_TIMEOUT", "2"))
 
 
 def resolve_goboscript() -> str | None:
@@ -957,10 +975,11 @@ def ensure_host_server() -> None:
                 log(f"host server already on http://127.0.0.1:{HOST_SERVER_PORT} "
                     f"(pid {info.get('pid')}); reusing")
             return
-        raise SystemExit(
-            f"port {HOST_SERVER_PORT} is in use by another application (not a gsdev "
-            f"host server). Set GSDEV_HOST_PORT to a free port, or stop that process."
-        )
+        # The port is open but not answering as ours yet: a concurrent command may be
+        # starting a server this very moment. Fall through and try to start ours — a
+        # bind failure is immediate (seen as the child exiting), after which we
+        # re-probe and reuse theirs, or report a genuinely foreign holder.
+
     if not (HOST_DIR / "host.html").exists():
         raise SystemExit(f"missing {HOST_DIR / 'host.html'}")
     if not host_bundles_present():
@@ -979,17 +998,64 @@ def ensure_host_server() -> None:
         str(HOST_DIR), str(HOST_SERVER_PORT), token, HARNESS_FINGERPRINT,
         str(BUNDLES_DIR),
     ]
-    subprocess.Popen(args, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, **_detached_kwargs())
-    deadline = time.monotonic() + 10
-    while time.monotonic() < deadline:
-        info = probe_host_server(token)
-        if info is not None:
-            write_host_state(token=token, pid=info.get("pid"), port=HOST_SERVER_PORT,
-                             project=str(PROJECT_ROOT), fingerprint=HARNESS_FINGERPRINT)
-            log(f"host server on http://127.0.0.1:{HOST_SERVER_PORT}")
+    proc = subprocess.Popen(
+        args, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+        text=True, encoding="utf-8", errors="replace", **_detached_kwargs(),
+    )
+    # hostserver.py prints one ready line and then detaches stdout, so waiting for
+    # that line is the readiness event (no port-probing loop, no sleep).
+    ready = threading.Event()
+    settled = threading.Event()
+
+    def _await_ready() -> None:
+        try:
+            for line in proc.stdout or ():
+                if line.startswith("hostserver ready "):
+                    ready.set()
+                    break
+        except (OSError, ValueError):
+            pass
+        finally:
+            settled.set()
+
+    threading.Thread(target=_await_ready, daemon=True).start()
+    # Wait for either outcome (the ready line, or stdout closing when the child
+    # exits): a bind failure is then detected immediately instead of after a budget.
+    settled.wait(HOST_SERVER_TIMEOUT)
+    if not ready.is_set():
+        # Fast paths, no long wait: our child either died (usually a bind error
+        # because a concurrent command won the port), or another gsdev server is
+        # already serving it — in which case reuse that one.
+        info = probe_host_server()
+        if info is not None and info.get("fingerprint") == HARNESS_FINGERPRINT:
+            log(f"host server already running (pid {info.get('pid')}); reusing")
+            # Only record it if nobody has: the command that started it owns the
+            # state entry (and therefore `close`); do not clobber that.
+            if read_host_state().get("pid") != info.get("pid"):
+                write_host_state(token=info.get("token"), pid=info.get("pid"),
+                                 port=HOST_SERVER_PORT, project=str(PROJECT_ROOT),
+                                 fingerprint=HARNESS_FINGERPRINT)
             return
-        time.sleep(0.1)
-    raise SystemExit("host server did not start")
+        if port_open(HOST_SERVER_PORT):
+            raise SystemExit(
+                f"port {HOST_SERVER_PORT} is in use by another application (not a "
+                "gsdev host server). Set GSDEV_HOST_PORT to a free port, or stop that "
+                "process."
+            )
+        died = proc.poll() is not None
+        raise SystemExit(
+            f"host server did not start within {HOST_SERVER_TIMEOUT:g}s"
+            + (" (the child exited)" if died else "")
+        )
+    # One-shot verification: never treat a port owner we did not start as ours.
+    info = probe_host_server(token)
+    if info is None:
+        raise SystemExit(
+            f"port {HOST_SERVER_PORT} is held by something that is not our host server"
+        )
+    write_host_state(token=token, pid=info.get("pid"), port=HOST_SERVER_PORT,
+                     project=str(PROJECT_ROOT), fingerprint=HARNESS_FINGERPRINT)
+    log(f"host server on http://127.0.0.1:{HOST_SERVER_PORT}")
 
 
 def host_target(port: int) -> dict | None:
@@ -999,6 +1065,22 @@ def host_target(port: int) -> dict | None:
         return None
     for target in targets:
         if target.get("type") == "page" and "host.html" in str(target.get("url", "")):
+            return target
+    return None
+
+
+def any_page_target(port: int) -> dict | None:
+    """Any page target on the port.
+
+    ``host_target`` only accepts a page already showing ``host.html``; at launch the
+    browser may still be on ``about:blank`` because we navigate over CDP ourselves.
+    """
+    try:
+        targets = list_targets(port=port, timeout=2.0)
+    except Exception:
+        return None
+    for target in targets:
+        if target.get("type") == "page":
             return target
     return None
 
@@ -1070,15 +1152,16 @@ def dismiss_browser_dialogs(port: int) -> None:
         log(f"closed browser dialog: {url}")
 
 
-def abort_host(port: int) -> None:
+def abort_host(port: int, keep_server: bool = False) -> None:
     """Tear down a failed launch so nothing detached is left behind.
 
     A failed `run` used to leave the host server (started with the portable
     Python) alive; that then held `.tools/python`, so a rebuild could not delete
-    it until the interpreter was killed by hand.
+    it until the interpreter was killed by hand. `keep_server=True` is for a launch
+    *retry*, which needs the server to survive the teardown.
     """
     try:
-        close_host(port)
+        close_host(port, keep_server=keep_server)
     except (CDPError, OSError, urllib.error.URLError):
         pass
 
@@ -1176,6 +1259,78 @@ def _assert_host_identity(conn: CDP, port: int) -> None:
         )
 
 
+def spawn_browser(flags: list[str], timeout: float | None = None) -> tuple[subprocess.Popen, dict]:
+    """Launch a browser and wait for its DevTools readiness line (or its exit).
+
+    Chromium announces its endpoint on stderr; that line is the "a debuggable page
+    exists" event (``marks["ws"]``). The pipe is drained for the browser's whole
+    lifetime: Chromium is chatty on a headed run, and a pipe we stop reading fills up
+    and blocks the renderer, after which the page never loads. ``marks["settled"]`` is
+    set on the line or when stderr closes, so a browser that dies at once fails fast
+    instead of consuming the attach budget (``marks["exit_code"]`` is then set).
+
+    Shared with gsbridge so both hosts launch and detect readiness the same way.
+    """
+    if timeout is None:
+        timeout = HOST_ATTACH_TIMEOUT
+    proc = subprocess.Popen(
+        flags, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE,
+        text=True, encoding="utf-8", errors="replace", **_detached_kwargs(),
+    )
+    marks: dict = {
+        "devtools": threading.Event(),
+        "settled": threading.Event(),
+        "ws": None,
+        "exit_code": None,
+    }
+
+    def _drain() -> None:
+        try:
+            for line in proc.stderr or ():
+                if not marks["devtools"].is_set() and "DevTools listening on ws://" in line:
+                    marks["ws"] = line.split("DevTools listening on ", 1)[1].strip()
+                    marks["devtools"].set()
+                    marks["settled"].set()
+        except (OSError, ValueError):
+            pass
+        finally:
+            marks["settled"].set()
+
+    threading.Thread(target=_drain, daemon=True).start()
+    marks["settled"].wait(timeout)
+    if not marks["devtools"].is_set():
+        try:
+            marks["exit_code"] = proc.wait(timeout=0.5)  # a process wait, not a sleep
+        except subprocess.TimeoutExpired:
+            pass
+    return proc, marks
+
+
+def _page_error(conn: CDP) -> str:
+    """The page's URL if the browser is showing its own navigation-error page, else ''."""
+    try:
+        href = conn.evaluate("location.href", timeout=CDP_ATTACH_TIMEOUT) or ""
+    except (CDPError, TimeoutError, OSError):
+        return ""
+    return str(href) if str(href).startswith("chrome-error://") else ""
+
+
+def _navigate_host(conn: CDP) -> bool:
+    """Page.enable + navigate to the host page + await the load event.
+
+    False means the navigation did not land on the host page (typically because the
+    host server was not accepting connections, so Chromium showed its error page).
+    The caller retries rather than waiting out the whole ready budget.
+    """
+    try:
+        conn.call("Page.enable", timeout=CDP_ATTACH_TIMEOUT)
+        conn.call("Page.navigate", {"url": host_url()}, timeout=HOST_READY_TIMEOUT)
+        conn.event("Page.loadEventFired", timeout=HOST_READY_TIMEOUT)
+    except (CDPError, TimeoutError, OSError):
+        return False
+    return not _page_error(conn)
+
+
 def ensure_host(port: int, headless: bool, software: bool) -> tuple[CDP, bool]:
     # GSDEV_SOFTWARE=1 forces software GL without threading --software through
     # every command (CI sets it once so the test suites can run on GPU-less boxes).
@@ -1213,74 +1368,164 @@ def ensure_host(port: int, headless: bool, software: bool) -> tuple[CDP, bool]:
         flags.append("--headless=new")
         if software:
             flags += ["--use-angle=swiftshader", "--enable-unsafe-swiftshader"]
-    flags.append(host_url())
-    log(f"launching {Path(browser).name}{' headless' if headless else ''}")
-    subprocess.Popen(flags, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, **_detached_kwargs())
-    # Record the CDP port so a later `close` (with no --port) can find this
-    # browser instead of guessing the default.
-    update_host_state(cdpPort=port)
-    # Two phases so a browser that never attaches fails fast, while a slow cold
-    # page load still gets time: HOST_ATTACH_TIMEOUT for a debuggable page to
-    # appear, then HOST_READY_TIMEOUT for window.__host to come up.
-    attach_deadline = time.monotonic() + HOST_ATTACH_TIMEOUT
-    ready_deadline: float | None = None
+    # Launch on a blank page and navigate over CDP: that way the navigation happens
+    # after we enable Page events, so `Page.loadEventFired` is deterministic.
+    # (Launching straight at the host URL races that event and can run an evaluate
+    # in the pre-navigation context, which then gets destroyed.)
+    base_flags = list(flags)
+    proc: subprocess.Popen | None = None
     conn: CDP | None = None
-    while True:
-        now = time.monotonic()
-        if ready_deadline is None:
-            if now >= attach_deadline:
-                abort_host(port)
-                raise SystemExit(
-                    f"no debuggable {Path(browser).name} page appeared within "
-                    f"{HOST_ATTACH_TIMEOUT:g}s; is the browser blocked by policy? "
-                    "(raise GSDEV_HOST_TIMEOUT for a slow cold start)"
-                )
-        elif now >= ready_deadline:
-            break
-        dismiss_browser_dialogs(port)
-        target = host_target(port)
-        if target is not None:
-            if ready_deadline is None:
-                ready_deadline = now + HOST_READY_TIMEOUT
-            try:
-                if conn is None:
+    for attempt in range(1, LAUNCH_ATTEMPTS + 1):
+        # abort_host() stops the host server as well as the browser, so every attempt
+        # (including a relaunch) must make sure the server is back before the page
+        # navigates to it. Reuses an existing server when one is up.
+        ensure_host_server()
+        flags = base_flags + ["about:blank"]
+        log(f"launching {Path(browser).name}{' headless' if headless else ''}"
+            f"{'' if attempt == 1 else f' (attempt {attempt}/{LAUNCH_ATTEMPTS})'}")
+        proc, marks = spawn_browser(flags)
+        devtools = marks["devtools"]
+        if devtools.is_set():
+            log(f"{Path(browser).name} devtools ready")
+        elif marks["exit_code"] not in (None, 0):
+            abort_host(port)
+            raise SystemExit(
+                f"{Path(browser).name} exited immediately (code {marks['exit_code']}); "
+                "is it blocked by policy?"
+            )
+        else:
+            # Chromium's launcher stub can hand off to the real browser and exit 0 while
+            # the browser keeps running (observed on Windows Edge), and a browser that dies
+            # silently just closes stderr — neither proves failure, so probe for the
+            # endpoint below instead of declaring it here.
+            log(f"{Path(browser).name} printed no DevTools line; probing for the endpoint")
+        # Record the CDP port so a later `close` (with no --port) can find this
+        # browser instead of guessing the default.
+        update_host_state(cdpPort=port)
+        # Phase 1: a debuggable page (the DevTools event above, or probing if the
+        # browser stayed silent). Phase 2: the page's own ready event below. A launcher
+        # stub that handed off (exit 0, no line) leaves the browser coming up, which is a
+        # ready-phase wait rather than an attach failure, so the probe gets the longer
+        # budget there; the fast path keeps the short one.
+        attach_budget = HOST_ATTACH_TIMEOUT if devtools.is_set() else HOST_READY_TIMEOUT
+        attach_deadline = time.monotonic() + attach_budget
+        conn = None
+        silent = not devtools.is_set()
+        while time.monotonic() < attach_deadline and conn is None:
+            dismiss_browser_dialogs(port)
+            target = any_page_target(port)
+            if target is not None:
+                try:
                     conn = connect(target, timeout=CDP_ATTACH_TIMEOUT)
-                if conn.evaluate(
-                    "!!(window.__host && window.__marks && window.__marks.ready)",
-                    timeout=CDP_ATTACH_TIMEOUT,
-                ):
-                    log("host ready")
-                    try:
-                        info = conn.evaluate(
-                            "window.__host.gpu ? window.__host.gpu() : null",
-                            timeout=CDP_ATTACH_TIMEOUT,
-                        )
-                        if info and info.get("renderer"):
-                            log(f"gl {info['renderer']}")
-                            if info.get("software"):
-                                log(
-                                    "WARNING: GL looks like software (SwiftShader); "
-                                    "perf is not GPU-representative"
-                                )
-                    except (CDPError, TimeoutError, OSError):
-                        pass
-                    return conn, True
-            except (CDPError, TimeoutError, OSError):
-                pass
-        time.sleep(0.2)
-    detail = ""
-    try:
+                    break
+                except (CDPError, TimeoutError, OSError):
+                    pass
+            if silent:
+                time.sleep(0.05)  # fallback only: no DevTools line to wait on
+        # Navigate here, inside the retry loop: a navigation that never lands on the
+        # host page (server not accepting connections -> Chromium's error page) is a
+        # launch failure and must be retried, not charged to the ready budget.
+        if conn is not None and _navigate_host(conn):
+            break
         if conn is not None:
+            log(f"{Path(browser).name} landed on {_page_error(conn) or 'a non-host page'}; "
+                "relaunching")
+            conn.close()
+            conn = None
+        # No usable page: clear the browser's owner and try once more. Keep the host
+        # server alive when another attempt follows (the browser, not the server, is
+        # what failed here).
+        more_attempts = attempt < LAUNCH_ATTEMPTS
+        abort_host(port, keep_server=more_attempts)
+        if not more_attempts:
+            raise SystemExit(
+                f"no debuggable {Path(browser).name} page appeared within "
+                f"{attach_budget:g}s after {LAUNCH_ATTEMPTS} attempt(s); is the browser "
+                "blocked by policy? (raise GSDEV_HOST_TIMEOUT for a slow cold start, "
+                "GSDEV_LAUNCH_ATTEMPTS for more tries)"
+            )
+        log(f"{Path(browser).name} gave no usable page; relaunching")
+    # Phase 2 is the page's own ready event, awaited in-page (no polling). The
+    # navigation itself happened inside the retry loop above.
+    ready_error = ""
+    ready_phase = "gsdev:ready"
+    ready: dict | None = None
+    try:
+        # The listener is installed by us (not by host.js) because host.js loads well
+        # after `load`; ready() covers the case where the event already fired.
+        ready = conn.evaluate(
+            "new Promise(r => {"
+            " if (window.__host && window.__host.ready) { window.__host.ready(0).then(r); return; }"
+            " window.addEventListener('gsdev:ready',"
+            "   () => r({ ok: true, why: 'event', fatal: (window.__marks && window.__marks.fatal) || null }),"
+            "   { once: true });"
+            f" setTimeout(() => r({{ ok: false, why: 'timeout' }}), {int(HOST_READY_TIMEOUT * 1000)});"
+            " })",
+            await_promise=True, timeout=HOST_READY_TIMEOUT + 5,
+        )
+    except (CDPError, TimeoutError, OSError) as exc:
+        ready = None
+        ready_error = f"{type(exc).__name__} during {ready_phase}: {exc}"
+    if ready and ready.get("fatal"):
+        # host.js recorded a fatal init error: report it at once rather than as a
+        # ready timeout (the event still fires, so ok is true).
+        conn.close()
+        abort_host(port)
+        raise SystemExit(f"host page failed to initialise: {ready['fatal']}")
+    if not (ready or {}).get("ok"):
+        detail = ""
+        try:
             error = conn.evaluate("window.__hostBundlesError || ''", timeout=CDP_ATTACH_TIMEOUT)
             if error:
                 detail = f" (host page: {error})"
+        except (CDPError, TimeoutError, OSError):
+            pass
+        # What was the page actually doing? Distinguishes "still fetching resources"
+        # from "host.js never ran" from "init threw" without another reproduction.
+        try:
+            page = conn.evaluate(
+                "JSON.stringify({readyState: document.readyState, href: location.href,"
+                " hasHost: !!window.__host, hasVm: !!(window.__host && window.__host.vm),"
+                " marksReady: !!(window.__marks && window.__marks.ready),"
+                " marksFatal: (window.__marks && window.__marks.fatal) || null,"
+                " scripts: document.scripts.length,"
+                " bundles: window.__gsdevBundles ? window.__gsdevBundles.length : null})",
+                timeout=CDP_ATTACH_TIMEOUT,
+            )
+            detail += f" (page: {page})"
+        except (CDPError, TimeoutError, OSError) as exc:
+            detail += f" (page diag failed: {type(exc).__name__})"
+        # Was the page's *server* reachable from here at the same moment the browser
+        # showed its error page? (Distinguishes a dead/slow host server from a
+        # browser-side navigation failure.)
+        try:
+            import urllib.request
+            with urllib.request.urlopen(host_url(), timeout=3) as resp:
+                detail += f" (server: http {resp.status}, {len(resp.read())} bytes)"
+        except Exception as exc:  # noqa: BLE001
+            detail += f" (server unreachable: {type(exc).__name__}: {exc})"
+        conn.close()
+        abort_host(port)
+        raise SystemExit(
+            f"scratch-vm host page did not finish loading within {HOST_READY_TIMEOUT:g}s"
+            f"{detail}{(' (' + ready_error + ')') if ready_error else ''}; {_setup_hint()}"
+        )
+    log("host ready" + (" (waited on gsdev:ready)" if ready.get("waited") else ""))
+    try:
+        info = conn.evaluate(
+            "window.__host.gpu ? window.__host.gpu() : null",
+            timeout=CDP_ATTACH_TIMEOUT,
+        )
+        if info and info.get("renderer"):
+            log(f"gl {info['renderer']}")
+            if info.get("software"):
+                log(
+                    "WARNING: GL looks like software (SwiftShader); "
+                    "perf is not GPU-representative"
+                )
     except (CDPError, TimeoutError, OSError):
         pass
-    abort_host(port)
-    raise SystemExit(
-        f"scratch-vm host page did not finish loading within {HOST_READY_TIMEOUT:g}s"
-        f"{detail}; {_setup_hint()}"
-    )
+    return conn, True
 
 
 def open_host(port: int) -> CDP | None:
@@ -1321,11 +1566,17 @@ def load_host_project(cdp: CDP, sb3_path: Path) -> dict:
     return json.loads(cdp.evaluate(script, await_promise=True, timeout=120))
 
 
-def stop_host(cdp: CDP) -> None:
-    cdp.evaluate("window.__host.stop()")
+def stop_host(cdp: CDP, ns: str = "window.__host") -> None:
+    cdp.evaluate(f"{ns}.stop()")
 
 
-def close_host(port: int) -> None:
+def close_host(port: int, keep_server: bool = False) -> None:
+    """Close the browser on `port`.
+
+    `keep_server=True` leaves the host server running: a launch *retry* needs it
+    (restarting it immediately usually fails on Windows, where hostserver binds
+    exclusively, so the just-closed port is still in TIME_WAIT).
+    """
     process_name = Path(find_browser() or "chrome.exe").name.lower()
     pids = find_editor_pids(port, process_name, host_profile_dir(port))
     if pids:
@@ -1333,6 +1584,8 @@ def close_host(port: int) -> None:
         log(f"killed host browser (pid {', '.join(str(p) for p in pids)})")
     else:
         log("no host browser to close")
+    if keep_server:
+        return
     # Only stop the host server if we started it (recorded token) and it is still
     # the same process -- never a foreign application that happens to hold the port.
     state = read_host_state()
@@ -2425,7 +2678,8 @@ def cmd_status(args: argparse.Namespace) -> int:
     try:
         state = cdp.evaluate(
             "JSON.stringify({sprites: window.__host.vm.runtime.targets.map(t => t.getName()),"
-            " running: window.__host.vm.runtime.threads.length > 0})"
+            " running: window.__host.vm.runtime.threads.length > 0})",
+            timeout=READ_TIMEOUT,
         )
         log(state)
     finally:
@@ -2464,13 +2718,20 @@ def parse_selector(selector: str) -> tuple[str, str, int | None]:
 _UNSET = object()
 
 
-def _var_js(target: str, name: str, index: int | None = None, value=_UNSET) -> str:
+def _var_js(target: str, name: str, index: int | None = None, value=_UNSET,
+            ns: str = "window.__host") -> str:
+    """JS for reading (or writing, when `value` is given) one variable/list element.
+
+    `ns` is the page-side object to use, so gsbridge's injected shim
+    (`window.__bridge`) reuses this exactly instead of keeping a second implementation.
+    It must expose `findTarget(name)` (a Scratch target) and `perfValue(name)`.
+    """
     if target == "@perf":
         if value is not _UNSET:
             return "({error: 'read-only: @' + " + json.dumps(name) + "})"
         return (
             "(() => {"
-            " const _host = window.__host;"
+            " const _host = " + ns + ";"
             " if (!_host || !_host.perfValue) return {error: 'no host (open the project with run first)'};"
             " const _want = " + json.dumps(name) + ";"
             " const _out = _host.perfValue(_want);"
@@ -2490,7 +2751,7 @@ def _var_js(target: str, name: str, index: int | None = None, value=_UNSET) -> s
         ) % (literal, literal, json.dumps(name))
     return (
         "(() => {"
-        " const _host = window.__host;"
+        " const _host = " + ns + ";"
         " if (!_host || !_host.findTarget) return {error: 'no host (open the project with run first)'};"
         " const _want = " + json.dumps(target) + ";"
         " const _t = _host.findTarget(_want);"
@@ -2517,7 +2778,9 @@ def parse_value(raw: str):
         return raw
 
 
-def _watch_install_js(specs: list[tuple], labels: list[str], interval_ms: int) -> str:
+def _watch_install_js(specs: list[tuple], labels: list[str], interval_ms: int,
+                      ns: str = "window.__host",
+                      glob: str = "window.__gsdevWatch") -> str:
     spec_list = "[" + ",".join(
         "{target: %s, name: %s, label: %s, index: %s}"
         % (
@@ -2530,7 +2793,7 @@ def _watch_install_js(specs: list[tuple], labels: list[str], interval_ms: int) -
     ) + "]"
     return (
         "(() => {"
-        " const _host = window.__host;"
+        " const _host = " + ns + ";"
         " if (!_host || !_host.findTarget) return {error: 'no host (open the project with run first)'};"
         " const _specs = " + spec_list + ";"
         " const _refs = [];"
@@ -2544,7 +2807,7 @@ def _watch_install_js(specs: list[tuple], labels: list[str], interval_ms: int) -
         "   _refs.push({label: _s.label, ref: _v, index: _s.index});"
         " }"
         " const _read = (_r) => (_r.ref.__perf)"
-        "   ? window.__host.perfValue(_r.ref.__perf)"
+        "   ? " + ns + ".perfValue(_r.ref.__perf)"
         "   : ((_r.index === null)"
         "     ? _r.ref.value"
         "     : (Array.isArray(_r.ref.value) ? _r.ref.value[_r.index - 1] : undefined));"
@@ -2553,9 +2816,9 @@ def _watch_install_js(specs: list[tuple], labels: list[str], interval_ms: int) -
         "     return s.length > 200 ? s.slice(0, 200) + '...(' + x.length + ')' : s; }"
         "   if (x !== null && typeof x === 'object') { try { return JSON.stringify(x); } catch (e) { return String(x); } }"
         "   return x; };"
-        " const _prev = window.__gsdevWatch;"
+        " const _prev = " + glob + ";"
         " if (_prev && _prev.timer) clearInterval(_prev.timer);"
-        " const _W = window.__gsdevWatch = {on: true, samples: [], refs: _refs, t0: performance.now()};"
+        " const _W = " + glob + " = {on: true, samples: [], refs: _refs, t0: performance.now()};"
         " _W.timer = setInterval(() => { if (!_W.on) return;"
         "   const _row = [Math.round(performance.now() - _W.t0)];"
         "   for (const _r of _W.refs) _row.push(_fmt(_read(_r)));"
@@ -2567,15 +2830,14 @@ def _watch_install_js(specs: list[tuple], labels: list[str], interval_ms: int) -
     )
 
 
-DRAIN_WATCH_JS = (
-    "JSON.stringify((window.__gsdevWatch"
-    " && window.__gsdevWatch.samples.splice(0, window.__gsdevWatch.samples.length)) || [])"
-)
-STOP_WATCH_JS = (
-    "(() => { if (window.__gsdevWatch) { window.__gsdevWatch.on = false;"
-    " if (window.__gsdevWatch.timer) clearInterval(window.__gsdevWatch.timer); }"
-    " return 'ok'; })()"
-)
+def _drain_watch_js(glob: str = "window.__gsdevWatch") -> str:
+    return (f"JSON.stringify(({glob}"
+            f" && {glob}.samples.splice(0, {glob}.samples.length)) || [])")
+
+
+def _stop_watch_js(glob: str = "window.__gsdevWatch") -> str:
+    return (f"(() => {{ if ({glob}) {{ {glob}.on = false;"
+            f" if ({glob}.timer) clearInterval({glob}.timer); }} return 'ok'; }})()")
 
 
 def open_live_cdp(port: int) -> CDP | None:
@@ -2591,8 +2853,28 @@ def cmd_get(args: argparse.Namespace) -> int:
         result = {}
         for selector in args.selectors:
             target, name, index = parse_selector(selector)
-            result[selector] = cdp.evaluate(_var_js(target, name, index))
-        log(json.dumps(result))
+            result[selector] = cdp.evaluate(_var_js(target, name, index),
+                                            timeout=READ_TIMEOUT)
+        payload = json.dumps(result)
+        if getattr(args, "out", None):
+            # A whole list comes back as one big JSON line. Write it to a UTF-8 file
+            # (a PowerShell 5.1 pipe is not UTF-8) instead of printing megabytes.
+            out = Path(args.out)
+            out.parent.mkdir(parents=True, exist_ok=True)
+            out.write_text(payload + "\n", encoding="utf-8", newline="\n")
+            counts = {}
+            for sel, entry in result.items():
+                value = entry.get("value") if isinstance(entry, dict) else entry
+                if isinstance(value, list):
+                    counts[sel] = len(value)
+            log(json.dumps({"out": str(out), "bytes": out.stat().st_size,
+                            "items": counts}))
+        else:
+            log(payload)
+    except (CDPError, TimeoutError) as exc:
+        log(f"no answer within {READ_TIMEOUT:g}s ({type(exc).__name__}); the page may be "
+            f"busy or mid-navigation — raise GSDEV_READ_TIMEOUT if the read is genuinely slow")
+        return 1
     finally:
         cdp.close()
     return 0
@@ -2605,20 +2887,22 @@ def cmd_set(args: argparse.Namespace) -> int:
     if cdp is None:
         return 1
     try:
-        result = cdp.evaluate(_var_js(target, name, index, value)) or {}
+        result = cdp.evaluate(_var_js(target, name, index, value), timeout=READ_TIMEOUT) or {}
         log(json.dumps({"selector": args.selector, **result}))
         return 1 if result.get("error") else 0
     finally:
         cdp.close()
 
 
-def apply_batch(cdp: CDP, tokens: list[str]) -> None:
+def apply_batch(cdp: CDP, tokens: list[str], ns: str = "window.__host", log_fn=None) -> None:
     """Set several variables/lists in ONE evaluate, so the VM cannot step between.
 
     ``tokens`` are ``selector=value`` (lists and indices supported). This is what
     removes the race where a multi-variable fixture is read with only one of the
     pair updated: a single evaluate runs as one JS task on the same thread as the
-    VM step, so no thread can observe a half-applied update.
+    VM step, so no thread can observe a half-applied update. `ns` lets gsbridge reuse
+    this against its injected shim, and `log_fn` keeps the output in the caller's own
+    format (gsbridge's log has no `[gsdev]` prefix).
     """
     labels: list[str] = []
     exprs: list[str] = []
@@ -2627,14 +2911,14 @@ def apply_batch(cdp: CDP, tokens: list[str]) -> None:
         if not sep:
             raise SystemExit(f"bad assignment {token!r} (want selector=value)")
         target, name, index = parse_selector(selector)
-        exprs.append(_var_js(target, name, index, parse_value(raw)))
+        exprs.append(_var_js(target, name, index, parse_value(raw), ns=ns))
         labels.append(selector)
     script = (
         "(() => { const out = [];"
         + "".join(f" out.push({expr});" for expr in exprs)
         + " return JSON.stringify(out); })()"
     )
-    log(json.dumps({"set_batch": labels, "results": json.loads(cdp.evaluate(script))}))
+    (log_fn or log)(json.dumps({"set_batch": labels, "results": json.loads(cdp.evaluate(script))}))
 
 
 def cmd_set_batch(args: argparse.Namespace) -> int:
@@ -2649,21 +2933,23 @@ def cmd_set_batch(args: argparse.Namespace) -> int:
 
 
 def _watch_run(
-    cdp: CDP, selectors: list[str], duration_ms: float, interval_ms: int = 20
+    cdp: CDP, selectors: list[str], duration_ms: float, interval_ms: int = 20,
+    ns: str = "window.__host", glob: str = "window.__gsdevWatch", log_fn=None,
 ) -> dict:
     specs = [parse_selector(selector) for selector in selectors]
     labels = list(selectors)
-    result = cdp.evaluate(_watch_install_js(specs, labels, max(1, int(interval_ms))))
+    result = cdp.evaluate(
+        _watch_install_js(specs, labels, max(1, int(interval_ms)), ns=ns, glob=glob))
     if not result or result.get("error"):
         error = (result or {}).get("error", "unknown error")
         if not JSON_MODE:
-            log(f"watch failed: {error}")
+            (log_fn or log)(f"watch failed: {error}")
         return {"ok": False, "error": error, "labels": labels, "rows": [], "summary": []}
     rows: list[list] = []
     deadline = time.monotonic() + duration_ms / 1000.0
     while time.monotonic() < deadline:
         time.sleep(0.05)
-        for row in json.loads(cdp.evaluate(DRAIN_WATCH_JS) or "[]"):
+        for row in json.loads(cdp.evaluate(_drain_watch_js(glob)) or "[]"):
             rows.append(row)
             if JSON_MODE:
                 continue
@@ -2698,7 +2984,7 @@ def cmd_watch(args: argparse.Namespace) -> int:
             print(json.dumps({"watch": result}, separators=(",", ":")), flush=True)
     finally:
         try:
-            cdp.evaluate(STOP_WATCH_JS)
+            cdp.evaluate(_stop_watch_js())
         except (CDPError, TimeoutError, OSError):
             pass
         cdp.close()
@@ -2769,7 +3055,7 @@ def run_session_lines(cdp: CDP, lines, quiet: bool = False,
             elif op == "set" and len(parts) >= 3:
                 target, name, index = parse_selector(parts[1])
                 value = parse_value(" ".join(parts[2:]))
-                result = cdp.evaluate(_var_js(target, name, index, value))
+                result = cdp.evaluate(_var_js(target, name, index, value), timeout=READ_TIMEOUT)
                 log(json.dumps({"set": parts[1], **result}))
             elif op == "set_batch" and len(parts) >= 3:
                 try:
@@ -2796,9 +3082,8 @@ def run_session_lines(cdp: CDP, lines, quiet: bool = False,
                 x, y = float(parts[1]), float(parts[2])
                 cdp.evaluate(mouse_js(x, y, None))
                 cdp.evaluate(mouse_js(x, y, True))
-                time.sleep(0.05)
+                cdp.evaluate("window.__host.waitFrames(1, 1000)", await_promise=True, timeout=2) or {}
                 cdp.evaluate(mouse_js(x, y, False))
-                time.sleep(0.05)
                 log(json.dumps({"click": [x, y]}))
             elif op == "key" and len(parts) >= 2:
                 key = input_key_name(parts[1])
@@ -2809,7 +3094,7 @@ def run_session_lines(cdp: CDP, lines, quiet: bool = False,
                     cdp.evaluate(key_js(key, False))
                 else:
                     cdp.evaluate(key_js(key, True))
-                    time.sleep(0.05)
+                    cdp.evaluate("window.__host.waitFrames(1, 1000)", await_promise=True, timeout=2) or {}
                     cdp.evaluate(key_js(key, False))
                 log(json.dumps({"key": key, "mode": mode}))
             elif op == "expect" and len(parts) >= 4:
@@ -2819,12 +3104,12 @@ def run_session_lines(cdp: CDP, lines, quiet: bool = False,
                 if extra_selectors:
                     # One synchronous evaluation: assertion + declared state together.
                     res = cdp.evaluate(
-                        _assert_capture_js(selector, extra_selectors)) or {}
+                        _assert_capture_js(selector, extra_selectors), timeout=READ_TIMEOUT) or {}
                     actual = (res.get("actual") or {}).get("value")
                     capture = {"source": res.get("actual")}
                     capture.update(res.get("capture") or {})
                 else:
-                    actual = cdp.evaluate(select_js(selector)).get("value")
+                    actual = cdp.evaluate(select_js(selector), timeout=READ_TIMEOUT).get("value")
                     capture = None
                 record(
                     compare(actual, operator, expected),
@@ -2848,7 +3133,7 @@ def run_session_lines(cdp: CDP, lines, quiet: bool = False,
                 if not ok and captures:
                     # A pixel read is a promise, so pixel-failure captures are read
                     # separately; label that they are not simultaneous.
-                    capture = cdp.evaluate(_capture_js(captures)) or {}
+                    capture = cdp.evaluate(_capture_js(captures), timeout=READ_TIMEOUT) or {}
                     atomic = False
                 record(
                     ok,
@@ -2859,16 +3144,16 @@ def run_session_lines(cdp: CDP, lines, quiet: bool = False,
             elif op == "frame" and len(parts) == 1:
                 log(json.dumps({"frame": current_frame(cdp)}))
             elif op == "pause":
-                cdp.evaluate("window.__host.pause()")
+                cdp.evaluate(pause_js())
                 log(json.dumps({"paused": True, "frame": current_frame(cdp)}))
             elif op == "resume":
-                cdp.evaluate("window.__host.resume()")
+                cdp.evaluate(resume_js())
                 log(json.dumps({"resumed": True, "frame": current_frame(cdp)}))
             elif op == "restart":
                 cdp.evaluate("window.__host.restart()")
                 log(json.dumps({"restarted": True, "frame": current_frame(cdp)}))
             elif op == "step" and len(parts) >= 2:
-                cdp.evaluate("window.__host.pause()")
+                cdp.evaluate(pause_js())
                 before = current_frame(cdp)
                 frame = int(cdp.evaluate(f"window.__host.step({int(parts[1])})"))
                 log(json.dumps({"stepped": frame - before, "frame": frame}))
@@ -2884,7 +3169,7 @@ def run_session_lines(cdp: CDP, lines, quiet: bool = False,
                 else:
                     record(False, f"waitframe {count} timed out")
             elif op == "render":
-                log(json.dumps(cdp.evaluate("window.__host.events()")))
+                log(json.dumps(cdp.evaluate(events_js())))
             elif op == "record" and len(parts) >= 2:
                 specs = [_spec(selector) for selector in parts[1:]]
                 result = cdp.evaluate(f"window.__host.record({json.dumps(specs)}, 100000)")
@@ -2925,9 +3210,9 @@ def run_session_lines(cdp: CDP, lines, quiet: bool = False,
                     record(False, f"broadcast_wait {parts[1]} timed out")
             elif op == "inspect":
                 target = parts[1] if len(parts) > 1 else ""
-                log(json.dumps(cdp.evaluate(_inspect_js(target))))
+                log(json.dumps(cdp.evaluate(_inspect_js(target), timeout=READ_TIMEOUT)))
             elif op == "props" and len(parts) >= 2:
-                result = cdp.evaluate(f"window.__host.props({json.dumps(parts[1])})") or {}
+                result = cdp.evaluate(f"window.__host.props({json.dumps(parts[1])})", timeout=READ_TIMEOUT) or {}
                 log(json.dumps(result))
                 if result.get("error"):
                     record(False, f"props {parts[1]}: {result['error']}")
@@ -2948,7 +3233,7 @@ def run_session_lines(cdp: CDP, lines, quiet: bool = False,
                 if result.get("error"):
                     record(False, f"prop {parts[1]} {parts[2]}: {result['error']}")
             elif op == "clones":
-                log(json.dumps({"clones": cdp.evaluate("window.__host.clones()")}))
+                log(json.dumps({"clones": cdp.evaluate("window.__host.clones()", timeout=READ_TIMEOUT)}))
             elif op == "perf":
                 log(json.dumps(cdp.evaluate("window.__host.perf()")))
             elif op == "errors":
@@ -2976,6 +3261,16 @@ def run_session_lines(cdp: CDP, lines, quiet: bool = False,
                     }))
                 else:
                     record(False, f"waituntil {parts[1]} {parts[2]} {value} timed out")
+            elif op == "waitstopped":
+                timeout = float(parts[1]) if len(parts) > 1 else 60000.0
+                result = cdp.evaluate(
+                    f"window.__host.waitStopped(0, {int(timeout)})",
+                    await_promise=True, timeout=timeout / 1000.0 + 5,
+                ) or {}
+                if result.get("stopped"):
+                    log(json.dumps({"waitstopped": result}))
+                else:
+                    record(False, f"waitstopped timed out after {int(timeout)}ms")
             elif op == "waitpixel" and len(parts) >= 4:
                 timeout = float(parts[4]) if len(parts) > 4 else 5000.0
                 result = cdp.evaluate(
@@ -2997,7 +3292,7 @@ def run_session_lines(cdp: CDP, lines, quiet: bool = False,
               "elapsed": round(time.time() - started, 3)})
     finally:
         try:
-            cdp.evaluate(STOP_WATCH_JS)
+            cdp.evaluate(_stop_watch_js())
         except (CDPError, TimeoutError, OSError):
             pass
     return {"asserts": asserts, "failures": failures, "watches": watches}
@@ -3485,26 +3780,29 @@ def input_key_name(name: str) -> str:
     return INPUT_KEY_ALIASES.get(name.strip().lower(), name)
 
 
-def mouse_js(x: float, y: float, is_down: bool | None) -> str:
+def mouse_js(x: float, y: float, is_down: bool | None, ns: str = "window.__host") -> str:
+    """Mouse move/press JS. `ns` needs `vm` and `stageRect()` (see host.js), so the
+    coordinate math is shared with gsbridge's injected shim instead of duplicated."""
     down = "undefined" if is_down is None else ("true" if is_down else "false")
     return (
         "(() => {"
-        " const vm = window.__host.vm;"
-        " const r = document.getElementById('stage').getBoundingClientRect();"
-        " const sw = vm.runtime.constructor.STAGE_WIDTH || 480;"
-        " const sh = vm.runtime.constructor.STAGE_HEIGHT || 360;"
-        f" const px = ({float(x)!r} / sw + 0.5) * r.width;"
-        f" const py = (0.5 - {float(y)!r} / sh) * r.height;"
-        " vm.postIOData('mouse', {x: px, y: py, canvasWidth: r.width,"
-        f" canvasHeight: r.height, isDown: {down}}});"
+        f" const _h = {ns};"
+        " const _r = _h.stageRect && _h.stageRect();"
+        " if (!_r) return 'no-stage';"
+        " const sw = _h.vm.runtime.constructor.STAGE_WIDTH || 480;"
+        " const sh = _h.vm.runtime.constructor.STAGE_HEIGHT || 360;"
+        f" const px = ({float(x)!r} / sw + 0.5) * _r.width;"
+        f" const py = (0.5 - {float(y)!r} / sh) * _r.height;"
+        " _h.vm.postIOData('mouse', {x: px, y: py, canvasWidth: _r.width,"
+        f" canvasHeight: _r.height, isDown: {down}}});"
         " return 'ok'; })()"
     )
 
 
-def key_js(key: str, is_down: bool) -> str:
+def key_js(key: str, is_down: bool, ns: str = "window.__host") -> str:
     pressed = "true" if is_down else "false"
     return (
-        "(() => { window.__host.vm.postIOData('keyboard', {key: "
+        f"(() => {{ {ns}.vm.postIOData('keyboard', {{key: "
         + json.dumps(key) + ", isDown: " + pressed + "}); return 'ok'; })()"
     )
 
@@ -3548,17 +3846,35 @@ def cmd_mouse(args: argparse.Namespace) -> int:
     return 0
 
 
+def _hold_input(cdp: CDP, settle_ms: float, ns: str = "window.__host") -> None:
+    """Keep mouse/key down and up apart without the CLI sleeping.
+
+    Default is exactly one VM frame; an explicit --settle becomes a page-side timer
+    (still no CLI sleep, and the duration is honoured exactly). `ns` selects the host
+    page's namespace so gsbridge (window.__bridge) shares this implementation.
+    """
+    try:
+        if settle_ms > 0:
+            cdp.evaluate(
+                f"new Promise(r => setTimeout(r, {int(settle_ms)}))",
+                await_promise=True, timeout=settle_ms / 1000.0 + 3,
+            )
+        else:
+            cdp.evaluate(f"{ns}.waitFrames(1, 2000)", await_promise=True, timeout=3)
+    except (CDPError, TimeoutError, OSError):
+        pass
+
+
 def cmd_click(args: argparse.Namespace) -> int:
     cdp = open_live_cdp(args.port)
     if cdp is None:
         return 1
     try:
-        settle = max(0.0, args.settle) / 1000.0
         cdp.evaluate(mouse_js(args.x, args.y, None))
         cdp.evaluate(mouse_js(args.x, args.y, True))
-        time.sleep(settle)
+        _hold_input(cdp, float(args.settle))
         cdp.evaluate(mouse_js(args.x, args.y, False))
-        time.sleep(settle)
+        _hold_input(cdp, 0.0)
         log(json.dumps({"click": [args.x, args.y]}))
     finally:
         cdp.close()
@@ -3571,7 +3887,6 @@ def cmd_key(args: argparse.Namespace) -> int:
         return 1
     try:
         key = input_key_name(args.name)
-        settle = max(0.0, args.settle) / 1000.0
         if args.down:
             cdp.evaluate(key_js(key, True))
             mode = "down"
@@ -3580,7 +3895,7 @@ def cmd_key(args: argparse.Namespace) -> int:
             mode = "up"
         else:
             cdp.evaluate(key_js(key, True))
-            time.sleep(settle)
+            _hold_input(cdp, float(args.settle))
             cdp.evaluate(key_js(key, False))
             mode = "press"
         log(json.dumps({"key": key, "mode": mode}))
@@ -3638,8 +3953,29 @@ def cmd_pixel(args: argparse.Namespace) -> int:
 # wall-clock time, so timer/`wait` blocks need real time (use run/watch).
 
 
-def current_frame(cdp: CDP) -> int:
-    return int(cdp.evaluate("window.__gsdev.frame"))
+def events_js(ns: str = "window.__host") -> str:
+    return f"{ns}.events()"
+
+
+def pause_js(ns: str = "window.__host") -> str:
+    return f"{ns}.pause()"
+
+
+def resume_js(ns: str = "window.__host") -> str:
+    return f"{ns}.resume()"
+
+
+def step_js(count: int, ns: str = "window.__host") -> str:
+    return f"{ns}.step({int(count)})"
+
+
+def broadcast_js(name: str, ns: str = "window.__host") -> str:
+    return f"{ns}.broadcast({json.dumps(name)})"
+
+
+def current_frame(cdp: CDP, js: str = "window.__gsdev.frame") -> int:
+    # The counter is a property on the local host and a method on the bridge shim.
+    return int(cdp.evaluate(js))
 
 
 def cmd_frame(args: argparse.Namespace) -> int:
@@ -3658,7 +3994,7 @@ def cmd_pause(args: argparse.Namespace) -> int:
     if cdp is None:
         return 1
     try:
-        cdp.evaluate("window.__host.pause()")
+        cdp.evaluate(pause_js())
         log(json.dumps({"paused": True, "frame": current_frame(cdp)}))
     finally:
         cdp.close()
@@ -3670,7 +4006,7 @@ def cmd_resume(args: argparse.Namespace) -> int:
     if cdp is None:
         return 1
     try:
-        cdp.evaluate("window.__host.resume()")
+        cdp.evaluate(resume_js())
         log(json.dumps({"resumed": True, "frame": current_frame(cdp)}))
     finally:
         cdp.close()
@@ -3682,9 +4018,9 @@ def cmd_step(args: argparse.Namespace) -> int:
     if cdp is None:
         return 1
     try:
-        cdp.evaluate("window.__host.pause()")
+        cdp.evaluate(pause_js())
         before = current_frame(cdp)
-        frame = int(cdp.evaluate(f"window.__host.step({int(args.count)})"))
+        frame = int(cdp.evaluate(step_js(args.count)))
         log(json.dumps({"stepped": frame - before, "frame": frame}))
     finally:
         cdp.close()
@@ -3705,6 +4041,23 @@ def cmd_wait_frame(args: argparse.Namespace) -> int:
             return 0
         log(f"wait_frame timed out after {args.timeout} ms (frame {result.get('frame')}, wanted +{args.count})")
         return 1
+    finally:
+        cdp.close()
+
+
+def cmd_wait_stopped(args: argparse.Namespace) -> int:
+    """Wait for the VM's stop event (every script finished), event-driven."""
+    cdp = open_live_cdp(args.port)
+    if cdp is None:
+        return 1
+    try:
+        since = cdp.evaluate("window.__host.stopSeq()")
+        result = cdp.evaluate(
+            f"window.__host.waitStopped({since}, {int(args.timeout)})",
+            await_promise=True, timeout=args.timeout / 1000.0 + 5,
+        ) or {}
+        log(json.dumps(result))
+        return 0 if result.get("stopped") else 1
     finally:
         cdp.close()
 
@@ -3731,7 +4084,7 @@ def cmd_render(args: argparse.Namespace) -> int:
     if cdp is None:
         return 1
     try:
-        log(json.dumps(cdp.evaluate("window.__host.events()")))
+        log(json.dumps(cdp.evaluate(events_js())))
     finally:
         cdp.close()
     return 0
@@ -4334,15 +4687,15 @@ def cmd_broadcast(args: argparse.Namespace) -> int:
     if cdp is None:
         return 1
     try:
-        result = cdp.evaluate(f"window.__host.broadcast({json.dumps(args.name)})")
+        result = cdp.evaluate(broadcast_js(args.name))
         log(json.dumps({"broadcast": args.name, "threads": (result or {}).get("threads", 0)}))
     finally:
         cdp.close()
     return 0
 
 
-def _broadcast_wait_js(name: str, timeout_ms: int) -> str:
-    return f"window.__host.broadcastWait({json.dumps(name)}, {int(timeout_ms)})"
+def _broadcast_wait_js(name: str, timeout_ms: int, ns: str = "window.__host") -> str:
+    return f"{ns}.broadcastWait({json.dumps(name)}, {int(timeout_ms)})"
 
 
 def cmd_broadcast_wait(args: argparse.Namespace) -> int:
@@ -4384,7 +4737,7 @@ def cmd_inspect(args: argparse.Namespace) -> int:
     if cdp is None:
         return 1
     try:
-        result = cdp.evaluate(_inspect_js(args.target)) or {}
+        result = cdp.evaluate(_inspect_js(args.target), timeout=READ_TIMEOUT) or {}
         log(json.dumps(result))
         return 1 if result.get("error") else 0
     finally:
@@ -4396,7 +4749,7 @@ def cmd_props(args: argparse.Namespace) -> int:
     if cdp is None:
         return 1
     try:
-        result = cdp.evaluate(f"window.__host.props({json.dumps(args.target)})") or {}
+        result = cdp.evaluate(f"window.__host.props({json.dumps(args.target)})", timeout=READ_TIMEOUT) or {}
         log(json.dumps(result))
         return 1 if result.get("error") else 0
     finally:
@@ -4425,12 +4778,40 @@ def cmd_prop(args: argparse.Namespace) -> int:
         cdp.close()
 
 
+def cmd_targets(args: argparse.Namespace) -> int:
+    cdp = open_live_cdp(args.port)
+    if cdp is None:
+        return 1
+    try:
+        names = cdp.evaluate("window.__host.targetNames()", timeout=READ_TIMEOUT)
+        log(json.dumps({"targets": names if isinstance(names, list) else []}))
+    finally:
+        cdp.close()
+    return 0
+
+
+def cmd_logs(args: argparse.Namespace) -> int:
+    cdp = open_live_cdp(args.port)
+    if cdp is None:
+        return 1
+    try:
+        entries = cdp.evaluate("window.__host.logs()", timeout=READ_TIMEOUT) or []
+        if args.json:
+            log(json.dumps({"logs": entries}))
+        else:
+            for e in entries:
+                log(f"[LOG {e['sprite']}] {e['value']}")
+    finally:
+        cdp.close()
+    return 0
+
+
 def cmd_clones(args: argparse.Namespace) -> int:
     cdp = open_live_cdp(args.port)
     if cdp is None:
         return 1
     try:
-        log(json.dumps({"clones": cdp.evaluate("window.__host.clones()")}))
+        log(json.dumps({"clones": cdp.evaluate("window.__host.clones()", timeout=READ_TIMEOUT)}))
     finally:
         cdp.close()
     return 0
@@ -4445,7 +4826,7 @@ def cmd_clones(args: argparse.Namespace) -> int:
 
 
 def get_errors(cdp: CDP) -> dict:
-    return cdp.evaluate("window.__host.errors()") or {}
+    return cdp.evaluate("window.__host.errors()", timeout=READ_TIMEOUT) or {}
 
 
 def print_error(error: dict) -> None:
@@ -4917,6 +5298,20 @@ def cmd_selftest(args: argparse.Namespace) -> int:
         and host_profile_dir(9240).parent == HOST_PROFILE_ROOT,
         str(HOST_PROFILE_ROOT),
     )
+    # Shared verbs must keep identical syntax across gsdev and gsbridge; verb_parity is
+    # the single source of truth for what is shared and what may differ (see its module
+    # docstring). Imported lazily so a broken gsbridge never breaks the rest of selftest.
+    try:
+        import verb_parity
+        parity_problems, parity_shared = verb_parity.compare()
+        check(
+            "verb parity (gsdev/gsbridge)",
+            not parity_problems,
+            "; ".join(parity_problems) if parity_problems
+            else f"{parity_shared} shared verbs identical",
+        )
+    except Exception as exc:  # noqa: BLE001
+        check("verb parity (gsdev/gsbridge)", False, f"{type(exc).__name__}: {exc}")
 
     if failures:
         print(f"[FAIL] selftest - {failures} check(s) failed", flush=True)
@@ -5682,6 +6077,7 @@ def build_parser() -> argparse.ArgumentParser:
     get = subparsers.add_parser("get", help="read variables from the running project")
     add_port(get)
     get.add_argument("selectors", nargs="+", help="sprite.variable (bare name = stage global)")
+    get.add_argument("--out", help="write the JSON to FILE (UTF-8) instead of stdout")
     get.set_defaults(func=cmd_get)
 
     set_ = subparsers.add_parser("set", help="write a variable in the running project")
@@ -5818,6 +6214,13 @@ def build_parser() -> argparse.ArgumentParser:
     add_port(restart)
     restart.set_defaults(func=cmd_restart)
 
+    waitstopped = subparsers.add_parser(
+        "wait_stopped", help="wait for the VM stop event (all scripts finished)")
+    add_port(waitstopped)
+    waitstopped.add_argument("--timeout", type=int, default=60000,
+                             help="timeout in ms")
+    waitstopped.set_defaults(func=cmd_wait_stopped)
+
     render = subparsers.add_parser("render", help="frame/render counters and event totals")
     add_port(render)
     render.set_defaults(func=cmd_render)
@@ -5892,6 +6295,14 @@ def build_parser() -> argparse.ArgumentParser:
     clones = subparsers.add_parser("clones", help="print the clone count per sprite")
     add_port(clones)
     clones.set_defaults(func=cmd_clones)
+
+    targets = subparsers.add_parser("targets", help="list loaded target (sprite) names")
+    add_port(targets)
+    targets.set_defaults(func=cmd_targets)
+
+    logs = subparsers.add_parser("logs", help="goboscript log/warn/error captured by the host")
+    logs.add_argument("--json", action="store_true")
+    add_port(logs); logs.set_defaults(func=cmd_logs)
 
     perf = subparsers.add_parser(
         "perf", help="print fps / rendertime / steptime snapshot"
