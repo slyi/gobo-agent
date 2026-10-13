@@ -233,6 +233,17 @@ don't fix them and don't file bugs for them. Issue links are for reference.
 Conversion is not guaranteed pixel-identical: always `goboscript build`, then run
 and compare (e.g. `gsdev run` + `screenshot`) rather than assuming equivalence.
 
+**Tool installs.** `setup` downloads the pinned sb2gs into the shared tools root
+(`%LOCALAPPDATA%\gobo-agent`, overridable via `GSDEV_HOME`/`GSDEV_TOOLS`) and applies
+the patches there; the upstream tree is never vendored, so the working copy only ever
+holds the recipe. A user-installed `sb2gs` (`GSDEV_SB2GS` or on `PATH`) is detected and
+reported by `doctor` but **never executed or modified** — the harness always runs its
+own pinned, patched copy. The install records a patcher id, so a plain `gsdev setup`
+re-applies the patches after a commit that changes them (`--force` re-downloads even
+when they match), and `setup` refuses to write into a tools root that does not look
+like a gobo-agent install (which is what a mis-set `GSDEV_TOOLS`/`GSDEV_HOME` pointing
+at someone else's checkout would produce).
+
 **sb2gs**
 
 - **Sprite names that aren't valid filenames** — each sprite is written as

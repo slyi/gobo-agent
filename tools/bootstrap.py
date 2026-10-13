@@ -590,11 +590,41 @@ def sb2gs_marker() -> Path:
     return sb2gs_root() / ".installed.json"
 
 
-def system_sb2gs() -> str | None:
-    """A user-installed sb2gs to prefer over our bundled copy.
+def _patcher_id() -> str:
+    """Identify this patcher, so an install refreshes when the patches change.
 
-    ``GSDEV_SB2GS`` (a path to the command) or an ``sb2gs`` on PATH. When present
-    we run the user's own install instead of downloading ours.
+    The marker records it, so a plain ``setup`` re-applies the patches after a
+    commit that touches this file — no need to remember ``--force``.
+    """
+    return hashlib.sha256(Path(__file__).read_bytes()).hexdigest()[:12]
+
+
+def _is_foreign_sb2gs_tree() -> bool:
+    """True when the tools root holds someone else's sb2gs rather than ours.
+
+    We only ever create ``run.py``, ``source/sb2gs/**``, ``site-packages/`` and
+    ``.installed.json`` under ``sb2gs_root()``; a real sb2gs checkout has
+    ``pyproject.toml``/``src``/``.git``/``sb2gs`` at its top level. Anything we do not
+    recognise must not be replaced or written into — a mis-set ``GSDEV_TOOLS`` or
+    ``GSDEV_HOME`` is the only way to point us at a tree that is not ours.
+    """
+    root = sb2gs_root()
+    if not root.exists():
+        return False
+    if sb2gs_run_py().is_file() or sb2gs_marker().is_file():
+        return False  # ours (or a half-finished reinstall of ours)
+    return any(
+        (root / name).exists()
+        for name in ("pyproject.toml", "setup.py", "setup.cfg", "src", "sb2gs", ".git")
+    )
+
+
+def system_sb2gs() -> str | None:
+    """A user-installed sb2gs, detected only.
+
+    ``GSDEV_SB2GS`` (a path to the command) or an ``sb2gs`` on PATH. It is reported
+    by ``doctor``/``status`` and otherwise **ignored**: the harness always runs its
+    own pinned, patched copy and never executes or modifies a user's install.
     """
     override = os.environ.get("GSDEV_SB2GS")
     if override:
@@ -1619,16 +1649,19 @@ def _unzip_into(data: bytes, destination: Path) -> None:
 
 def install_sb2gs(force: bool = False, offline: bool = False) -> None:
     system = system_sb2gs()
-    if system and not force:
-        _log(f"sb2gs already available: {system} (skipping download)")
-        return
+    if system:
+        # Detected, never used and never modified: the harness always runs its own
+        # pinned, patched copy, so a user's install must not skip installing ours.
+        _log(f"note: leaving {system} untouched; the harness uses its own sb2gs copy")
     if sb2gs_present() and not force:
         try:
             recorded = json.loads(sb2gs_marker().read_text(encoding="utf-8"))
         except (OSError, json.JSONDecodeError):
             recorded = {}
-        if recorded.get("commit") == SB2GS_COMMIT:
-            _log(f"sb2gs already installed: {sb2gs_source_dir()}")
+        if (recorded.get("commit") == SB2GS_COMMIT
+                and recorded.get("patcher") == _patcher_id()):
+            _log(f"sb2gs already installed (patcher {recorded['patcher']}): "
+                 f"{sb2gs_source_dir()}")
             return
     if offline:
         raise SetupError(
@@ -1640,6 +1673,12 @@ def install_sb2gs(force: bool = False, offline: bool = False) -> None:
         _log(f"sb2gs needs Python 3.14+; skipping (found {platform.python_version()})")
         return
     source = sb2gs_source_dir()
+    if _is_foreign_sb2gs_tree():
+        raise SetupError(
+            f"{sb2gs_root()} does not look like a gobo-agent install; refusing to "
+            "write into it. Unset GSDEV_TOOLS/GSDEV_HOME to use the shared per-user "
+            "tools root, or point them at a fresh directory."
+        )
     if source.exists():
         shutil.rmtree(source)
     source.mkdir(parents=True, exist_ok=True)
@@ -1813,8 +1852,8 @@ def install_sb2gs(force: bool = False, offline: bool = False) -> None:
     sb2gs_run_py().write_text(SB2GS_RUNNER, encoding="utf-8")
     sb2gs_marker().write_text(
         json.dumps(
-            {"commit": SB2GS_COMMIT, "mode": mode, "pillow": key,
-             "packages": sorted(SB2GS_WHEELS)},
+            {"commit": SB2GS_COMMIT, "patcher": _patcher_id(), "mode": mode,
+             "pillow": key, "packages": sorted(SB2GS_WHEELS)},
             indent=2,
         ) + "\n",
         encoding="utf-8",
@@ -1838,7 +1877,9 @@ def sb2gs_env() -> dict:
 
 def run_sb2gs(argv: list[str]) -> int:
     if not sb2gs_present():
-        raise SetupError("sb2gs is not installed; run `gsdev setup` first")
+        system = system_sb2gs()
+        extra = f"; a user install at {system} is left untouched" if system else ""
+        raise SetupError(f"sb2gs is not installed; run `gsdev setup` first{extra}")
     if sys.version_info[:2] < (3, 14):
         raise SetupError(
             f"sb2gs needs Python 3.14+ (found {platform.python_version()}); run gsdev "
