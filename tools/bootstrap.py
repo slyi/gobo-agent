@@ -1326,11 +1326,18 @@ SB2GS_CUSTOM_BLOCK_PATCHES = (
     return PROCCODE_ARG_RE.sub("", block.mutation.proccode).strip()""",
         """_name_cache: dict[str, str] = {}
 
+# An argument placeholder together with the label that announces it (`x: %s`,
+# `worldX2: %s`) -- and only that: `go to x: %s y: %s` -> `go to`,
+# `viewTransformPoint worldX2: %s ...` -> `viewTransformPoint`, `say %s` -> `say`.
+# Argument *names* live in mutation.argumentnames, so the emitted parameters keep
+# their spelling (x, y, dir, xOrigin, ...).
+PROCCODE_LABEL_RE = re.compile(r"(?:\\s*\\w+:\\s*)?\\%[sb]")
+
 
 def get_name(block: Block) -> str:
     proccode = block.mutation.proccode
     if proccode not in _name_cache:
-        base = PROCCODE_ARG_RE.sub("", proccode).strip()
+        base = PROCCODE_LABEL_RE.sub("", proccode).strip()
         name = base
         i = 2
         while name in _name_cache.values():
@@ -1340,6 +1347,204 @@ def get_name(block: Block) -> str:
     return _name_cache[proccode]""",
     ),
 )
+
+
+# gobo-agent carries a source `// note` into the built project as a call to a carrier
+# proc (proccode "// %s") whose definition it strips, leaving the note inert (see
+# AGENTS.md, "// comments"). sb2gs renders such a call as `_ "note"` -- `//` collapses to
+# `_` -- and with the definition gone the call points at a proc that does not exist, so
+# the result cannot build.
+# Emit goboscript's comment form instead, which gobo-agent's own `//` support then
+# carries back into the rebuilt project. Applied to installed sb2gs (decompile_stmt.py).
+SB2GS_COMMENT_PATCHES = (
+    (
+        """def decompile_procedures_call(ctx: Ctx, block: Block) -> None:
+    ctx.iprint(syntax.identifier(custom_blocks.get_name(block)))
+    args = json.loads(block.mutation.argumentids)""",
+        """def decompile_procedures_call(ctx: Ctx, block: Block) -> None:
+    if getattr(block.mutation, "proccode", "").startswith("//"):
+        ids = json.loads(block.mutation.argumentids)
+        text = inputs.block_value(block.inputs._.get(ids[0])) if ids else None
+        note = " ".join(str("" if text is None else text).splitlines())
+        ctx.iprint("// ", note)
+        ctx.println("")
+        return
+    ctx.iprint(syntax.identifier(custom_blocks.get_name(block)))
+    args = json.loads(block.mutation.argumentids)""",
+    ),
+)
+
+
+# goboscript is case-sensitive and preserves what is written (`var camelCaseVar` and
+# `proc DrawQuad` round-trip verbatim, and `camelCaseVar` coexists with `camelcasevar`),
+# so collapsing every identifier to lowercase is unnecessary loss: it renames the
+# author's camelCase vars/lists/procs and makes converted names harder to map back to
+# the Scratch project. Keep the casing, and keep whitespace/symbol handling and the
+# collision numbering as they are. `decompile_events` compares the emitted identifier
+# against a readable form to decide whether a proc needs an explanatory note, so that
+# probe has to keep case as well, and a `//` carrier definition is dropped rather than
+# declared (its calls are comments -- see SB2GS_COMMENT_PATCHES).
+# Applied to the installed sb2gs (syntax.py, decompile_events.py).
+# goboscript's build writes only non-default stage/sprite properties, so a project built
+# by gobo-agent has no `volume`, `x`, `y`, `size`, `direction`, `draggable`,
+# `currentCostume`, no stage `tempo`/`video*` and no sprite `comments` -- and its blocks
+# may omit `next`/`inputs`/`fields`. sb2gs dereferences those directly (`self.volume =
+# target.volume`), so importing our own build died with "'JSONObject' has no attribute
+# 'volume'". The downloader already normalizes what it downloads; do the same for a local
+# `.sb3` so every import path is covered. Applied to the installed sb2gs (decompile.py).
+# TurboWarp/forkphorus runtime-detection reporters (`turbowarp_isCompiled`,
+# `turbowarp_isTurboWarp`, ...) have no goboscript spelling, so sb2gs dropped them and
+# emitted an empty condition. Emit a marker string instead; gsdev.inject_tw_blocks turns
+# it back into the opcode in the built sb3. Applied to the installed sb2gs
+# (decompile_expr.py).
+SB2GS_TW_DETECTION_PATCHES = (
+    (
+        """    elif block.opcode in BLOCKS:
+        decompiler = decompile_block
+    else:
+        decompiler = globals().get(f"decompile_{block.opcode}")""",
+        """    elif block.opcode in BLOCKS:
+        decompiler = decompile_block
+    elif (block.opcode.startswith("turbowarp_is")
+          or block.opcode.startswith("forkphorus_is")):
+        # goboscript has no syntax for the TurboWarp/forkphorus runtime-detection
+        # reporters, so emit a marked string constant rather than dropping the block
+        # (which left an empty condition and an unbuildable project). In a boolean
+        # input goboscript coerces it to `(<marker> == 1)`, which survives compilation,
+        # and gsdev.inject_tw_blocks mutates that comparison back into the original
+        # opcode. Unbuilt, the comparison is simply false.
+        ctx.print(syntax.string("__gsdev_tw_op_" + block.opcode + "__"))
+        return
+    else:
+        decompiler = globals().get(f"decompile_{block.opcode}")""",
+    ),
+)
+
+
+SB2GS_DEFAULTS_PATCHES = (
+    (
+        '        project = json.load(f, object_hook=JSONObject)',
+        '        project = json.load(f, object_hook=JSONObject)\n'
+        '        fill_sb3_defaults(project)',
+    ),
+    (
+        'def decompile(input: Path, output: Path) -> None:',
+        '''def fill_sb3_defaults(project: JSONObject) -> None:
+    """Fill the sb3 defaults a producer may omit, for every import path.
+
+    goboscript writes only non-default properties, so a project it built has no
+    volume/x/y/size/direction/draggable/currentCostume, no stage tempo/videoState/
+    videoTransparency and no sprite comments, and its blocks omit next/parent/
+    inputs/fields/shadow/topLevel. sb2gs reads several of those directly (`self.volume
+    = target.volume`), so re-importing our own build failed; the downloader normalizes
+    only what it downloads, so normalize here too. Nested dicts are JSONObjects, so
+    unwrap on the way in and keep the wrapped empties that `target.<field>._` expects.
+    """
+
+    def unwrap(value):
+        return value._ if isinstance(value, JSONObject) else value
+
+    def defaults(is_stage: bool) -> dict:
+        data = {
+            "variables": JSONObject({}), "lists": JSONObject({}),
+            "broadcasts": JSONObject({}), "blocks": JSONObject({}),
+            "comments": JSONObject({}), "costumes": [], "sounds": [],
+            "currentCostume": 0, "volume": 100, "visible": True, "x": 0, "y": 0,
+            "size": 100, "direction": 90, "draggable": False,
+            "rotationStyle": "all around",
+        }
+        if is_stage:
+            data.update({"tempo": 60, "videoState": "off",
+                         "videoTransparency": 50, "textToSpeechLanguage": None})
+        return data
+
+    for index, target in enumerate(project.targets):
+        data = unwrap(target)
+        for key, value in defaults(bool(data.get("isStage"))).items():
+            data.setdefault(key, value)
+        if "layerOrder" not in data:
+            data["layerOrder"] = index
+        for asset in list(data.get("costumes") or []) + list(data.get("sounds") or []):
+            asset_data = unwrap(asset)
+            if isinstance(asset_data, dict) and not asset_data.get("md5ext"):
+                asset_data["md5ext"] = (
+                    f"{asset_data['assetId']}.{asset_data['dataFormat']}"
+                )
+        for block in (unwrap(data.get("blocks")) or {}).values():
+            block_data = unwrap(block)
+            if isinstance(block_data, dict):
+                block_data.setdefault("next", None)
+                block_data.setdefault("parent", None)
+                block_data.setdefault("inputs", JSONObject({}))
+                block_data.setdefault("fields", JSONObject({}))
+                block_data.setdefault("shadow", False)
+                block_data.setdefault("topLevel", False)
+
+
+def decompile(input: Path, output: Path) -> None:''',
+    ),
+)
+
+
+SB2GS_CASE_PATCHES = {
+    "syntax.py": (
+        (
+            '    # remove ugly leading and trailing underscores, and convert to lowercase\n'
+            '    # (in most cases, this converts to snake case)\n'
+            '    # any concerns with naming conflicts are solved at the end of the script, by\n'
+            '    # appending a number\n'
+            '    iden = iden.strip("_").lower()',
+            '    # remove ugly leading and trailing underscores, keeping the author\'s casing:\n'
+            '    # goboscript is case-sensitive and preserves what is written, so `drawLine`\n'
+            '    # stays `drawLine` instead of collapsing to `drawline`.\n'
+            '    # any concerns with naming conflicts are solved at the end of the script, by\n'
+            '    # appending a number\n'
+            '    iden = iden.strip("_")',
+        ),
+    ),
+    "decompile_events.py": (
+        (
+            """    # goboscript has no display label for a procedure, so the compiled block is
+    # named after the identifier emitted below. Only explain the name when the
+    # mangling actually hid something — dropped punctuation or case, as in
+    # `go to x: %s y: %s …` -> `go_to_x_y_dir_xorigin_yorigin`; a label that is just
+    # words (`DrawQuad %s …` -> `drawquad`) needs no note. The comment is a `//` line,
+    # which the gobo-agent build moves inside the body so the proc explains itself.
+    label = custom_blocks.get_name(custom)
+    identifier = syntax.identifier(label)
+    words = "".join(ch if ch.isalnum() or ch == "_" else " " for ch in label)
+    readable = "_".join(words.split()).strip("_").lower()
+    if identifier != readable or any(not (ch.isalnum() or ch in "_ \t") for ch in label):""",
+            """    # goboscript has no display label for a procedure, so the compiled block is
+    # named after the identifier emitted below. The argument placeholders and the
+    # `x: `/`worldX2: ` labels that announce them are dropped from the name
+    # (custom_blocks.get_name), leaving the block's own words and keeping the
+    # arguments' spelling from argumentnames. Explain the name only when the *name*
+    # itself was mangled — dropped punctuation or non-ASCII, not the classes
+    # whitespace/underscore collapse: a label that is only words (`DrawQuad %s` ->
+    # `DrawQuad`) needs no note. The comment is a `//` line, which the gobo-agent
+    # build moves inside the body so the proc explains itself.
+    label = custom_blocks.get_name(custom)
+    identifier = syntax.identifier(label)
+    words = "".join(ch if ch.isalnum() or ch == "_" else " " for ch in label)
+    readable = "_".join(words.split()).strip("_")
+    if identifier != readable or any(not (ch.isalnum() or ch in "_ \t") for ch in label):""",
+        ),
+        (
+            "def decompile_procedures_definition(ctx: Ctx, block: Block) -> None:\n"
+            "    custom = ctx.blocks[unwrap(inputs.block_id(block.inputs.custom_block))]\n"
+            "    args = json.loads(custom.mutation.argumentnames)",
+            "def decompile_procedures_definition(ctx: Ctx, block: Block) -> None:\n"
+            "    custom = ctx.blocks[unwrap(inputs.block_id(block.inputs.custom_block))]\n"
+            "    if getattr(custom.mutation, \"proccode\", \"\").startswith(\"//\"):\n"
+            "        # A `//` carrier definition: gobo-agent strips it when it builds, and\n"
+            "        # its calls come back as `//` comments (see SB2GS_COMMENT_PATCHES),\n"
+            "        # so declaring it here would only leave an unused proc.\n"
+            "        return\n"
+            "    args = json.loads(custom.mutation.argumentnames)",
+        ),
+    ),
+}
 
 
 # goboscript emits no `monitors` array, so monitor positions and slider modes are
@@ -1631,6 +1836,37 @@ def decompile_block(ctx: Ctx, block: Block) -> None:
         return
     signature = deepcopy(BLOCKS[block.opcode])""",
     ),
+    (
+        """    if isinstance(value, list) and value and value[0] in (4, 5, 6, 7, 8):
+        return syntax.scratch_number(value[1])
+    return None""",
+        """    if isinstance(value, list) and value and value[0] in (4, 5, 6, 7, 8):
+        return syntax.scratch_number(value[1])
+    if isinstance(value, list) and value and value[0] == 10:
+        # Scratch sometimes stores a typed costume number as a *string* primitive
+        # ("1", "255"); scratch-vm reads a numeric string as an index, so fold it.
+        try:
+            number = float(str(value[1]).strip())
+        except (TypeError, ValueError):
+            return None
+        return number if math.isfinite(number) else None
+    return None""",
+    ),
+    (
+        """    name = _indexed_name(getattr(ctx, "costumes", None), index)
+    if name is None:
+        return False
+    ctx.iprintln(keyword, " ", syntax.string(name), ";")
+    return True""",
+        """    name = _indexed_name(getattr(ctx, "costumes", None), index)
+    if name is None:
+        # A constant index no costume matches: scratch-vm leaves the costume alone,
+        # and emitting the number fails goboscript's "costume 'N' does not exist"
+        # check (projects use 255 to mean "no costume").
+        return True
+    ctx.iprintln(keyword, " ", syntax.string(name), ";")
+    return True""",
+    ),
 )
 
 
@@ -1804,7 +2040,9 @@ def install_sb2gs(force: bool = False, offline: bool = False) -> None:
     # Coerce arithmetic operands and fold constant costume/backdrop switches (see
     # SB2GS_NUMBER_PATCHES / SB2GS_SWITCH_FOLD_PATCHES).
     for filename, patches in (("decompile_input.py", SB2GS_NUMBER_PATCHES),
-                              ("decompile_stmt.py", SB2GS_SWITCH_FOLD_PATCHES)):
+                              ("decompile_stmt.py", SB2GS_SWITCH_FOLD_PATCHES),
+                              ("decompile_stmt.py", SB2GS_COMMENT_PATCHES),
+                              ("decompile_expr.py", SB2GS_TW_DETECTION_PATCHES)):
         target = source / "sb2gs" / filename
         if target.is_file():
             text = target.read_text(encoding="utf-8")
@@ -1812,6 +2050,17 @@ def install_sb2gs(force: bool = False, offline: bool = False) -> None:
                 if old in text:
                     text = text.replace(old, new, 1)
             target.write_text(text, encoding="utf-8")
+    # Keep the author's casing / handle `//` carriers (see SB2GS_CASE_PATCHES).
+    for filename, patches in (list(SB2GS_CASE_PATCHES.items())
+                              + [("decompile.py", SB2GS_DEFAULTS_PATCHES)]):
+        target = source / "sb2gs" / filename
+        if not target.is_file():
+            continue
+        text = target.read_text(encoding="utf-8")
+        for old, new in patches:
+            if old in text:
+                text = text.replace(old, new, 1)
+        target.write_text(text, encoding="utf-8")
     syn = source / "sb2gs" / "syntax.py"
     if syn.is_file():
         text = syn.read_text(encoding="utf-8")

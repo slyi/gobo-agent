@@ -211,6 +211,12 @@ Conversion is best-effort: some projects do not decompile. Always `goboscript
 build` the result before trusting it. sb2gs needs Python 3.14+ (the Windows
 portable is 3.14).
 
+A project that was itself built by gobo-agent carries its `//` notes as calls to a
+carrier proc whose definition was stripped; sb2gs decompiles them back to `// note`
+lines. `sb2gs --verify` then reports a failure (it runs plain goboscript, which
+rejects `//` by design) — that is expected, and not a conversion error. Build such a
+project with `gsdev build`, which carries the notes through, and check with `run`.
+
 An `--id` import also writes `provenance.json` at the project root (title,
 author/username, project id, release date, instructions, notes and credits,
 source and author URLs, retrieval time) so the original work stays credited — see
@@ -218,11 +224,13 @@ source and author URLs, retrieval time) so the original work stays credited — 
 metadata, so no file is written.
 
 Names change during conversion. The compiled project uses goboscript **identifiers**,
-not the Scratch names: goboscript lowercases a name, strips leading **and** trailing
-`_`, maps whitespace/`.`/`-`/`:` to `_`, drops any other symbol, and appends `_`/a
-number to avoid a keyword or a collision (gobo-agent also renames a variable/list
-name clash, e.g. `x` → `x_list`). So Scratch `Render._stickman` is `Render.stickman`
-after import. When poking live values (`set`/`set_batch`) or reading with `get`, use
+not the Scratch names. **sb2gs** applies the normalisation on import: whitespace/`.`/`-`/`:`
+become `_`, any other symbol is dropped, leading **and** trailing `_` is stripped, and
+`_`/a number is appended to avoid a keyword or a collision (gobo-agent also renames a
+variable/list name clash, e.g. `x` → `x_list`) — but the author's **casing is kept**
+(goboscript is case-sensitive and preserves what is written), so `camelCase` names and
+`xOrigin: %s` argument names stay as written. So Scratch `Render._stickman` is
+`Render.stickman` after import, while `gridY2` stays `gridY2`. When poking live values (`set`/`set_batch`) or reading with `get`, use
 the compiled name — find it with `inspect`/`props` or from the decompiled `.gs`
 (the "gobo-agent patches" list below is where such renames are explained).
 
@@ -372,25 +380,24 @@ at someone else's checkout would produce).
   Checked at the helper: `number(float("inf"))` → `(1 / 0)`, `value("Infinity")` →
   `(1 / 0)`, finite numbers unchanged.
 - **Procedure names (block labels)** — goboscript has no display label for a custom
-  block: the proc *name* **is** the compiled block label, so a Scratch label has to
-  become an identifier, and it is mangled. `custom_blocks.get_name` first drops the
-  `%s`/`%b` placeholders, then `syntax.identifier` maps every run of `[\s.\-:]` to
-  `_`, removes anything outside `[A-Za-z0-9_]`, lowercases and strips outer
-  underscores; argument names mangle the same way. So
-  `go to x: %s y: %s dir: %s xOrigin: %s yOrigin: %s` becomes
-  `go_to_x_y_dir_xorigin_yorigin` (the colon belongs to the whitespace class, so each
-  `x:  ` run collapses to a single `_`), with arguments `x, y, dir, xo, yo`; that is
-  `Render.go_to_x_y_dir_xorigin_yorigin` as a selector (1110356115). The patch notes
-  the original label as a `//` comment above the definition, but only when the mangling
-  actually hid something — dropped punctuation, case or non-ASCII — as in
-  `// go to x: %s y: %s dir: %s xOrigin: %s yOrigin: %s` above
-  `proc go_to_x_y_dir_xorigin_yorigin x, y, dir, xo, yo {`; a label that is only words
-  (`DrawQuad %s …` → `drawquad`) gets no note, since it reads fine. The build moves the
-  note inside the body, so the compiled proc's first block is that `//` text and the
-  name explains itself (9 of 1110356115's 32 procs — the ones with punctuation — and it
-  builds and runs at 30 fps with 0 errors). It is **not idempotent**: the built
-  project's label is regenerated as `<name> x: %s y: …`, so re-importing the *built*
-  sb3 yields a longer name (`go_to_x_y_dir_xorigin_yorigin_x_y_dir_xo_yo`).
+  block: the proc *name* **is** the compiled block label, so a Scratch label has to become
+  an identifier. `custom_blocks.get_name` drops each argument placeholder together with the
+  label text that announces it (`x: %s`, `worldX2: %s`) — and only that — so the name is the
+  block's own words; `syntax.identifier` then maps runs of `[\s.\-:]` to `_`, removes
+  anything outside `[A-Za-z0-9_]`, strips outer underscores and keeps the author's case.
+  Arguments are emitted from the mutation's **argumentnames**, so they keep their spelling
+  too. So the label `go to x: %s y: %s dir: %s xOrigin: %s yOrigin: %s` with argumentnames
+  `x, y, dir, xO, yO` becomes `proc go_to x2, y2, dir, xO, yO {` — the `2` suffixes are
+  collision numbering (`x`/`y` are already identifiers elsewhere in that project, since a
+  parameter cannot shadow one), and its argument names really are `xO`/`yO` even though the
+  label prose says `xOrigin:` — i.e. selector `Render.go_to` (1110356115). The patch notes
+  the original label as a `//` comment above the definition, but only when the *name* itself
+  was mangled — dropped punctuation or non-ASCII, `refresh (special) %s` → `refresh_special`
+  — and a label that is only words (`DrawQuad %s` → `DrawQuad`) needs no note. The build
+  moves the note inside the body, so the compiled proc's first block is that `//` text.
+  This is **idempotent**: the built project's label is regenerated as `go_to x: %s y: %s …`,
+  and re-importing that sb3 yields `go_to` again (the extra `x: `/`y: ` labels are dropped
+  on the way in).
 - **Comments that must stay visible in the editor** — `#` comments are compile-time
   only, so they never reach the Scratch editor, and a comment carrier cannot be
   *named* `//` or `#`: goboscript needs an identifier, `#` starts a comment and `/` is
@@ -416,6 +423,17 @@ at someone else's checkout would produce).
   gobo-agent build feature: `//` is not goboscript syntax, so a `.gs` containing it
   builds only through `gsdev` — plain `goboscript build` and the upstream VS Code
   extension flag it (the compiler itself is left alone).
+
+- **TurboWarp / forkphorus runtime detection** (`turbowarp_isCompiled`,
+  `turbowarp_isTurboWarp`, `forkphorus_is*`) — goboscript has no spelling for these
+  reporters (its `tw_is_compiled`/`tw_is_turbowarp` names are in the binary's table but
+  are rejected in source, and the docs list no TurboWarp reporter), and sb2gs used to
+  drop the block, leaving an empty condition that would not compile. sb2gs now writes a
+  marker string (`"__gsdev_tw_op_<opcode>__"`) and `gsdev build` rewrites the compiled
+  comparison back into the opcode (`gsdev.inject_tw_blocks`), so it survives the round
+  trip; in a value position the input is repointed at the re-created block. Through the
+  harness the built project holds the original opcode; a build without gobo-agent sees
+  only the marker (a false condition).
 
 **gobo-agent mitigations:** for large or known-problematic projects, download the
 `.sb3` in a browser and pass the local file (`gsdev sb2gs <file.sb3>`);

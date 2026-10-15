@@ -99,11 +99,24 @@ then strips that carrier's definition and relabels the calls, leaving an inert
 `// note` block the editor shows. A `//` inside a body stays where it is, whatever its
 indentation; a flush-left `//` directly above a proc/hat moves inside that body; any
 other top-level `//` (above `costumes`, a `var`/`list` declaration, end of file) is
-ignored. The source is restored byte-for-byte, and the only cost is the caller's own
+ignored. Converting such a project back with sb2gs yields those `// note` lines again
+(the carrier call has no definition to resolve), so `sb2gs --verify` — which runs plain
+goboscript — cannot check it: build it with `gsdev build`, which carries the notes.
+The source is restored byte-for-byte, and the only cost is the caller's own
 block dispatch — keep comment calls out of hot loops. This is a gobo-agent build
 feature (`gsdev`/`gsdev.ps1`): plain `goboscript build` and the upstream VS Code
 extension still see `//` as a syntax error, so such a `.gs` builds only through the
 harness.
+
+TurboWarp/forkphorus runtime-detection reporters (`turbowarp_isCompiled`,
+`turbowarp_isTurboWarp`, the `forkphorus_is*` family) have no goboscript spelling, so sb2gs
+writes a marker string where they were and `build` turns it back into the opcode
+(`gsdev.inject_tw_blocks`): in a boolean input goboscript compiles the marker to
+`<marker> == 1`, and that comparison is rewritten in place, so the enclosing condition
+holds the real reporter again. A converted `.gs` therefore reads
+`if "__gsdev_tw_op_turbowarp_isCompiled__" {`. Built through the harness the opcode
+round-trips exactly; built with plain `goboscript` the marker is just a false condition
+(in a value position, the marker text).
 
 ## Ground rules
 
@@ -260,10 +273,12 @@ execution stays in the harness. It is not required by end users.
 
 Selectors are `sprite.variable`, `sprite.list[index]` (1-based), a bare name (Stage
 global), or `sprite#N` clones (indices stable only within a frame). Names are the
-**compiled** goboscript identifiers, not the original Scratch names: goboscript
-lowercases them, strips leading/trailing `_`, maps whitespace/`.`/`-`/`:` to `_`, drops
-other symbols, and appends `_`/a number to dodge a keyword or collision — so
-`Render._stickman` becomes `Render.stickman`. Discover the real names with
+**compiled** goboscript identifiers, not the original Scratch names. **sb2gs** applies the
+normalisation on import — whitespace/`.`/`-`/`:` become `_`, other symbols are dropped,
+outer `_` is stripped, and `_`/a number is appended to dodge a keyword or collision —
+while **keeping the author's casing** (goboscript is case-sensitive and preserves what is
+written, so `camelCase` stays `camelCase`), which is why `Render._stickman` becomes
+`Render.stickman` but `gridY2` stays `gridY2`. Discover the real names with
 `inspect`/`props`/`clones`. A leading `@` selects a harness metric, not a project
 variable. Quote `@` selectors in PowerShell.
 

@@ -1650,6 +1650,114 @@ def resolve_mode(args=None) -> str:
     return mode if mode in MODE_MACROS else "debug"
 
 
+# TurboWarp/forkphorus runtime-detection reporters have no goboscript spelling, so
+# sb2gs writes this marker string where they were (see SB2GS_TW_DETECTION_PATCHES in
+# bootstrap.py); the build turns it back into the original opcode.
+TW_MARKER_PREFIX = "__gsdev_tw_op_"
+TW_MARKER_SUFFIX = "__"
+
+
+def _tw_marker_opcode(value: object) -> str | None:
+    """The opcode a marker string names, if `value` is one."""
+    if (isinstance(value, str) and value.startswith(TW_MARKER_PREFIX)
+            and value.endswith(TW_MARKER_SUFFIX)):
+        return value[len(TW_MARKER_PREFIX):-len(TW_MARKER_SUFFIX)] or None
+    return None
+
+
+def _tw_marker_in_input(value: object) -> str | None:
+    """The opcode of a marker inside one block input.
+
+    Covers a literal shadow (`[1, [10, "<marker>"]]`) and a `[3, block, fallback]`
+    input, so both boolean and any/number/string positions are found.
+    """
+    if not isinstance(value, list) or len(value) < 2:
+        return None
+    payload = value[1]
+    if isinstance(payload, list) and len(payload) >= 2:
+        found = _tw_marker_opcode(payload[1])
+        if found:
+            return found
+    if len(value) >= 3:
+        return _tw_marker_in_input(value[2])
+    return None
+
+
+def inject_tw_blocks(sb3_path: Path, root: Path) -> None:
+    """Turn marker placeholders in a built sb3 back into the TW detection reporters.
+
+    goboscript has no syntax for `turbowarp_isCompiled` / `turbowarp_isTurboWarp` (nor
+    the forkphorus equivalents), so sb2gs emits the marked string constant
+    `"__gsdev_tw_op_<opcode>__"` in its place. In a boolean input goboscript compiles
+    that to `<marker> == 1`, so the marker ends up inside a real `operator_equals`
+    block: mutating that block into the original opcode keeps the wiring, so the
+    enclosing condition holds the reporter again. In an any/number/string input the
+    marker stays a shadow string, so the input is repointed at a new block instead.
+    Best-effort and a no-op when no marker is present; runs after the build, like
+    `inject_monitors`.
+    """
+    try:
+        with zipfile.ZipFile(sb3_path) as archive:
+            project = json.loads(archive.read("project.json"))
+            members = [
+                (name, archive.read(name))
+                for name in archive.namelist()
+                if name != "project.json"
+            ]
+    except (OSError, ValueError, zipfile.BadZipFile):
+        return
+    changed = False
+    created = 0
+    for target in project.get("targets", []):
+        blocks = target.get("blocks")
+        if not isinstance(blocks, dict):
+            continue
+        for block_id, block in list(blocks.items()):
+            if not isinstance(block, dict):
+                continue
+            inputs = block.get("inputs")
+            if not isinstance(inputs, dict):
+                continue
+            if block.get("opcode") == "operator_equals":
+                opcode = None
+                for value in inputs.values():
+                    opcode = _tw_marker_in_input(value)
+                    if opcode:
+                        break
+                if opcode:
+                    block["opcode"] = opcode
+                    block["inputs"] = {}
+                    block["fields"] = {}
+                    changed = True
+                    continue
+            for name, value in list(inputs.items()):
+                opcode = _tw_marker_in_input(value)
+                if not opcode:
+                    continue
+                created += 1
+                new_id = f"gsdevtw{created}"
+                blocks[new_id] = {
+                    "opcode": opcode, "next": None, "parent": block_id,
+                    "inputs": {}, "fields": {}, "shadow": False, "topLevel": False,
+                }
+                inputs[name] = [2, new_id] if value[0] == 1 else [3, new_id, [10, ""]]
+                changed = True
+    if not changed:
+        return
+    tmp = sb3_path.with_name(sb3_path.name + ".tmp")
+    try:
+        with zipfile.ZipFile(tmp, "w", zipfile.ZIP_DEFLATED) as archive:
+            archive.writestr("project.json", json.dumps(project, ensure_ascii=False))
+            for name, data in members:
+                archive.writestr(name, data)
+        os.replace(tmp, sb3_path)
+    except OSError:
+        try:
+            tmp.unlink()
+        except OSError:
+            pass
+
+
 def inject_monitors(sb3_path: Path, root: Path) -> None:
     """Re-inject the source project's monitors into a built sb3.
 
@@ -2509,6 +2617,7 @@ def build_project_at(root: Path, mode: str = "debug") -> Path:
     inject_comments(sb3_path)
     inject_monitors(sb3_path, root)
     inject_costumes(sb3_path, root)
+    inject_tw_blocks(sb3_path, root)
     return sb3_path
 
 
