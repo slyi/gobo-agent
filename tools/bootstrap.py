@@ -1486,6 +1486,90 @@ def decompile(input: Path, output: Path) -> None:''',
 )
 
 
+# Scratch resolves a variable/list reference by the id in its `[name, id]` field, but
+# sb2gs emitted the field's *text*. When that text is stale (a variable renamed in the
+# editor, or `@`-prefixed by the author's compiler) the declaration and the references
+# disagreed and `syntax.identifier`'s collision cache renamed one of them, so the build
+# failed with "unrecognized variable" (project 1103811570: `deltaTime2` in Controls).
+# Record every declared name by id and resolve references through it. Applied to the
+# installed sb2gs (syntax.py, decompile.py, decompile_expr.py, decompile_stmt.py,
+# decompile_input.py).
+SB2GS_ID_RESOLUTION_PATCHES = {
+    "syntax.py": (
+        (
+            "def identifier(og: str) -> str:",
+            "NAMES_BY_ID: dict[str, str] = {}\n"
+            "\n"
+            "\n"
+            "def declared_name(field):\n"
+            "    # The declared name for a `[name, id]` variable/list field.\n"
+            "    # Scratch resolves a reference by id; the field text can be stale (a\n"
+            "    # variable renamed in the editor, or prefixed by the author's compiler as in\n"
+            "    # `@deltaTime`). sb2gs used the text for references but the table name for\n"
+            "    # the declaration, so one variable could get two identifiers (`deltaTime`\n"
+            "    # and `deltaTime2`) and the build failed with \"unrecognized variable\".\n"
+            "    # The id wins; the text is a fallback for an id in no table.\n"
+            "    if isinstance(field, list) and len(field) >= 2:\n"
+            "        return NAMES_BY_ID.get(field[1], field[0])\n"
+            "    return field\n"
+            "\n"
+            "\n"
+            "def identifier(og: str) -> str:",
+        ),
+    ),
+    "decompile.py": (
+        (
+            "        project = json.load(f, object_hook=JSONObject)",
+            "        project = json.load(f, object_hook=JSONObject)\n"
+            "        remember_names(project)",
+        ),
+        (
+            "def decompile(input: Path, output: Path) -> None:",
+            "def remember_names(project: JSONObject) -> None:\n"
+            "    # Record every declared variable/list name by id (Scratch keys on id).\n"
+            "    from . import syntax\n"
+            "\n"
+            "    syntax.NAMES_BY_ID.clear()\n"
+            "    for target in project.targets:\n"
+            "        raw = target._\n"
+            "        for table in (\"variables\", \"lists\"):\n"
+            "            entries = raw.get(table)\n"
+            "            entries = entries._ if hasattr(entries, \"_\") else entries\n"
+            "            for vid, entry in (entries or {}).items():\n"
+            "                syntax.NAMES_BY_ID[vid] = entry[0]\n"
+            "\n"
+            "\n"
+            "def decompile(input: Path, output: Path) -> None:",
+        ),
+    ),
+    "decompile_expr.py": (
+        (
+            "syntax.identifier(block.fields.LIST[0])",
+            "syntax.identifier(syntax.declared_name(block.fields.LIST))",
+        ),
+    ),
+    "decompile_stmt.py": (
+        (
+            "syntax.identifier(block.fields.VARIABLE[0])",
+            "syntax.identifier(syntax.declared_name(block.fields.VARIABLE))",
+        ),
+        (
+            "syntax.identifier(block.fields.LIST[0])",
+            "syntax.identifier(syntax.declared_name(block.fields.LIST))",
+        ),
+    ),
+    "decompile_input.py": (
+        (
+            "    if input_type in {InputType.VAR, InputType.LIST}:\n"
+            "        ctx.print(syntax.identifier(input_value))",
+            "    if input_type in {InputType.VAR, InputType.LIST}:\n"
+            "        declared = input[1][2] if len(input[1]) > 2 else None\n"
+            "        ctx.print(syntax.identifier(syntax.NAMES_BY_ID.get(declared, input_value)))",
+        ),
+    ),
+}
+
+
 SB2GS_CASE_PATCHES = {
     "syntax.py": (
         (
@@ -2050,6 +2134,16 @@ def install_sb2gs(force: bool = False, offline: bool = False) -> None:
                 if old in text:
                     text = text.replace(old, new, 1)
             target.write_text(text, encoding="utf-8")
+    # Resolve variable/list references by id (see SB2GS_ID_RESOLUTION_PATCHES).
+    for filename, pairs in SB2GS_ID_RESOLUTION_PATCHES.items():
+        target = source / "sb2gs" / filename
+        if not target.is_file():
+            continue
+        text = target.read_text(encoding="utf-8")
+        for old, new in pairs:
+            text = text.replace(old, new)
+        target.write_text(text, encoding="utf-8")
+
     # Keep the author's casing / handle `//` carriers (see SB2GS_CASE_PATCHES).
     for filename, patches in (list(SB2GS_CASE_PATCHES.items())
                               + [("decompile.py", SB2GS_DEFAULTS_PATCHES)]):

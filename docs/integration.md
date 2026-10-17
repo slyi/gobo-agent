@@ -435,6 +435,15 @@ at someone else's checkout would produce).
   harness the built project holds the original opcode; a build without gobo-agent sees
   only the marker (a false condition).
 
+- **Variable/list references vs stale field text** — Scratch resolves a variable or list
+  by the **id** in a block's `[name, id]` field, but sb2gs emitted the field's *text*. When
+  that text is stale (a variable renamed in the editor, or prefixed by the author's own
+  compiler, as in `@deltaTime`), the declaration and the references disagreed and the
+  identifier cache renamed one side (`deltaTime` vs `deltaTime2`), so the build failed
+  with "unrecognized variable" (project 1103811570). gobo-agent records every declared
+  name by id (`syntax.NAMES_BY_ID`) and resolves references through it, falling back to
+  the text only for an id that is in no table.
+
 **gobo-agent mitigations:** for large or known-problematic projects, download the
 `.sb3` in a browser and pass the local file (`gsdev sb2gs <file.sb3>`);
 `gsdev sb2gs` bounds the run and cleans partial `.sb3`/output on failure.

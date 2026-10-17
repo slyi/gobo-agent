@@ -356,13 +356,21 @@ BRIDGE_JS = r"""
     // Readiness wait: the page's own project is in place (the same predicate the
     // CLI used to poll for), evaluated once per VM step.
     waitReady: (timeoutMs) => new Promise(finish => {
+      // The project counts as ready once the page has targets, or once its own load
+      // event fired. Do NOT wait for a VM step: a player page that has not been
+      // green-flagged (scratch.mit.edu/embed) never steps, so the step-driven waiter
+      // would time out with the project sitting there. A page-side timer covers that.
       const read = () => (rt.targets.length >= 2) || st.projectLoaded > 0;
-      const test = value => !!value;
-      if (test(read())) return finish({ ok: true, ready: true, frame: st.frame });
-      st.waiters.push({
-        read, test, deadline: performance.now() + (timeoutMs || 20000),
-        resolve: r => finish({ ok: !!r.ok, frame: st.frame }),
-      });
+      if (read()) return finish({ ok: true, ready: true, frame: st.frame });
+      const deadline = performance.now() + (timeoutMs || 20000);
+      const tick = () => {
+        if (read()) return finish({ ok: true, ready: true, frame: st.frame });
+        if (performance.now() >= deadline) {
+          return finish({ ok: false, ready: false, frame: st.frame, timeout: true });
+        }
+        setTimeout(tick, 100);
+      };
+      setTimeout(tick, 100);
     }),
     waitFrames: (count, timeoutMs) => new Promise(finish => {
       const target = st.frame + Math.max(0, count | 0);
@@ -752,14 +760,24 @@ def inject_bridge(cdp, timeout: float = 30.0) -> bool:
     Installing is synchronous, so one evaluate suffices; readiness is then the page's
     own per-step predicate via waitReady(), never a CLI polling loop.
     """
-    try:
-        if not cdp.evaluate(BOOT_WAIT_JS, timeout=10):
+    # The page mounts its VM on its own schedule (React/scratch-gui, notably on
+    # scratch.mit.edu), so install once and retry until the VM is reachable, bounded by
+    # `timeout`. There is no event for "React mounted", so this is a short bounded poll,
+    # not a state wait: readiness itself stays event-driven below.
+    deadline = time.monotonic() + timeout
+    while True:
+        try:
+            if cdp.evaluate(BOOT_WAIT_JS, timeout=10):
+                break
             cdp.evaluate(PROFILER_JS, timeout=10)
             cdp.evaluate(BRIDGE_JS, timeout=10)
-            if not cdp.evaluate(BOOT_WAIT_JS, timeout=10):
-                return False
-    except (CDPError, TimeoutError, OSError):
-        return False
+            if cdp.evaluate(BOOT_WAIT_JS, timeout=10):
+                break
+        except (CDPError, TimeoutError, OSError):
+            pass
+        if time.monotonic() >= deadline:
+            return False
+        time.sleep(0.2)
     try:
         result = cdp.evaluate(
             f"window.__bridge.waitReady({int(timeout * 1000)})",
@@ -1018,7 +1036,11 @@ def cmd_run(args) -> int:
     try:
         cdp.evaluate(f"window.__bridgeSession = {json.dumps(token)}")
         if not inject_bridge(cdp, timeout=args.ready_timeout):
-            log("WARNING: bridge not installed (no VM found?)")
+            raise SystemExit(
+                "could not install the bridge: the page exposes no reachable scratch VM "
+                "within the ready budget (is the project still loading? raise "
+                "--ready-timeout)"
+            )
         info = cdp.evaluate(STATE_JS)
         log({"target": args.target, "url": info.get("origin"), "bridge": info.get("bridge")})
 
