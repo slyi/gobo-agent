@@ -62,6 +62,7 @@ mode, or `close` it first rather than starting a second browser.
 | Repeatable test from reloaded state | `test FILE --headless --json` |
 | Find expensive procedures, keep execution | `profile --no-reload --no-restart --seconds 2 --no-follow --leave-running`, then `setprofiling off` |
 | Capture a freshly loaded image | `screenshot --no-build` (skips compile but reloads/stops the project) |
+| Capture what is on screen now | `screenshot --no-reload` — no build, no load, project keeps running |
 | Check Scratch size/memory fit | `preflight` — offline scan (no browser); `--sb3 FILE`, `--json`, `--strict` |
 | End project execution | `stop` — host stays available |
 | Re-run the green flag after it went idle | `restart` — warm host, no reload |
@@ -76,6 +77,35 @@ change, or a lifecycle test; otherwise use warm iteration. Keep independent host
 explicit ports;
 `--port 0` remembers its choice. A warm host in the wrong headed/headless mode must be
 closed or moved; inspect conflicts, never kill unrelated listeners.
+
+`screenshot --no-reload` is the live counterpart to the default: it captures the warm
+host's current canvas and touches nothing (the default path builds, loads, then stops the
+project). Use it for a state you deliberately set up — a pinned camera, a `set` value, a
+paused frame — and note that a live frame is only as reproducible as the project's own
+state.
+
+## When the shell is sandboxed: the MCP server
+
+A harness that confines shell tools (a container, a restricted token, an AppContainer)
+blocks the browser: `gsdev run` builds, then Chromium exits at startup
+(`OpenProcess: Access is denied`). The confinement covers the tool's process tree, so no
+`gsdev` flag fixes it.
+
+`tools/gobo_mcp.py` exposes the harness as **MCP tools** instead. Its stdio process is
+spawned by the MCP *host*, not by a sandboxed tool call, so `gsdev` runs in the host's
+process tree and the browser launches normally. It serves the full `gsdev` verb surface
+(`gobo_run`, `gobo_gsdev`, `gobo_screenshot`, `gobo_session`, `gobo_doctor`,
+`gobo_close`) and `gsbridge`'s (`gobo_gsbridge`), plus a `gobo://status` resource. Every
+tool takes a `project` (relative to the server root) and applies the same allowlist,
+project containment, timeouts and output cap as the CLI.
+
+Register it with `@deepseek-ai/dsh-mcp-client` from
+[`tools/gobo-mcp.patch.yml`](tools/gobo-mcp.patch.yml): append the entry — inside an
+`insert:` list, because a bare entry with a new id is silently ignored — to the profile's
+`cordis.patch.yml`, then restart the client. Tools appear as `mcp__gobo__*`.
+
+The server runs on stdio by default; `--http HOST:PORT` serves MCP Streamable HTTP at
+`/mcp`. `python tools/test_gobo_mcp.py` checks both transports without a browser.
 
 ## Debug and release builds
 
