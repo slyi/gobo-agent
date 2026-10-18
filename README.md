@@ -157,6 +157,26 @@ the current window, no restart), or `code --install-extension …`. Maintainers 
 it with `npx @vscode/vsce package`. Step-by-step use and troubleshooting are in
 [`vscode-extension/README.md`](vscode-extension/README.md).
 
+### MCP server
+
+`tools/gobo_mcp.py` exposes the harness as **MCP tools** (`gobo_run`, `gobo_gsdev`,
+`gobo_screenshot`, `gobo_session`, `gobo_doctor`, `gobo_close`, `gobo_gsbridge`, plus a
+`gobo://status` resource). A stdio MCP server is spawned by the harness host rather than
+by a sandboxed shell tool, so a `gobo_run` call can launch the browser normally.
+`gobo_gsbridge` runs the same verbs against a live Scratch page (`--target production
+--project-id N` for the real embed, or `editor` / `github` / `localhost`).
+
+```sh
+python tools/gobo_mcp.py                        # stdio transport
+python tools/gobo_mcp.py --http 127.0.0.1:8770  # MCP Streamable HTTP at /mcp
+```
+
+Register it with the `@deepseek-ai/dsh-mcp-client` entry in
+[`tools/gobo-mcp.patch.yml`](tools/gobo-mcp.patch.yml) (append it to the profile's
+`cordis.patch.yml`, then restart the client); tools appear as `mcp__gobo__*`. The
+allowlist, project containment and timeouts match the CLI's, and
+`python tools/test_gobo_mcp.py` checks both transports without a browser.
+
 For language editing, the upstream **`aspizu.goboscript`** extension adds syntax, snippets,
 build-on-save diagnostics, and a `.sb3` **preview**. It has **no debugger** — don't press
 F5/Run‑Debug; build with gobo-agent and open the built `.sb3` for its preview (▶/⏹/⟳ live in
@@ -241,6 +261,7 @@ tools\gsdev.ps1 profile --seconds 2 --headless --json debug/profile.json  # see 
 
 ```powershell
 tools\gsdev.ps1 screenshot --headless --out debug/frame.png
+tools\gsdev.ps1 screenshot --no-reload --out debug/live.png   # capture the warm host, keep it running
 tools\gsdev.ps1 pixel 0 0
 ```
 

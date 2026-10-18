@@ -1,0 +1,37 @@
+# gobo-agent as MCP tools for DeepSeek Harness (or any MCP client).
+#
+# Append to %USERPROFILE%\.dsh\profiles\desktop\cordis.patch.yml, then restart
+# the app. A *new* plugin must go in an `insert:` list — a bare entry for an id
+# that already exists is a config override, and a bare entry with a new id is
+# silently ignored (verified with `dsh --dump-config`).
+#
+# The tools appear as mcp__gobo__*. Replace <python> and <repo> with absolute
+# paths (forward slashes are fine in YAML).
+
+# --- stdio (recommended) ---------------------------------------------------
+- insert:
+    - id: mcp-gobo
+      name: '@deepseek-ai/dsh-mcp-client'
+      config:
+        serverName: gobo
+        transport: stdio
+        command: '<python>'
+        args: ['<repo>/tools/gobo_mcp.py', '--root', '<repo>']
+        cwd: '<repo>'
+        # A `test` or a long session can exceed the 60s default.
+        toolCallTimeoutMs: 900000
+        failOnStartupError: false
+
+# --- Streamable HTTP (alternative) -----------------------------------------
+# Start the server yourself, outside the harness, so it keeps running:
+#     <python> <repo>/tools/gobo_mcp.py --root <repo> --http 127.0.0.1:8770
+# and insert the endpoint instead of the stdio entry above:
+#
+# - insert:
+#     - id: mcp-gobo-http
+#       name: '@deepseek-ai/dsh-mcp-client'
+#       config:
+#         serverName: gobo
+#         transport: streamable-http
+#         url: 'http://127.0.0.1:8770/mcp'
+#         toolCallTimeoutMs: 900000

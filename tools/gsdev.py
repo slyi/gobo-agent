@@ -2724,12 +2724,35 @@ def cmd_run(args: argparse.Namespace) -> int:
 
 def cmd_screenshot(args: argparse.Namespace) -> int:
     ensure_dependencies(need_bundles=True)
-    if not getattr(args, "sb3", "") and not args.no_build:
-        build_project(resolve_mode(args))
-    artifact = artifact_path(args)
     out_path = Path(args.out).expanduser() if args.out else DEBUG_DIR / "stage.png"
     if not out_path.is_absolute():
         out_path = PROJECT_ROOT / out_path
+    if getattr(args, "no_reload", False):
+        # Capture whatever the warm host is showing right now. No build, no
+        # load, and the project keeps running: this is the live-tuning
+        # counterpart to the default reload-and-wait capture.
+        cdp = open_host(args.port)
+        if cdp is None:
+            raise SystemExit(
+                "no running host to capture; start one with `run --leave-running`, "
+                "or drop --no-reload for a fresh load")
+        try:
+            time.sleep(max(0, args.delay) / 1000.0)
+            rect = host_stage_rect(cdp)
+            data = cdp.call(
+                "Page.captureScreenshot",
+                {"format": "png", "clip": {**rect, "scale": 1}},
+                timeout=20,
+            )
+            out_path.parent.mkdir(parents=True, exist_ok=True)
+            out_path.write_bytes(base64.b64decode(data["data"]))
+            log(f"screenshot (live): {out_path} ({int(rect['width'])}x{int(rect['height'])})")
+        finally:
+            cdp.close()
+        return 0
+    if not getattr(args, "sb3", "") and not args.no_build:
+        build_project(resolve_mode(args))
+    artifact = artifact_path(args)
     cdp, _ = ensure_host(args.port, args.headless, args.software)
     dismiss_browser_dialogs(args.port)
     apply_cpu_throttle(cdp, getattr(args, "cpu", 0.0))
@@ -6165,6 +6188,9 @@ def build_parser() -> argparse.ArgumentParser:
     add_cpu(shot)
     add_mode(shot)
     shot.add_argument("--no-build", action="store_true", help="skip goboscript build")
+    shot.add_argument("--no-reload", action="store_true",
+                      help="capture the running project instead of loading it (skips the build; "
+                           "leaves the host and project running)")
     shot.add_argument("--sb3", default="", help="load this sb3 instead of building")
     shot.add_argument("--out", default="", help="output path (default debug/stage.png)")
     shot.add_argument("--delay", type=int, default=1200, help="wait before capture in ms")
