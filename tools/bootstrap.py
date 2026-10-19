@@ -100,6 +100,12 @@ SB2GS_COMMIT = "8cb5dabdb5ffaa42209643469d1a53722ac762aa"
 SB2GS_ZIP_URL = f"https://github.com/aspizu/sb2gs/archive/{SB2GS_COMMIT}.zip"
 SB2GS_ZIP_SHA256 = "53a6e562244fbeae6cae4bf2f1c17b8c3ff9366e4c6a97769525db3084532d14"
 
+# Bump this whenever the SB2GS_* patch set changes. The shared install records
+# it, so an older checkout (an adopted project's runtime copy, say) cannot
+# silently downgrade a newer machine-wide install: install_sb2gs refuses unless
+# --force is given. The patcher hash still detects same-version drift.
+SB2GS_PATCH_VERSION = 1
+
 # name -> (filename, url, sha256); all universal (py3-none-any) wheels.
 SB2GS_WHEELS = {
     "httpx": ("httpx-0.28.1-py3-none-any.whl",
@@ -640,6 +646,16 @@ def sb2gs_present() -> bool:
         and sb2gs_run_py().is_file()
         and sb2gs_marker().is_file()
     )
+
+
+def sb2gs_patch_version() -> int | None:
+    """The patch-set version recorded by the shared sb2gs install, if any."""
+    try:
+        recorded = json.loads(sb2gs_marker().read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return None
+    version = recorded.get("patchVersion")
+    return version if isinstance(version, int) else None
 
 
 def _sb2gs_pillow_key() -> str | None:
@@ -1421,6 +1437,61 @@ SB2GS_TW_DETECTION_PATCHES = (
 )
 
 
+# A custom-block argument reporter whose name no enclosing definition declares
+# (`argument_reporter_boolean` / `argument_reporter_string_number`) is dangling:
+# Scratch still runs it and reads an empty value (false in a boolean input), but
+# sb2gs emitted `$name` unconditionally, and goboscript rejects that as an
+# unknown local, so the whole import failed to build. Track the definition's
+# parameters while its body is decompiled and emit the value Scratch sees when
+# the name is out of scope. Applied to the installed sb2gs (decompile_sprite.py
+# for the Ctx field, decompile_events.py for the scope, decompile_expr.py for
+# the fallback).
+SB2GS_ARG_REPORTER_PATCHES = {
+    "decompile_sprite.py": (
+        (
+            """        self.assets: dict[str, str] = assets""",
+            """        self.assets: dict[str, str] = assets
+        # Custom-block argument names in scope; see SB2GS_ARG_REPORTER_PATCHES.
+        self.params: set[str] = set()""",
+        ),
+    ),
+    "decompile_events.py": (
+        (
+            """    if args:
+        ctx.print(" ")
+        ctx.commasep(args, lambda arg: ctx.print(syntax.identifier(arg)))
+    ctx.print(" ")
+    decompile_stack(ctx, block.next)""",
+            """    if args:
+        ctx.print(" ")
+        ctx.commasep(args, lambda arg: ctx.print(syntax.identifier(arg)))
+    ctx.print(" ")
+    saved_params = ctx.params
+    ctx.params = {syntax.identifier(arg) for arg in args}
+    try:
+        decompile_stack(ctx, block.next)
+    finally:
+        ctx.params = saved_params""",
+        ),
+    ),
+    "decompile_expr.py": (
+        (
+            """def decompile_argument_reporter_string_number(ctx: Ctx, block: Block) -> None:
+    ctx.print("$", syntax.identifier(block.fields.VALUE[0]))""",
+            """def decompile_argument_reporter_string_number(ctx: Ctx, block: Block) -> None:
+    name = syntax.identifier(block.fields.VALUE[0])
+    if name not in ctx.params:
+        # A dangling reporter (no enclosing definition declares it): Scratch
+        # reads it as empty, so emit that rather than `$name`, which
+        # goboscript rejects as an unknown local.
+        ctx.print("0" if block.opcode.endswith("boolean") else '""')
+        return
+    ctx.print("$", name)""",
+        ),
+    ),
+}
+
+
 SB2GS_DEFAULTS_PATCHES = (
     (
         '        project = json.load(f, object_hook=JSONObject)',
@@ -1973,6 +2044,13 @@ def install_sb2gs(force: bool = False, offline: bool = False) -> None:
         # Detected, never used and never modified: the harness always runs its own
         # pinned, patched copy, so a user's install must not skip installing ours.
         _log(f"note: leaving {system} untouched; the harness uses its own sb2gs copy")
+    installed_version = sb2gs_patch_version()
+    if (installed_version is not None and installed_version > SB2GS_PATCH_VERSION
+            and not force):
+        raise SetupError(
+            f"the shared sb2gs install is patch set v{installed_version}, newer than "
+            f"this checkout's v{SB2GS_PATCH_VERSION}; run setup from an updated "
+            "gobo-agent checkout (or pass --force to overwrite it)")
     if sb2gs_present() and not force:
         try:
             recorded = json.loads(sb2gs_marker().read_text(encoding="utf-8"))
@@ -2126,7 +2204,10 @@ def install_sb2gs(force: bool = False, offline: bool = False) -> None:
     for filename, patches in (("decompile_input.py", SB2GS_NUMBER_PATCHES),
                               ("decompile_stmt.py", SB2GS_SWITCH_FOLD_PATCHES),
                               ("decompile_stmt.py", SB2GS_COMMENT_PATCHES),
-                              ("decompile_expr.py", SB2GS_TW_DETECTION_PATCHES)):
+                              ("decompile_expr.py", SB2GS_TW_DETECTION_PATCHES),
+                              ("decompile_expr.py", SB2GS_ARG_REPORTER_PATCHES["decompile_expr.py"]),
+                              ("decompile_events.py", SB2GS_ARG_REPORTER_PATCHES["decompile_events.py"]),
+                              ("decompile_sprite.py", SB2GS_ARG_REPORTER_PATCHES["decompile_sprite.py"])):
         target = source / "sb2gs" / filename
         if target.is_file():
             text = target.read_text(encoding="utf-8")
@@ -2195,7 +2276,8 @@ def install_sb2gs(force: bool = False, offline: bool = False) -> None:
     sb2gs_run_py().write_text(SB2GS_RUNNER, encoding="utf-8")
     sb2gs_marker().write_text(
         json.dumps(
-            {"commit": SB2GS_COMMIT, "patcher": _patcher_id(), "mode": mode,
+            {"commit": SB2GS_COMMIT, "patcher": _patcher_id(),
+             "patchVersion": SB2GS_PATCH_VERSION, "mode": mode,
              "pillow": key, "packages": sorted(SB2GS_WHEELS)},
             indent=2,
         ) + "\n",

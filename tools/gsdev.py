@@ -5168,7 +5168,18 @@ def cmd_doctor(args: argparse.Namespace) -> int:
     if system_sb2gs:
         ok("sb2gs", f"{system_sb2gs} (system)")
     elif bootstrap.sb2gs_present():
-        ok("sb2gs", str(bootstrap.sb2gs_source_dir()))
+        source = bootstrap.sb2gs_source_dir()
+        installed = bootstrap.sb2gs_patch_version()
+        if installed is None:
+            warn("sb2gs", f"{source} (install predates patch versioning; run setup)")
+        elif installed < bootstrap.SB2GS_PATCH_VERSION:
+            warn("sb2gs", f"{source} (patch v{installed}, behind this checkout's "
+                          f"v{bootstrap.SB2GS_PATCH_VERSION}; run setup)")
+        elif installed > bootstrap.SB2GS_PATCH_VERSION:
+            warn("sb2gs", f"{source} (patch v{installed}, newer than this checkout's "
+                          f"v{bootstrap.SB2GS_PATCH_VERSION}; update the checkout)")
+        else:
+            ok("sb2gs", str(source))
     elif sys.version_info[:2] < (3, 14):
         warn("sb2gs", f"needs Python 3.14+ (found {platform.python_version()})")
     else:

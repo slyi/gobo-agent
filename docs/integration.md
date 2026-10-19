@@ -250,7 +250,11 @@ own pinned, patched copy. The install records a patcher id, so a plain `gsdev se
 re-applies the patches after a commit that changes them (`--force` re-downloads even
 when they match), and `setup` refuses to write into a tools root that does not look
 like a gobo-agent install (which is what a mis-set `GSDEV_TOOLS`/`GSDEV_HOME` pointing
-at someone else's checkout would produce).
+at someone else's checkout would produce). It also records a **patch-set version**
+(`SB2GS_PATCH_VERSION`): `setup` refuses to let an older checkout — an adopted project's
+runtime copy, say — replace a newer shared install unless `--force` is given, and
+`doctor` warns when the install and the running checkout disagree. The patcher hash
+still detects drift within one version.
 
 **sb2gs**
 
@@ -434,6 +438,18 @@ at someone else's checkout would produce).
   trip; in a value position the input is repointed at the re-created block. Through the
   harness the built project holds the original opcode; a build without gobo-agent sees
   only the marker (a false condition).
+
+- **Dangling custom-block argument reporters** — an `argument_reporter_boolean` /
+  `argument_reporter_string_number` whose name no enclosing definition declares (a
+  leftover after its custom block was deleted or renamed) is tolerated by Scratch, which
+  reads it as empty — false in a boolean input. sb2gs emitted `$name` for every argument
+  reporter, and goboscript rejects an unknown local (`unrecognized argument`), so the
+  import built nothing (project 723763681). sb2gs now tracks the definition's parameter
+  names while decompiling its body and emits `0` (boolean) or `""` (string/number) when
+  the name is out of scope; names that are in scope still become `$name`, and the
+  arithmetic coercion above turns the empty value into 0. Verified: 723763681 imports and
+  builds, keeps `REPEAT = 200000`, and its timings match the original; a synthetic
+  `argument_reporter_string_number` variant builds too.
 
 - **Variable/list references vs stale field text** — Scratch resolves a variable or list
   by the **id** in a block's `[name, id]` field, but sb2gs emitted the field's *text*. When
