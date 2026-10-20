@@ -7,6 +7,14 @@ setup.cmd
 setup.sh
 LICENSE
 tools/gsdev.py
+tools/gsdevlib/__init__.py
+tools/gsdevlib/build.py
+tools/gsdevlib/host.py
+tools/gsdevlib/page.py
+tools/gsdevlib/preflight.py
+tools/gsdevlib/profile.py
+tools/gsdevlib/session.py
+tools/gsdevlib/state.py
 tools/bootstrap.py
 tools/cdp.py
 tools/hostserver.py

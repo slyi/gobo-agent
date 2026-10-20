@@ -348,7 +348,8 @@ still detects drift within one version.
   variable/list readouts lost their positions and slider modes. sb2gs now records
   each monitor (with its compiled variable/list name) in a **`monitors.json`**
   sidecar at the project root, and `build`/`run`/`screenshot`/`test` re-inject the
-  full `monitors` array into the **built sb3** (`inject_monitors` in `gsdev.py`),
+  full `monitors` array into the **built sb3** (`inject_monitors` in
+  `tools/gsdevlib/build.py`),
   mapping each by name to the compiled id — restoring positions, slider
   mode/min-max and visibility. Verified: 1113180719's positioned readouts and the
   `Render: stickman` slider return. Labels show the compiled identifier (`camz`,
@@ -434,7 +435,8 @@ still detects drift within one version.
   are rejected in source, and the docs list no TurboWarp reporter), and sb2gs used to
   drop the block, leaving an empty condition that would not compile. sb2gs now writes a
   marker string (`"__gsdev_tw_op_<opcode>__"`) and `gsdev build` rewrites the compiled
-  comparison back into the opcode (`gsdev.inject_tw_blocks`), so it survives the round
+  comparison back into the opcode (`inject_tw_blocks` in
+  `tools/gsdevlib/build.py`), so it survives the round
   trip; in a value position the input is repointed at the re-created block. Through the
   harness the built project holds the original opcode; a build without gobo-agent sees
   only the marker (a false condition).
