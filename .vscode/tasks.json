@@ -24,8 +24,6 @@
                 "args": ["-NoProfile", "-ExecutionPolicy", "Bypass", "-File", "${workspaceFolder}/tools/gsdev.ps1", "run"]
             },
             "options": { "cwd": "${workspaceFolder}" },
-            "dependsOn": ["gobo-agent: Setup (download prebuilt tools, no admin)"],
-            "dependsOrder": "sequence",
             "group": { "kind": "build", "isDefault": true },
             "problemMatcher": [],
             "presentation": { "reveal": "always", "panel": "dedicated", "clear": true },
@@ -41,8 +39,6 @@
                 "args": ["-NoProfile", "-ExecutionPolicy", "Bypass", "-File", "${workspaceFolder}/tools/gsdev.ps1", "build"]
             },
             "options": { "cwd": "${workspaceFolder}" },
-            "dependsOn": ["gobo-agent: Setup (download prebuilt tools, no admin)"],
-            "dependsOrder": "sequence",
             "group": "build",
             "problemMatcher": []
         },
@@ -63,8 +59,6 @@
                 ]
             },
             "options": { "cwd": "${workspaceFolder}" },
-            "dependsOn": ["gobo-agent: Setup (download prebuilt tools, no admin)"],
-            "dependsOrder": "sequence",
             "problemMatcher": [],
             "presentation": { "reveal": "always", "panel": "dedicated", "clear": true },
             "runOptions": { "instanceLimit": 1 }
@@ -79,8 +73,6 @@
                 "args": ["-NoProfile", "-ExecutionPolicy", "Bypass", "-File", "${workspaceFolder}/tools/gsdev.ps1", "test", "--manifest", "${workspaceFolder}/gobo-tests.json"]
             },
             "options": { "cwd": "${workspaceFolder}" },
-            "dependsOn": ["gobo-agent: Setup (download prebuilt tools, no admin)"],
-            "dependsOrder": "sequence",
             "group": { "kind": "test", "isDefault": true },
             "problemMatcher": [],
             "presentation": { "reveal": "always", "panel": "dedicated", "clear": true },

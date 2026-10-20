@@ -2900,9 +2900,6 @@ def _adopted_tasks() -> list[dict]:
             "options": {"cwd": "${workspaceFolder}"},
             "problemMatcher": [],
         }
-        if depends:
-            entry["dependsOn"] = [setup_label]
-            entry["dependsOrder"] = "sequence"
         if group is not None:
             entry["group"] = group
         if extra:

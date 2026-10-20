@@ -15,6 +15,37 @@ import zipfile
 from pathlib import Path
 
 
+def _read_sb3(sb3_path: Path):
+    """Read project.json and the remaining members once; None when unreadable."""
+    try:
+        with zipfile.ZipFile(sb3_path) as archive:
+            project = json.loads(archive.read("project.json"))
+            members = [
+                (name, archive.read(name))
+                for name in archive.namelist()
+                if name != "project.json"
+            ]
+    except (OSError, ValueError, zipfile.BadZipFile):
+        return None
+    return project, members
+
+
+def _write_sb3(sb3_path: Path, project: dict, members: list[tuple[str, bytes]]) -> None:
+    """Replace the sb3 atomically via a unique temp (parallel builds don't share it)."""
+    tmp = sb3_path.with_name(f"{sb3_path.name}.tmp-{os.getpid()}")
+    try:
+        with zipfile.ZipFile(tmp, "w", zipfile.ZIP_DEFLATED) as archive:
+            archive.writestr("project.json", json.dumps(project, ensure_ascii=False))
+            for name, data in members:
+                archive.writestr(name, data)
+        os.replace(tmp, sb3_path)
+    except OSError:
+        try:
+            tmp.unlink()
+        except OSError:
+            pass
+
+
 # --- debug / release builds ---------------------------------------------------
 # A harness-generated include (`lib/gsdev_mode.gs`) provides diagnostic statement
 # macros. Debug expands them to real statements; release erases the statement *and
@@ -73,7 +104,8 @@ def _tw_marker_in_input(value: object) -> str | None:
     return None
 
 
-def inject_tw_blocks(sb3_path: Path, root: Path) -> None:
+def inject_tw_blocks(sb3_path: Path, root: Path, *, project: dict | None = None,
+                     members: list | None = None) -> bool:
     """Turn marker placeholders in a built sb3 back into the TW detection reporters.
 
     goboscript has no syntax for `turbowarp_isCompiled` / `turbowarp_isTurboWarp` (nor
@@ -86,16 +118,12 @@ def inject_tw_blocks(sb3_path: Path, root: Path) -> None:
     Best-effort and a no-op when no marker is present; runs after the build, like
     `inject_monitors`.
     """
-    try:
-        with zipfile.ZipFile(sb3_path) as archive:
-            project = json.loads(archive.read("project.json"))
-            members = [
-                (name, archive.read(name))
-                for name in archive.namelist()
-                if name != "project.json"
-            ]
-    except (OSError, ValueError, zipfile.BadZipFile):
-        return
+    own = project is None
+    if own:
+        data = _read_sb3(sb3_path)
+        if data is None:
+            return False
+        project, members = data
     changed = False
     created = 0
     for target in project.get("targets", []):
@@ -133,22 +161,14 @@ def inject_tw_blocks(sb3_path: Path, root: Path) -> None:
                 inputs[name] = [2, new_id] if value[0] == 1 else [3, new_id, [10, ""]]
                 changed = True
     if not changed:
-        return
-    tmp = sb3_path.with_name(sb3_path.name + ".tmp")
-    try:
-        with zipfile.ZipFile(tmp, "w", zipfile.ZIP_DEFLATED) as archive:
-            archive.writestr("project.json", json.dumps(project, ensure_ascii=False))
-            for name, data in members:
-                archive.writestr(name, data)
-        os.replace(tmp, sb3_path)
-    except OSError:
-        try:
-            tmp.unlink()
-        except OSError:
-            pass
+        return False
+    if own:
+        _write_sb3(sb3_path, project, members)
+    return True
 
 
-def inject_monitors(sb3_path: Path, root: Path) -> None:
+def inject_monitors(sb3_path: Path, root: Path, *, project: dict | None = None,
+                    members: list | None = None) -> bool:
     """Re-inject the source project's monitors into a built sb3.
 
     goboscript emits an empty `monitors` array, so monitor positions, slider
@@ -157,25 +177,21 @@ def inject_monitors(sb3_path: Path, root: Path) -> None:
     writes the array into the sb3. Best-effort: a missing/invalid sidecar is a
     no-op.
     """
+    own = project is None
+    if own:
+        data = _read_sb3(sb3_path)
+        if data is None:
+            return False
+        project, members = data
     sidecar = root / "monitors.json"
     if not sidecar.is_file():
-        return
+        return False
     try:
         records = json.loads(sidecar.read_text(encoding="utf-8"))
     except (OSError, ValueError):
-        return
+        return False
     if not isinstance(records, list) or not records:
-        return
-    try:
-        with zipfile.ZipFile(sb3_path) as archive:
-            project = json.loads(archive.read("project.json"))
-            members = [
-                (name, archive.read(name))
-                for name in archive.namelist()
-                if name != "project.json"
-            ]
-    except (OSError, ValueError, zipfile.BadZipFile):
-        return
+        return False
     targets: dict[str | None, dict] = {
         None: next((t for t in project["targets"] if t.get("isStage")), None)
     }
@@ -210,23 +226,15 @@ def inject_monitors(sb3_path: Path, root: Path) -> None:
             "isDiscrete": record.get("isDiscrete", True),
         })
     if not monitors:
-        return
+        return False
     project["monitors"] = monitors
-    tmp = sb3_path.with_name(sb3_path.name + ".tmp")
-    try:
-        with zipfile.ZipFile(tmp, "w", zipfile.ZIP_DEFLATED) as archive:
-            archive.writestr("project.json", json.dumps(project, ensure_ascii=False))
-            for name, data in members:
-                archive.writestr(name, data)
-        os.replace(tmp, sb3_path)
-    except OSError:
-        try:
-            tmp.unlink()
-        except OSError:
-            pass
+    if own:
+        _write_sb3(sb3_path, project, members)
+    return True
 
 
-def inject_costumes(sb3_path: Path, root: Path) -> None:
+def inject_costumes(sb3_path: Path, root: Path, *, project: dict | None = None,
+                    members: list | None = None) -> bool:
     """Set the source rotation centers on a built sb3's costumes.
 
     sb2gs preserves costumes byte-for-byte, so the compiled costumes have no
@@ -234,25 +242,21 @@ def inject_costumes(sb3_path: Path, root: Path) -> None:
     the `costumes.json` sidecar (matched by target + costume name, else order).
     Best-effort.
     """
+    own = project is None
+    if own:
+        data = _read_sb3(sb3_path)
+        if data is None:
+            return False
+        project, members = data
     sidecar = root / "costumes.json"
     if not sidecar.is_file():
-        return
+        return False
     try:
         records = json.loads(sidecar.read_text(encoding="utf-8"))
     except (OSError, ValueError):
-        return
+        return False
     if not isinstance(records, list) or not records:
-        return
-    try:
-        with zipfile.ZipFile(sb3_path) as archive:
-            project = json.loads(archive.read("project.json"))
-            members = [
-                (name, archive.read(name))
-                for name in archive.namelist()
-                if name != "project.json"
-            ]
-    except (OSError, ValueError, zipfile.BadZipFile):
-        return
+        return False
     targets: dict[str | None, dict] = {
         None: next((t for t in project["targets"] if t.get("isStage")), None)
     }
@@ -285,19 +289,10 @@ def inject_costumes(sb3_path: Path, root: Path) -> None:
         costume["bitmapResolution"] = record.get("bitmapResolution", 1)
         applied += 1
     if not applied:
-        return
-    tmp = sb3_path.with_name(sb3_path.name + ".tmp")
-    try:
-        with zipfile.ZipFile(tmp, "w", zipfile.ZIP_DEFLATED) as archive:
-            archive.writestr("project.json", json.dumps(project, ensure_ascii=False))
-            for name, data in members:
-                archive.writestr(name, data)
-        os.replace(tmp, sb3_path)
-    except OSError:
-        try:
-            tmp.unlink()
-        except OSError:
-            pass
+        return False
+    if own:
+        _write_sb3(sb3_path, project, members)
+    return True
 
 
 # A `// ...` line is not a goboscript comment (only `#` is) and `#` comments are
@@ -414,18 +409,15 @@ def restore_sources(backups: list[tuple[Path, bytes]]) -> None:
         path.write_bytes(raw)
 
 
-def inject_comments(sb3_path: Path) -> None:
+def inject_comments(sb3_path: Path, *, project: dict | None = None,
+                    members: list | None = None) -> bool:
     """Drop the carrier's definition and relabel its calls to ``// %s``."""
-    try:
-        with zipfile.ZipFile(sb3_path) as archive:
-            project = json.loads(archive.read("project.json"))
-            members = [
-                (name, archive.read(name))
-                for name in archive.namelist()
-                if name != "project.json"
-            ]
-    except (OSError, ValueError, zipfile.BadZipFile):
-        return
+    own = project is None
+    if own:
+        data = _read_sb3(sb3_path)
+        if data is None:
+            return False
+        project, members = data
     changed = False
     for target in project["targets"]:
         blocks = target.get("blocks")
@@ -465,19 +457,30 @@ def inject_comments(sb3_path: Path) -> None:
                 mutation["proccode"] = _COMMENT_LABEL
                 changed = True
     if not changed:
+        return False
+    if own:
+        _write_sb3(sb3_path, project, members)
+    return True
+
+
+def apply_injections(sb3_path: Path, root: Path) -> None:
+    """Run all post-build sb3 passes in one read/modify/write.
+
+    The passes touch disjoint structures (comment-carrier blocks, monitors,
+    costume metadata, TW marker blocks) and keep their previous order, so this is
+    a sequential in-memory pipeline: no concurrency, and a failure before the
+    final write leaves the built sb3 untouched.
+    """
+    data = _read_sb3(sb3_path)
+    if data is None:
         return
-    tmp = sb3_path.with_name(sb3_path.name + ".tmp")
-    try:
-        with zipfile.ZipFile(tmp, "w", zipfile.ZIP_DEFLATED) as archive:
-            archive.writestr("project.json", json.dumps(project, ensure_ascii=False))
-            for name, data in members:
-                archive.writestr(name, data)
-        os.replace(tmp, sb3_path)
-    except OSError:
-        try:
-            tmp.unlink()
-        except OSError:
-            pass
+    project, members = data
+    changed = inject_comments(sb3_path, project=project, members=members)
+    changed = inject_monitors(sb3_path, root, project=project, members=members) or changed
+    changed = inject_costumes(sb3_path, root, project=project, members=members) or changed
+    changed = inject_tw_blocks(sb3_path, root, project=project, members=members) or changed
+    if changed:
+        _write_sb3(sb3_path, project, members)
 
 
 def build_project_at(root: Path, mode: str = "debug", *, goboscript: str,
@@ -517,8 +520,5 @@ def build_project_at(root: Path, mode: str = "debug", *, goboscript: str,
         restore_sources(comment_backups)
     if result.returncode != 0:
         raise SystemExit(f"goboscript build failed (exit {result.returncode}).")
-    inject_comments(sb3_path)
-    inject_monitors(sb3_path, root)
-    inject_costumes(sb3_path, root)
-    inject_tw_blocks(sb3_path, root)
+    apply_injections(sb3_path, root)
     return sb3_path
