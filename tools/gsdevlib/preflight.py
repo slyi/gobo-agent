@@ -17,7 +17,7 @@ from pathlib import Path
 
 # --- Preflight: Scratch compatibility + memory (offline, no browser) ----------
 
-PREFLIGHT_SCHEMA = 2
+PREFLIGHT_SCHEMA = 3
 
 # Renderer constants, from scratch-render's SVGSkin/BitmapSkin.
 _SVG_MAX_TEXTURE_DIMENSION = 2048
@@ -74,13 +74,13 @@ def budgets(get_int) -> dict:
         camel = "preflight" + key[0].upper() + key[1:]
         env = "GSDEV_PREFLIGHT_" + re.sub(r"(?<!^)(?=[A-Z])", "_", key).upper()
         values[key] = get_int(env, camel, default)
-    # Device tiering: both budgets scale linearly with the device's RAM when set.
-    # 2048 MB -> 1.25 GiB / 200M (the calibrated 2 GB defaults); 1536 -> 960 MiB / 150M.
+    # Device tiering: both budgets scale linearly from the 2 GB baseline.
+    # 2048 MB -> 870 MiB / 110M (the calibrated defaults).
     memory_mb = values.get("deviceMemoryMb", 0)
     if memory_mb > 0:
         scale = memory_mb / 2048
-        values["memoryBudget"] = int(1280 * 1024 ** 2 * scale)
-        values["pixelBudget"] = int(200_000_000 * scale)
+        values["memoryBudget"] = int(870 * 1024 ** 2 * scale)
+        values["pixelBudget"] = int(110_000_000 * scale)
     return values
 
 
@@ -183,8 +183,10 @@ def _image_dims(data: bytes, fmt):
 
 
 def _svg_dims(data: bytes) -> dict:
-    head = data[:4000]
-    if b"<!DOCTYPE" in head or b"<!ENTITY" in head:
+    # Reject any document type/entity declaration, not just one in the first 4 KB:
+    # ElementTree expands internal entities, so a late declaration can still be a
+    # billion-laughs-style memory/CPU sink.
+    if re.search(rb"<!\s*(?:DOCTYPE|ENTITY)", data, re.IGNORECASE):
         return {"status": "unresolved", "reason": "doctype"}
     try:
         root = ET.fromstring(data)
@@ -195,7 +197,10 @@ def _svg_dims(data: bytes) -> dict:
         if not value:
             return None
         match = re.match(r"^\s*([0-9]*\.?[0-9]+)\s*(px)?\s*$", value)
-        return float(match.group(1)) if match else None
+        if not match:
+            return None
+        number = float(match.group(1))
+        return number if math.isfinite(number) and number > 0 else None
 
     # The renderer sizes an SVG skin from the viewBox (SVGSkin.setSVG), so use
     # that first; width/height are only a fallback when it is absent.
@@ -205,10 +210,13 @@ def _svg_dims(data: bytes) -> dict:
         parts = view_box.replace(",", " ").split()
         if len(parts) == 4:
             try:
-                return {"status": "viewbox", "width": abs(float(parts[2])),
-                        "height": abs(float(parts[3])), "elements": elements}
+                width, height = abs(float(parts[2])), abs(float(parts[3]))
             except ValueError:
                 pass
+            else:
+                if math.isfinite(width) and math.isfinite(height) and width > 0 and height > 0:
+                    return {"status": "viewbox", "width": width,
+                            "height": height, "elements": elements}
     width, height = scalar(root.attrib.get("width")), scalar(root.attrib.get("height"))
     if width and height:
         return {"status": "px", "width": width, "height": height, "elements": elements}
@@ -236,6 +244,60 @@ def _svg_mip_scale(width: float, height: float, device_scale: float,
     return max(1 / 256, 2 ** math.ceil(math.log2(requested)))
 
 
+def _finite_number(value) -> float | None:
+    try:
+        number = float(value)
+    except (TypeError, ValueError, OverflowError):
+        return None
+    return number if math.isfinite(number) else None
+
+
+def _literal_size_input(block: dict, name: str) -> float | None:
+    """Read an active SB3 literal, never a reporter's obscured shadow value."""
+    value = block.get('inputs', {}).get(name)
+    if not isinstance(value, list) or len(value) < 2:
+        return None
+    primitive = value[1]
+    # Primitive tags 4..8 are numbers; 10 is text. Variables/lists and
+    # reporter block IDs need runtime data, even if they have a numeric shadow.
+    if (not isinstance(primitive, list) or len(primitive) < 2
+            or primitive[0] not in (4, 5, 6, 7, 8, 10)):
+        return None
+    return _finite_number(primitive[1])
+
+
+def _target_sizes(target: dict) -> dict:
+    """Conservative size requests across all blocks, including custom procedures.
+
+    This deliberately includes unused blocks/branches: an offline asset scan
+    cannot know which events will run. Relative changes may repeat, so they and
+    non-literal inputs use the renderer's maximum SVG MIP instead of guessing.
+    Do not clamp requests using the saved costume: a script can first select a
+    tiny costume, grow, then switch to a large sheet without another size clamp.
+    """
+    if target.get('isStage'):
+        return {'sprite': target.get('name'), 'initialSize': 100.0,
+                'maxSize': 100.0, 'knownMaxSize': 100.0, 'unresolved': []}
+    initial = _finite_number(target.get('size', 100))
+    maximum = initial if initial is not None and initial > 0 else 100.0
+    unresolved = [] if initial is not None and initial > 0 else ['saved-size']
+    for block_id, block in target.get('blocks', {}).items():
+        if not isinstance(block, dict):
+            continue
+        opcode = block.get('opcode')
+        if opcode == 'looks_setsizeto':
+            size = _literal_size_input(block, 'SIZE')
+            if size is None or size <= 0:
+                unresolved.append(block_id)
+            else:
+                maximum = max(maximum, size)
+        elif opcode == 'looks_changesizeby':
+            unresolved.append(block_id)
+    return {'sprite': target.get('name'), 'initialSize': initial,
+            'maxSize': None if unresolved else maximum, 'knownMaxSize': maximum,
+            'unresolved': unresolved}
+
+
 def _pf(level: str, code: str, message: str, detail=None) -> dict:
     finding = {'level': level, 'code': code, 'message': message}
     if detail is not None:
@@ -249,7 +311,7 @@ def preflight_scan(sb3_path: Path, budgets: dict) -> dict:
     report = {
         'schema': PREFLIGHT_SCHEMA,
         'artifact': str(sb3_path),
-        'sha256': _sha256_file(sb3_path),
+        'sha256': '',
         'budgets': budgets,
         'json': {'bytes': 0, 'budget': budgets['jsonBudget'], 'over': False},
         'assets': {'count': 0, 'totalBytes': 0, 'over': [], 'largest': []},
@@ -257,7 +319,7 @@ def preflight_scan(sb3_path: Path, budgets: dict) -> dict:
         'memory': {
             'bitmapPx': 0, 'bitmapTexturePx': 0, 'bitmapSkins': 0,
             'svgPx': 0, 'svgRasterPx': 0, 'svgSkins': 0, 'svgUnresolved': 0,
-            'cssMathSkins': 0, 'svgElements': 0, 'maxSvgElements': 0,
+            'cssMathSkins': 0, 'nestedSvgSkins': 0, 'svgElements': 0, 'maxSvgElements': 0,
             'deviceScale': budgets['deviceScale'],
             'bitmapBytesPerPx': budgets['bitmapBytesPerPx'],
             'svgBytesPerPx': budgets['svgBytesPerPx'],
@@ -265,12 +327,17 @@ def preflight_scan(sb3_path: Path, budgets: dict) -> dict:
             'effectivePx': 0, 'pixelCost': 0,
             'pixelBudget': budgets['pixelBudget'], 'pixelPercent': 0.0,
             'bytes': 0, 'budget': budgets['memoryBudget'], 'percent': 0.0,
-            'overDimension': [], 'largest': [],
+            'overDimension': [], 'largest': [], 'targetSizes': [],
         },
         'sounds': {'count': 0, 'bytes': 0, 'decodedBytes': 0, 'unresolved': 0},
         'coverage': {'unresolved': 0},
         'findings': findings,
     }
+    try:
+        report['sha256'] = _sha256_file(sb3_path)
+    except OSError as error:
+        findings.append(_pf('error', 'invalid-archive', f'cannot read artifact: {error}'))
+        return report
     try:
         with zipfile.ZipFile(sb3_path) as archive:
             names = archive.namelist()
@@ -316,32 +383,44 @@ def preflight_scan(sb3_path: Path, budgets: dict) -> dict:
             cache: dict[str, dict] = {}
             costume_px: list[tuple] = []
             for target in targets:
-                draw_scale = float(target.get('size', 100) or 100) / 100.0
+                size_info = _target_sizes(target)
+                report['memory']['targetSizes'].append(size_info)
+                # Infinity is only an internal request for the renderer's cap;
+                # JSON exposes null for an unknown runtime size.
+                draw_scale = (size_info['maxSize'] / 100.0
+                              if size_info['maxSize'] is not None else math.inf)
+                has_svg = False
                 for costume in target.get('costumes', []):
                     fmt = costume.get('dataFormat')
                     md5ext = costume.get('md5ext') or f"{costume.get('assetId')}.{fmt}"
                     info = cache.get(md5ext)
                     if info is None:
                         info = {'kind': fmt, 'dims': None, 'unresolved': False}
-                        try:
-                            blob = archive.read(md5ext)
-                        except KeyError:
+                        if fmt == 'svg' and sizes.get(md5ext, 0) > _PREFLIGHT_MAX_SVG_READ:
                             info['unresolved'] = True
                         else:
-                            kind, dims = _image_dims(blob, fmt)
-                            info['kind'] = kind
-                            info['cssMath'] = fmt == 'svg' and any(
-                                token in blob for token in (b'calc(', b'matrix3d', b'var(--'))
-                            if isinstance(dims, dict):
-                                if dims.get('status') == 'unresolved':
-                                    info['unresolved'] = True
-                                else:
-                                    info['dims'] = (dims['width'], dims['height'])
-                            elif dims:
-                                info['dims'] = dims
-                            else:
+                            try:
+                                blob = archive.read(md5ext)
+                            except (KeyError, OSError, RuntimeError, zipfile.BadZipFile):
                                 info['unresolved'] = True
-                            info['elements'] = dims.get('elements', 0) if isinstance(dims, dict) else 0
+                            else:
+                                kind, dims = _image_dims(blob, fmt)
+                                info['kind'] = kind
+                                info['cssMath'] = fmt == 'svg' and (
+                                    b'calc(' in blob or b'calc (' in blob
+                                    or b'matrix3d' in blob
+                                    or re.search(rb'var\(\s*--', blob) is not None)
+                                info['nestedSvg'] = fmt == 'svg' and b'data:image/svg+xml' in blob
+                                if isinstance(dims, dict):
+                                    if dims.get('status') == 'unresolved':
+                                        info['unresolved'] = True
+                                    else:
+                                        info['dims'] = (dims['width'], dims['height'])
+                                elif dims:
+                                    info['dims'] = dims
+                                else:
+                                    info['unresolved'] = True
+                                info['elements'] = dims.get('elements', 0) if isinstance(dims, dict) else 0
                         cache[md5ext] = info
                     if info['unresolved'] or not info['dims']:
                         report['coverage']['unresolved'] += 1
@@ -352,6 +431,8 @@ def preflight_scan(sb3_path: Path, budgets: dict) -> dict:
                     is_svg = info['kind'] == 'svg'
                     if is_svg and info.get('cssMath'):
                         report['memory']['cssMathSkins'] += 1
+                    if is_svg and info.get('nestedSvg'):
+                        report['memory']['nestedSvgSkins'] += 1
                     pixels = int(round(width * height))
                     if is_svg:
                         report['memory']['svgSkins'] += 1
@@ -361,10 +442,12 @@ def preflight_scan(sb3_path: Path, budgets: dict) -> dict:
                     else:
                         report['memory']['bitmapSkins'] += 1
                     if is_svg:
+                        has_svg = True
                         # Rasterised at the draw scale: viewBox x deviceScale,
                         # rounded up to a power of two and capped at 2048.
                         mip = _svg_mip_scale(width, height, budgets['deviceScale'], draw_scale)
                         texture = int(round(pixels * mip * mip))
+                        raster_scale = mip
                         report['memory']['svgPx'] += pixels
                         report['memory']['svgRasterPx'] += texture
                         if width > budgets['svgMaxWidth'] or height > budgets['svgMaxHeight']:
@@ -375,15 +458,27 @@ def preflight_scan(sb3_path: Path, budgets: dict) -> dict:
                         # The stored PNG is the texture. A resolution-1 asset is
                         # upscaled to 2x at load (fetchBitmapCanvas_), which is
                         # 4x the pixels; resolution 2 is used as stored.
-                        res = costume.get('bitmapResolution', 1) or 1
-                        scale_up = (2.0 / res) if res else 2.0
+                        res = costume.get('bitmapResolution', 1)
+                        if (not isinstance(res, (int, float)) or isinstance(res, bool)
+                                or not math.isfinite(res) or res <= 0):
+                            res = 1
+                        scale_up = 2.0 / res
+                        raster_scale = scale_up
                         texture = int(round(pixels * scale_up * scale_up))
                         report['memory']['bitmapPx'] += pixels
                         report['memory']['bitmapTexturePx'] += texture
                     costume_px.append({
                         'texture': texture, 'encoded': pixels, 'sprite': target.get('name'),
                         'costume': costume.get('name'), 'kind': info['kind'],
+                        'drawScale': draw_scale if math.isfinite(draw_scale) else None,
+                        'rasterScale': raster_scale,
+                        'rasterWidth': int(round(width * raster_scale)),
+                        'rasterHeight': int(round(height * raster_scale)),
                     })
+                if has_svg and size_info['unresolved']:
+                    findings.append(_pf('warning', 'runtime-size-unknown',
+                        f"{target.get('name')}: size depends on runtime inputs or relative changes; "
+                        'estimating every SVG at its maximum renderer MIP', size_info))
 
             for target in targets:
                 for entry in target.get('lists', {}).values():
@@ -439,7 +534,9 @@ def preflight_scan(sb3_path: Path, budgets: dict) -> dict:
                                 f"(~{report['json']['percent']}% of {budgets['jsonBudget']:,})"))
         report['memory']['largest'] = [
             {'texturePx': item['texture'], 'encodedPx': item['encoded'],
-             'sprite': item['sprite'], 'costume': item['costume'], 'kind': item['kind']}
+             'sprite': item['sprite'], 'costume': item['costume'], 'kind': item['kind'],
+             'drawScale': item['drawScale'], 'rasterScale': item['rasterScale'],
+             'rasterWidth': item['rasterWidth'], 'rasterHeight': item['rasterHeight']}
             for item in sorted(costume_px, key=lambda x: -x['texture'])[:10]
         ]
         memory = report['memory']
@@ -512,9 +609,14 @@ def preflight_scan(sb3_path: Path, budgets: dict) -> dict:
         if memory['cssMathSkins']:
             findings.append(_pf('warning', 'svg-css-math',
                                 f"{memory['cssMathSkins']} SVG skin(s) use CSS calc()/matrix3d()/"
-                                'variables; browser CSS math can dominate startup even when '
+                                'variables; browser CSS math can add startup cost even when '
                                 'textures are small',
                                 {'cssMathSkins': memory['cssMathSkins']}))
+        if memory['nestedSvgSkins']:
+            findings.append(_pf('warning', 'svg-nested-data-uri',
+                                f"{memory['nestedSvgSkins']} SVG skin(s) embed data-URI SVG; "
+                                'inner element count and CSS math are not scanned',
+                                {'nestedSvgSkins': memory['nestedSvgSkins']}))
         if memory['svgElements'] > 50_000 or memory['maxSvgElements'] > 50_000:
             findings.append(_pf('warning', 'svg-complexity',
                                 f"{memory['svgElements']:,} SVG elements across "
@@ -542,15 +644,23 @@ def print_preflight(report: dict) -> None:
           f" ({j.get('percent', 0.0)}%)" + ('  OVER' if j['over'] else ''))
     print(f"assets: {a['count']} unique, {a['totalBytes']:,} bytes total, "
           f"{len(a['over'])} over {report['budgets']['assetBudget']:,}")
-    print(f"memory (estimated): ~{m['bytes'] / 2 ** 30:.2f} GiB ({m['percent']}% of {_budget_text(m['budget'])})")
+    print(f"memory (estimated): ~{m['bytes'] / 2 ** 20:.1f} MiB "
+          f"({m['bytes'] / 2 ** 30:.2f} GiB; {m['percent']}% of {_budget_text(m['budget'])})")
     print(f"  = bitmap {m['bitmapTexturePx']:,} tex px x{m['bitmapBytesPerPx']}"
           f" + svg {m['svgRasterPx']:,} raster px x{m['svgBytesPerPx']}"
           f" (viewBox {int(m['svgPx']):,} px, scale {m['deviceScale']}x)"
           f" + {report['sounds']['decodedBytes']:,} B sound PCM")
     print(f"costume pixels: {m['pixelCost']:,} / {m['pixelBudget']:,}"
-          f" ({m['pixelPercent']}%; bitmap + {m['svgPixelWeight']}x SVG viewBox)"
+          f" ({m['pixelPercent']}%; bitmap + {m['svgPixelWeight']}x SVG raster)"
           + ('  OVER' if m['pixelCost'] > m['pixelBudget'] else ''))
     print(f"svg unresolved: {m['svgUnresolved']}")
+    for size in m['targetSizes']:
+        maximum = size['maxSize']
+        if maximum is None:
+            print(f"  draw size: {size['sprite']} unknown (maximum SVG MIP)")
+        elif maximum != size['initialSize']:
+            print(f"  draw size: {size['sprite']} {size['initialSize']:g}% saved, "
+                  f"{maximum:g}% maximum script request")
     print(f"largest list: {l['max']:,} / {report['budgets']['listLimit']:,} items")
     s = report['sounds']
     print(f"sounds: {s['count']} ({s['bytes']:,} bytes, ~{s['decodedBytes']:,} PCM, "
@@ -559,7 +669,8 @@ def print_preflight(report: dict) -> None:
     print(f"sha256: {report.get('sha256', '')[:16]}...")
     for item in report['memory']['largest'][:5]:
         print(f"  largest: {item['sprite']}::{item['costume']} {item['texturePx']:,} tex px"
-              f" (encoded {item['encodedPx']:,}, {item['kind']})")
+              f" ({item['rasterWidth']}x{item['rasterHeight']}, "
+              f"{item['rasterScale']:g}x raster; encoded {item['encodedPx']:,}, {item['kind']})")
     for finding in report['findings']:
         print(f"[{finding['level']:7}] {finding['code']}: {finding['message']}")
         detail = finding.get('detail')
@@ -597,7 +708,7 @@ def _wav_pcm_bytes(data: bytes):
         size = struct.unpack('<I', data[i + 4:i + 8])[0]
         body = i + 8
         if chunk == b'data':
-            return size
+            return min(size, max(0, len(data) - body))
         i = body + size + (size & 1)
     return None
 

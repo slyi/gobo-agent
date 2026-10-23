@@ -385,6 +385,9 @@ accounts for the last ~10 s.
 `svg-css-math` warns when an SVG uses CSS `calc()`, `matrix3d()`
 or variables. A 1k-node control at 1000% loads in 367 ms static vs 278/291/432 ms for
 vars/calc/trig+pow — CSS math is not a major load driver at that scale; node count is.
+`svg-nested-data-uri` warns when an SVG embeds another SVG as a data URI (the packed
+floor sheets do this): the scanner measures the outer document, so inner element count
+and CSS math are not included.
 1041228311's own startup is its floor sheets at 1000%: only 5 of the 11 floor costumes
 are ever drawn, each becoming a 1536×1728 texture (31.85 MB with canvas + silhouette),
 ~159 MB in total, generated on first draw in ~2.7 s and stuttery until cached; the
@@ -403,8 +406,18 @@ the lowest known passing bound (951197417 uses ~4.6 GiB of a 9.3 GiB RAM+swap bu
 and stutters). This is a **4 GB** machine, not a 2 GB one; a true 2 GB Chromebook
 would need its own (lower) tier.
 
-It uses each target's initial size (`size/100`) and one cached MIP per costume; the full
-viewBox still costs texels, and scripts that change size aren't modelled. On a 1× canvas a
+It uses the largest of each sprite's saved size and literal `set size to` requests
+across its blocks, including procedures and unused branches. This handles scripts
+that grow on a tiny costume and then switch to a large sheet: the saved costume's
+size clamp does not bound later costumes. A variable/reporter size input or any
+`change size by` block has no inferred bound; `runtime-size-unknown` warns and uses
+each SVG's maximum renderer MIP (and fails `--strict`). Bitmap textures keep their
+fixed loaded dimensions. JSON `memory.targetSizes` records saved and inferred sizes;
+`memory.largest` records draw scale, raster scale and raster dimensions. The text
+report shows runtime enlargement and the largest raster dimensions too.
+
+The model retains one largest MIP per costume and counts every costume, including
+unused/hidden ones; the full viewBox still costs texels. On a 1× canvas a
 37.5% sprite uses the 0.5× MIP (1331442506 measures 356 MB), but on 2×/3.5× the same size
 requests 0.75/1.31 and still rounds to the 1× MIP because the 1920-wide viewBox caps at
 1× — so the mobile estimate stays 1.39 GiB. The stage framebuffer, extra scale MIPs and
