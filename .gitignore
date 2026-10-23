@@ -51,12 +51,18 @@ tests/
 #   test_perf_controls      perf-run setup (dialogs/occlusion/ports), no browser
 #   test_procedure_profile  profiler attribution invariant, end to end
 #   test_ready_events       readiness/waits/clone/close robustness, browser required
+#   test_gsbridge_session   session port state (no browser)
+#   test_gsbridge_cleanup   bridge orphan cleanup (no browser)
+#   test_gsdev_cleanup      gsdev host orphan cleanup (no browser)
 #   benchmarks/profiling    the fixture that test needs
 tools/test_perf_controls.py
 tools/test_procedure_profile.py
 tools/test_ready_events.py
 tools/test_bridge_targets.py
 tools/test_profiler_aggregation.py
+tools/test_gsbridge_cleanup.py
+tools/test_gsbridge_session.py
+tools/test_gsdev_cleanup.py
 tools/measure_overhead.py
 tools/benchmarks/profiling/
 tools/benchmarks/hatsAgg/
@@ -70,3 +76,4 @@ tools/benchmarks/waitsAgg/
 tools/test_profiler_waits.py
 tools/test_preflight.py
 profiler-handover.md
+.gsbridge/

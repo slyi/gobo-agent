@@ -52,6 +52,7 @@ import sys
 import time
 import uuid
 import zipfile
+from datetime import datetime
 from pathlib import Path
 from urllib.parse import urlparse
 
@@ -262,10 +263,194 @@ def match_for(url: str, target: str) -> str:
     return urlparse(url).netloc or ""
 
 
+def _state_root(app: str) -> Path:
+    """Stable state root, shared across harness processes.
+
+    ``%TEMP%`` is per DSH invocation, so a state file written by ``run`` is not
+    visible to the next command. The project-local ``.gsbridge/`` is stable and
+    writable under the workspace sandbox; ``GSBRIDGE_STATE_DIR`` overrides it.
+    """
+    override = os.environ.get("GSBRIDGE_STATE_DIR")
+    if override:
+        base = Path(override).expanduser()
+    else:
+        base = Path(__file__).resolve().parent.parent / ".gsbridge"
+    try:
+        (base / app).mkdir(parents=True, exist_ok=True)
+    except OSError:
+        base = Path(os.environ.get("TEMP", ".")) / "gobo-agent"
+        (base / app).mkdir(parents=True, exist_ok=True)
+    return base / app
+
+
 def state_path(port: int, app: str | None = None) -> Path:
-    base = _bridge_temp_dir(app or _BRIDGE_STATE_APPS[0])
+    base = _state_root(app or _BRIDGE_STATE_APPS[0])
     base.mkdir(parents=True, exist_ok=True)
     return base / f"session_{port}.json"
+
+
+def _session_id() -> str:
+    sid = os.environ.get("DSH_SESSION_ID") or os.environ.get("GSBRIDGE_SESSION") or "default"
+    return "".join(ch if (ch.isalnum() or ch in "._-") else "_" for ch in sid)
+
+
+def session_path(app: str | None = None) -> Path:
+    base = _state_root(app or _BRIDGE_STATE_APPS[0])
+    base.mkdir(parents=True, exist_ok=True)
+    return base / f"current_{_session_id()}.json"
+
+
+def write_session(port: int, **fields) -> None:
+    try:
+        record = dict(port=int(port), updated=time.time(), **fields)
+        session_path().write_text(json.dumps(record), encoding="utf-8")
+    except OSError:
+        pass
+
+
+def read_session() -> dict:
+    for app in _BRIDGE_STATE_APPS:
+        try:
+            record = json.loads(session_path(app).read_text(encoding="utf-8"))
+            if isinstance(record, dict) and isinstance(record.get("port"), int):
+                return record
+        except (OSError, ValueError):
+            continue
+    return {}
+
+
+def clear_session(port: int | None = None) -> None:
+    record = read_session()
+    if port is not None and record and record.get("port") != port:
+        return
+    for app in _BRIDGE_STATE_APPS:
+        try:
+            session_path(app).unlink()
+        except OSError:
+            pass
+
+
+def port_alive(port: int) -> bool:
+    try:
+        return any(t.get("type") == "page" for t in list_targets(port=port, timeout=0.75))
+    except (CDPError, TimeoutError, OSError):
+        return False
+
+
+def resolve_port(explicit: int | None, for_run: bool = False) -> int:
+    """Explicit --port, then GSBRIDGE_PORT, then this session's last run, then 9400."""
+    if explicit is not None:
+        return int(explicit)
+    env = os.environ.get("GSBRIDGE_PORT")
+    if env:
+        try:
+            return int(env)
+        except ValueError:
+            pass
+    if not for_run:
+        record = read_session()
+        if record and isinstance(record.get("port"), int):
+            if os.environ.get("GSBRIDGE_TRUST_SESSION") == "1" or port_alive(record["port"]):
+                return record["port"]
+    return DEFAULT_PORT
+
+
+def registry_path(port: int, app: str | None = None) -> Path:
+    base = _state_root(app or _BRIDGE_STATE_APPS[0])
+    base.mkdir(parents=True, exist_ok=True)
+    return base / f"browser_{port}.json"
+
+
+def write_registry(port: int, pid: int, profile, url: str = "", target: str = "") -> None:
+    """Record a launched browser immediately, before any navigation or bridge work.
+
+    ``state`` is written later and carries the session token; the registry is the
+    crash/failure record that lets a later ``close`` or run reap the process even
+    when the token/state never made it.
+    """
+    try:
+        record = dict(port=int(port), pid=int(pid), profile=str(profile), url=url,
+                      target=target, session=_session_id(), started=time.time())
+        registry_path(port).write_text(json.dumps(record), encoding="utf-8")
+    except OSError:
+        pass
+
+
+def read_registry(port: int) -> dict:
+    for app in _BRIDGE_STATE_APPS:
+        try:
+            record = json.loads(registry_path(port, app).read_text(encoding="utf-8"))
+            if isinstance(record, dict):
+                return record
+        except (OSError, ValueError):
+            continue
+    return {}
+
+
+def clear_registry(port: int) -> None:
+    for app in _BRIDGE_STATE_APPS:
+        try:
+            registry_path(port, app).unlink()
+        except OSError:
+            pass
+
+
+def pid_alive(pid: int) -> bool:
+    try:
+        os.kill(pid, 0)
+        return True
+    except OSError:
+        return False
+
+
+def reap_orphans(session_only: bool = True, kill_live: bool = False) -> list[int]:
+    """Remove stale browser records; with ``kill_live`` also stop live owned browsers.
+
+    Only records whose profile matches the PID's command line are killed, so a
+    recycled PID or another tool's browser is left alone. ``session_only`` limits
+    the scan to this DSH session to avoid touching concurrent bridges.
+    """
+    killed: list[int] = []
+    sid = _session_id()
+    for app in _BRIDGE_STATE_APPS:
+        base = _state_root(app)
+        for path in list(base.glob("browser_*.json")) + list(base.glob("session_*.json")):
+            try:
+                record = json.loads(path.read_text(encoding="utf-8"))
+            except (OSError, ValueError):
+                try:
+                    path.unlink()
+                except OSError:
+                    pass
+                continue
+            if session_only and record.get("session") != sid:
+                continue
+            pid, profile = record.get("pid"), record.get("profile") or ""
+            if not isinstance(pid, int):
+                try:
+                    path.unlink()
+                except OSError:
+                    pass
+                continue
+            if not pid_alive(pid):
+                try:
+                    path.unlink()
+                except OSError:
+                    pass
+                continue
+            if not kill_live:
+                continue
+            if pid_owns_profile(pid, profile, record.get("started")):
+                try:
+                    if terminate_pid(pid):
+                        killed.append(pid)
+                except OSError:
+                    pass
+                try:
+                    path.unlink()
+                except OSError:
+                    pass
+    return killed
 
 
 def write_state(port: int, **fields) -> None:
@@ -292,61 +477,146 @@ def clear_state(port: int) -> None:
             pass
 
 
-def pid_owns_profile(pid: int, profile: str) -> bool:
-    """True only if `pid` is still the browser we launched (its command line
-    contains our unique profile dir). Guards against reusing a recycled PID."""
-    if not profile or os.name != "nt":
+def terminate_pid(pid: int) -> bool:
+    """Best-effort terminate; the sandbox can deny os.kill even for our child."""
+    if os.name != "nt":
+        for sig in (15, 9):
+            try:
+                os.kill(pid, sig)
+                return True
+            except OSError:
+                continue
         return False
+    try:
+        os.kill(pid, 15)
+        return True
+    except OSError:
+        pass
+    try:
+        import ctypes
+        handle = ctypes.windll.kernel32.OpenProcess(0x0001, False, pid)
+        if handle:
+            try:
+                return bool(ctypes.windll.kernel32.TerminateProcess(handle, 1))
+            finally:
+                ctypes.windll.kernel32.CloseHandle(handle)
+    except Exception:
+        pass
+    return False
+
+
+def process_start_epoch(pid: int) -> float | None:
+    if os.name != "nt":
+        try:
+            out = subprocess.run(
+                ["ps", "-p", str(pid), "-o", "etimes="],
+                capture_output=True, text=True, timeout=5,
+            ).stdout.strip()
+            return time.time() - float(out) if out else None
+        except Exception:
+            return None
+    try:
+        out = subprocess.run(
+            ["powershell", "-NoProfile", "-Command",
+             f"(Get-Process -Id {pid}).StartTime.ToUniversalTime().ToString('o')"],
+            capture_output=True, text=True, timeout=5,
+        ).stdout.strip()
+        if not out:
+            return None
+        return datetime.fromisoformat(out.replace("Z", "+00:00")).timestamp()
+    except Exception:
+        return None
+
+
+def pid_owns_profile(pid: int, profile: str, started: float | None = None) -> bool:
+    """True only if `pid` is still the browser we launched.
+
+    Prefer the command line (unique profile dir). Where WMI is access-denied (the
+    harness sandbox), fall back to the profile dir plus the process start time
+    recorded at launch, so cleanup still works without trusting a recycled PID.
+    """
+    if not profile:
+        return False
+    if os.name != "nt":
+        command = ""
+        try:
+            command = Path(f"/proc/{pid}/cmdline").read_bytes().replace(b"\0", b" ").decode(
+                errors="replace")
+        except OSError:
+            try:
+                command = subprocess.run(
+                    ["ps", "-p", str(pid), "-o", "command="],
+                    capture_output=True, text=True, timeout=5,
+                ).stdout
+            except Exception:
+                return False
+        return profile.lower() in command.lower()
     try:
         out = subprocess.run(
             ["powershell", "-NoProfile", "-Command",
              f'(Get-CimInstance Win32_Process -Filter "ProcessId={pid}").CommandLine'],
             capture_output=True, text=True, timeout=5,
-        ).stdout
+        ).stdout.strip()
     except Exception:
+        out = ""
+    if out:
+        return profile.lower() in out.lower()
+    try:
+        if not Path(profile).is_dir():
+            return False
+        if started is None:
+            started = Path(profile).stat().st_mtime
+        actual = process_start_epoch(pid)
+        return actual is not None and abs(actual - float(started)) <= 60.0
+    except OSError:
         return False
-    return profile.lower() in (out or "").lower()
 
 
 def stop_own_browser(port: int) -> None:
     """Close only the browser this bridge session launched -- and only after
     verifying ownership. Never touch gsdev's host server (another local session
-    may be using it), and never act on a stale record."""
+    may be using it), and never act on a stale record.
+
+    Uses the token when state exists, and the launch registry as the fallback for
+    failures that happened before state was written.
+    """
     st = read_state(port)
+    reg = read_registry(port)
     token = st.get("token")
-    if not token:
-        log(f"no bridge session record on port {port}; nothing to close")
-        return
-    cdp = open_target_page(port, timeout=5, match=st.get("host"))
-    if cdp is not None:
-        try:
-            # Ownership proof: only our injected page carries this token.
-            if cdp.evaluate(f"window.__bridgeSession === {json.dumps(token)}"):
-                try:
-                    cdp.call("Browser.close", timeout=5)
-                except Exception:
-                    pass
-            else:
-                log("page on this port is not our session; not closing it")
-        except Exception:
-            pass
-        try:
-            cdp.close()
-        except Exception:
-            pass
-    pid, profile = st.get("pid"), st.get("profile")
-    if isinstance(pid, int) and pid_owns_profile(pid, profile or ""):
-        try:
-            os.kill(pid, 15)
-        except OSError:
-            pass
+    if token:
+        cdp = open_target_page(port, timeout=5, match=st.get("host"))
+        if cdp is not None:
+            try:
+                # Ownership proof: only our injected page carries this token.
+                if cdp.evaluate(f"window.__bridgeSession === {json.dumps(token)}"):
+                    try:
+                        cdp.call("Browser.close", timeout=5)
+                    except Exception:
+                        pass
+                else:
+                    log("page on this port is not our session; not closing it")
+            except Exception:
+                pass
+            try:
+                cdp.close()
+            except Exception:
+                pass
+    pid = st.get("pid") or reg.get("pid")
+    profile = st.get("profile") or reg.get("profile") or ""
+    if isinstance(pid, int) and pid_owns_profile(pid, profile, st.get("started") or reg.get("started")):
+        terminate_pid(pid)
     clear_state(port)
+    clear_registry(port)
+    if not token and not reg:
+        log(f"no bridge session record on port {port}; nothing to close")
 
 
 def cmd_run(args) -> int:
     if args.target == "localhost":
         bridge_host.ensure_host_server()
     url = target_url(args)
+    clear_session(args.port)
+    reap_orphans(session_only=True, kill_live=False)
     port = args.port
     # Refuse to reuse a browser we don't own: an earlier --leave-running session on
     # this port would otherwise be silently re-attached (and mislabelled as the
@@ -375,11 +645,13 @@ def cmd_run(args) -> int:
         profile = profile_dir(port, args.target)
         profile.mkdir(parents=True, exist_ok=True)
         proc, _marks = launch_browser(args, "about:blank", port, profile)
+        write_registry(port, proc.pid, profile, url, args.target)
         cdp = open_target_page(port, timeout=args.ready_timeout)
         if cdp is not None:
             break
         proc.terminate()
         if attempt >= bridge_host.LAUNCH_ATTEMPTS:
+            stop_own_browser(port)
             raise SystemExit(
                 f"no page attached on port {port} after {bridge_host.LAUNCH_ATTEMPTS} "
                 "attempt(s); is the browser blocked by policy? (raise --ready-timeout or "
@@ -396,7 +668,7 @@ def cmd_run(args) -> int:
     bridge_host.apply_cpu_throttle(cdp, getattr(args, "cpu", 0.0))
     token = uuid.uuid4().hex
     session = dict(target=args.target, url=url, host=match, pid=proc.pid,
-                   profile=str(profile), token=token)
+                   profile=str(profile), token=token, session=_session_id())
     write_state(port, **session)
     try:
         cdp.evaluate(f"window.__bridgeSession = {json.dumps(token)}")
@@ -495,6 +767,7 @@ def cmd_run(args) -> int:
                 time.sleep(0.1)
 
         if args.leave_running:
+            write_session(port, **{k: v for k, v in session.items() if k != "token"})
             log({"left_running": True, "port": port})
             return 0
         try:
@@ -507,7 +780,8 @@ def cmd_run(args) -> int:
         return 0
     except Exception:
         proc.terminate()
-        clear_state(port)
+        stop_own_browser(port)
+        clear_session(port)
         raise
 
 
@@ -1154,7 +1428,14 @@ def cmd_wait_until(args) -> int:
 
 
 def cmd_close(args) -> int:
+    if not read_state(args.port):
+        record = read_session()
+        if record and record.get("port") == args.port:
+            write_state(args.port, **{k: v for k, v in record.items()
+                                      if k in ("host", "target", "url", "pid", "profile", "token")})
     stop_own_browser(args.port)   # only our browser; never gsdev's host server
+    reap_orphans(session_only=True, kill_live=True)
+    clear_session(args.port)
     return 0
 
 
@@ -1335,7 +1616,8 @@ def _compare(got, op, want) -> bool:
 
 
 def add_port(p):
-    p.add_argument("--port", type=int, default=DEFAULT_PORT, help="CDP port (default 9400)")
+    p.add_argument("--port", type=int, default=None,
+                   help="CDP port (default: this session's last run, else 9400)")
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -1624,6 +1906,8 @@ def build_parser() -> argparse.ArgumentParser:
 def main(argv=None) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
+    is_run = getattr(args, "func", None) is cmd_run
+    args.port = resolve_port(getattr(args, "port", None), for_run=is_run)
     return args.func(args)
 
 

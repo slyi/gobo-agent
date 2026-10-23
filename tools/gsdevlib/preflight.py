@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import math
 import re
 import struct
 import zipfile
@@ -16,14 +17,29 @@ from pathlib import Path
 
 # --- Preflight: Scratch compatibility + memory (offline, no browser) ----------
 
-PREFLIGHT_SCHEMA = 1
+PREFLIGHT_SCHEMA = 2
+
+# Renderer constants, from scratch-render's SVGSkin/BitmapSkin.
+_SVG_MAX_TEXTURE_DIMENSION = 2048
+_SVG_BYTES_PER_PIXEL = 12   # texture + per-skin 2D canvas + silhouette
+_BITMAP_BYTES_PER_PIXEL = 8  # texture + silhouette (no per-skin canvas)
+
 _PREFLIGHT_DEFAULTS = {
+    "deviceMemoryMb": 0,                 # 0 = fixed 2 GB-class budgets; set 2048/3072/4096
+                                         # to scale both budgets linearly for larger devices
     "jsonBudget": 5 * 1024 * 1024,      # Scratch's "5 MB" = 5 MiB
     "assetBudget": 10 * 1024 * 1024,    # Scratch's "10 MB" = 10 MiB
     "listLimit": 200_000,
-    "memoryBudget": 512 * 1024 ** 2,    # mobile-safe ceiling: iOS/Android OOM well below
-                                        # the ~2 GiB desktop browser limit (raise for desktop)
-    "svgMemoryFactor": 4,               # SVG needs 4x the pixels (then *4 bytes)
+    "memoryBudget": 870 * 1024 ** 2,    # 0.85 GiB: smooth-play target (1056403018 0.65 and
+                                        # cropped 957967074 0.80 are smooth; 941463385 1.17 stutters)
+    "pixelBudget": 110_000_000,         # smooth-play target (cropped build 104M is smooth)
+    "hardMemoryBudget": 1638 * 1024 ** 2,  # 1.6 GiB: measured 2 GB Android crash line
+    "hardPixelBudget": 300_000_000,        # measured crash line (52 sheets 277M stutter, 57 304M crash)
+    "svgStoredBudget": 100_000_000,     # stored viewBox px; above this, load-time risk, not memory
+    "deviceScale": 2,                   # canvas.width / 480; 2 = 2x tablet, raise for phones
+    "bitmapBytesPerPx": _BITMAP_BYTES_PER_PIXEL,
+    "svgBytesPerPx": _SVG_BYTES_PER_PIXEL,
+    "svgPixelWeight": 2,                # plan's observed ~2x SVG-vs-bitmap weight
     "svgMaxWidth": 2400,
     "svgMaxHeight": 1800,
 }
@@ -34,9 +50,11 @@ def _memory_suggestions(report: dict, budgets: dict) -> list[str]:
     suggestions = []
     if memory['svgPx'] > 0:
         suggestions.append(
-            'convert SVG costumes to bitmap (primary fix:'
-            f" ~{budgets['svgMemoryFactor']}x fewer pixels than SVG, no per-costume canvas)")
-    suggestions.append('pack frames into a spritesheet with fewer, smaller frames (keeps crisp SVG)')
+            'reduce SVG area or draw scale (SVG rasterises at the device scale,'
+            ' with texture + per-skin canvas + silhouette)')
+        suggestions.append('convert SVG costumes to bitmap at the same drawn size'
+                           ' (removes the per-skin canvas; fixed at the PNG size)')
+    suggestions.append('crop costumes to the visible stage area (transparent margins still cost texels)')
     if memory['bitmapPx'] + memory['svgPx'] > 0:
         suggestions.append('downscale costumes/frames (memory scales with area)')
     if report['sounds']['decodedBytes'] > 0:
@@ -56,6 +74,13 @@ def budgets(get_int) -> dict:
         camel = "preflight" + key[0].upper() + key[1:]
         env = "GSDEV_PREFLIGHT_" + re.sub(r"(?<!^)(?=[A-Z])", "_", key).upper()
         values[key] = get_int(env, camel, default)
+    # Device tiering: both budgets scale linearly with the device's RAM when set.
+    # 2048 MB -> 1.25 GiB / 200M (the calibrated 2 GB defaults); 1536 -> 960 MiB / 150M.
+    memory_mb = values.get("deviceMemoryMb", 0)
+    if memory_mb > 0:
+        scale = memory_mb / 2048
+        values["memoryBudget"] = int(1280 * 1024 ** 2 * scale)
+        values["pixelBudget"] = int(200_000_000 * scale)
     return values
 
 
@@ -172,18 +197,43 @@ def _svg_dims(data: bytes) -> dict:
         match = re.match(r"^\s*([0-9]*\.?[0-9]+)\s*(px)?\s*$", value)
         return float(match.group(1)) if match else None
 
-    width, height = scalar(root.attrib.get("width")), scalar(root.attrib.get("height"))
-    if width and height:
-        return {"status": "px", "width": width, "height": height}
+    # The renderer sizes an SVG skin from the viewBox (SVGSkin.setSVG), so use
+    # that first; width/height are only a fallback when it is absent.
+    elements = sum(1 for _ in root.iter())
     view_box = root.attrib.get("viewBox")
     if view_box:
         parts = view_box.replace(",", " ").split()
         if len(parts) == 4:
             try:
-                return {"status": "viewbox", "width": abs(float(parts[2])), "height": abs(float(parts[3]))}
+                return {"status": "viewbox", "width": abs(float(parts[2])),
+                        "height": abs(float(parts[3])), "elements": elements}
             except ValueError:
                 pass
+    width, height = scalar(root.attrib.get("width")), scalar(root.attrib.get("height"))
+    if width and height:
+        return {"status": "px", "width": width, "height": height, "elements": elements}
     return {"status": "unresolved", "reason": "dim"}
+
+
+def _svg_mip_scale(width: float, height: float, device_scale: float,
+                   draw_scale: float = 1.0) -> float:
+    """The power-of-two texture scale SVGSkin picks for a drawable at ``draw_scale``.
+
+    ``requestedScale = min(deviceScale * draw_scale, maxTextureScale)``, then rounded
+    up to a power of two. ``maxTextureScale`` is the largest power of two with
+    ``maxDimension * scale <= 2048``. The result can be below 1 (a sprite authored at
+    37.5% uses the 0.5x MIP), down to the renderer's 1/256 floor.
+    """
+    max_dimension = max(width, height)
+    if max_dimension <= 0:
+        return 1
+    cap = 1
+    test = 2
+    while max_dimension * test <= _SVG_MAX_TEXTURE_DIMENSION:
+        cap = test
+        test *= 2
+    requested = min(max(device_scale * draw_scale, 1 / 256), cap)
+    return max(1 / 256, 2 ** math.ceil(math.log2(requested)))
 
 
 def _pf(level: str, code: str, message: str, detail=None) -> dict:
@@ -205,8 +255,15 @@ def preflight_scan(sb3_path: Path, budgets: dict) -> dict:
         'assets': {'count': 0, 'totalBytes': 0, 'over': [], 'largest': []},
         'lists': {'max': 0, 'over': [], 'atLimit': []},
         'memory': {
-            'bitmapPx': 0, 'svgPx': 0, 'svgUnresolved': 0,
-            'svgMemoryFactor': budgets['svgMemoryFactor'], 'effectivePx': 0,
+            'bitmapPx': 0, 'bitmapTexturePx': 0, 'bitmapSkins': 0,
+            'svgPx': 0, 'svgRasterPx': 0, 'svgSkins': 0, 'svgUnresolved': 0,
+            'cssMathSkins': 0, 'svgElements': 0, 'maxSvgElements': 0,
+            'deviceScale': budgets['deviceScale'],
+            'bitmapBytesPerPx': budgets['bitmapBytesPerPx'],
+            'svgBytesPerPx': budgets['svgBytesPerPx'],
+            'svgPixelWeight': budgets['svgPixelWeight'],
+            'effectivePx': 0, 'pixelCost': 0,
+            'pixelBudget': budgets['pixelBudget'], 'pixelPercent': 0.0,
             'bytes': 0, 'budget': budgets['memoryBudget'], 'percent': 0.0,
             'overDimension': [], 'largest': [],
         },
@@ -231,6 +288,15 @@ def preflight_scan(sb3_path: Path, budgets: dict) -> dict:
                                     f"({len(names)} entries, {total_uncompressed:,} bytes uncompressed)"))
                 return report
             data = json.loads(project_bytes)
+            if not isinstance(data, dict) or 'targets' not in data:
+                if isinstance(data, dict) and data.get('objName'):
+                    findings.append(_pf('error', 'scratch2-project',
+                                        'project.json is a Scratch 2 project; convert it to sb3 '
+                                        'before preflight (Scratch 2 costumes are not scanned)'))
+                else:
+                    findings.append(_pf('error', 'invalid-project',
+                                        'project.json has no "targets"; cannot scan this artifact'))
+                return report
             targets = data.get('targets', [])
 
             report['assets']['count'] = len(sizes)
@@ -250,6 +316,7 @@ def preflight_scan(sb3_path: Path, budgets: dict) -> dict:
             cache: dict[str, dict] = {}
             costume_px: list[tuple] = []
             for target in targets:
+                draw_scale = float(target.get('size', 100) or 100) / 100.0
                 for costume in target.get('costumes', []):
                     fmt = costume.get('dataFormat')
                     md5ext = costume.get('md5ext') or f"{costume.get('assetId')}.{fmt}"
@@ -263,6 +330,8 @@ def preflight_scan(sb3_path: Path, budgets: dict) -> dict:
                         else:
                             kind, dims = _image_dims(blob, fmt)
                             info['kind'] = kind
+                            info['cssMath'] = fmt == 'svg' and any(
+                                token in blob for token in (b'calc(', b'matrix3d', b'var(--'))
                             if isinstance(dims, dict):
                                 if dims.get('status') == 'unresolved':
                                     info['unresolved'] = True
@@ -272,6 +341,7 @@ def preflight_scan(sb3_path: Path, budgets: dict) -> dict:
                                 info['dims'] = dims
                             else:
                                 info['unresolved'] = True
+                            info['elements'] = dims.get('elements', 0) if isinstance(dims, dict) else 0
                         cache[md5ext] = info
                     if info['unresolved'] or not info['dims']:
                         report['coverage']['unresolved'] += 1
@@ -280,22 +350,40 @@ def preflight_scan(sb3_path: Path, budgets: dict) -> dict:
                         continue
                     width, height = info['dims']
                     is_svg = info['kind'] == 'svg'
-                    pixels = width * height
-                    if not is_svg:
-                        # Scratch's texture is the stored bitmap at
-                        # bitmapResolution (2x saves -> quarter the pixels).
-                        res = costume.get('bitmapResolution', 1) or 1
-                        pixels = pixels / (res * res)
-                    pixels = int(round(pixels))
+                    if is_svg and info.get('cssMath'):
+                        report['memory']['cssMathSkins'] += 1
+                    pixels = int(round(width * height))
                     if is_svg:
+                        report['memory']['svgSkins'] += 1
+                        report['memory']['svgElements'] += int(info.get('elements', 0) or 0)
+                        report['memory']['maxSvgElements'] = max(
+                            report['memory']['maxSvgElements'], int(info.get('elements', 0) or 0))
+                    else:
+                        report['memory']['bitmapSkins'] += 1
+                    if is_svg:
+                        # Rasterised at the draw scale: viewBox x deviceScale,
+                        # rounded up to a power of two and capped at 2048.
+                        mip = _svg_mip_scale(width, height, budgets['deviceScale'], draw_scale)
+                        texture = int(round(pixels * mip * mip))
                         report['memory']['svgPx'] += pixels
+                        report['memory']['svgRasterPx'] += texture
                         if width > budgets['svgMaxWidth'] or height > budgets['svgMaxHeight']:
                             report['memory']['overDimension'].append(
                                 {'sprite': target.get('name'), 'costume': costume.get('name'),
                                  'width': width, 'height': height})
                     else:
+                        # The stored PNG is the texture. A resolution-1 asset is
+                        # upscaled to 2x at load (fetchBitmapCanvas_), which is
+                        # 4x the pixels; resolution 2 is used as stored.
+                        res = costume.get('bitmapResolution', 1) or 1
+                        scale_up = (2.0 / res) if res else 2.0
+                        texture = int(round(pixels * scale_up * scale_up))
                         report['memory']['bitmapPx'] += pixels
-                    costume_px.append((pixels, target.get('name'), costume.get('name'), info['kind']))
+                        report['memory']['bitmapTexturePx'] += texture
+                    costume_px.append({
+                        'texture': texture, 'encoded': pixels, 'sprite': target.get('name'),
+                        'costume': costume.get('name'), 'kind': info['kind'],
+                    })
 
             for target in targets:
                 for entry in target.get('lists', {}).values():
@@ -350,26 +438,91 @@ def preflight_scan(sb3_path: Path, budgets: dict) -> dict:
                                 f"project.json is {len(project_bytes):,} bytes "
                                 f"(~{report['json']['percent']}% of {budgets['jsonBudget']:,})"))
         report['memory']['largest'] = [
-            {'pixels': p, 'sprite': s, 'costume': c, 'kind': k}
-            for p, s, c, k in sorted(costume_px, reverse=True)[:10]
+            {'texturePx': item['texture'], 'encodedPx': item['encoded'],
+             'sprite': item['sprite'], 'costume': item['costume'], 'kind': item['kind']}
+            for item in sorted(costume_px, key=lambda x: -x['texture'])[:10]
         ]
         memory = report['memory']
-        memory['effectivePx'] = int(memory['bitmapPx'] + budgets['svgMemoryFactor'] * memory['svgPx'])
-        memory['bytes'] = memory['effectivePx'] * 4 + report['sounds']['decodedBytes']
+        memory['effectivePx'] = memory['bitmapTexturePx'] + memory['svgRasterPx']
+        memory['pixelCost'] = int(memory['bitmapPx'] + budgets['svgPixelWeight'] * memory['svgRasterPx'])
+        memory['bytes'] = int(
+            memory['bitmapTexturePx'] * budgets['bitmapBytesPerPx']
+            + memory['svgRasterPx'] * budgets['svgBytesPerPx']
+            + report['sounds']['decodedBytes'])
         memory['percent'] = round(memory['bytes'] / budgets['memoryBudget'] * 100, 1) if budgets['memoryBudget'] else 0.0
-        if memory['bytes'] > budgets['memoryBudget']:
+        memory['pixelPercent'] = round(memory['pixelCost'] / budgets['pixelBudget'] * 100, 1) if budgets['pixelBudget'] else 0.0
+        hard_mem = max(budgets.get('hardMemoryBudget', 0), budgets['memoryBudget'])
+        hard_px = max(budgets.get('hardPixelBudget', 0), budgets['pixelBudget'])
+        if memory['bytes'] > hard_mem:
             findings.append(_pf('error', 'memory-over-budget',
-                f"worst-case memory (all costumes loaded) ~{memory['bytes'] / 2 ** 30:.2f} GiB "
-                f"({memory['percent']}% of {_budget_text(budgets['memoryBudget'])})",
-                {'bitmapPx': memory['bitmapPx'], 'svgPx': int(memory['svgPx']),
-                 'svgFactor': budgets['svgMemoryFactor'],
+                f"estimated renderer memory (all costumes loaded) ~{memory['bytes'] / 2 ** 30:.2f} GiB "
+                f"({memory['percent']}% of the {_budget_text(budgets['memoryBudget'])} target; "
+                f"hard limit {_budget_text(hard_mem)})",
+                {'bitmapPx': memory['bitmapPx'], 'bitmapTexturePx': memory['bitmapTexturePx'],
+                 'svgPx': int(memory['svgPx']), 'svgRasterPx': memory['svgRasterPx'],
+                 'deviceScale': budgets['deviceScale'],
+                 'bitmapBytesPerPx': budgets['bitmapBytesPerPx'],
+                 'svgBytesPerPx': budgets['svgBytesPerPx'],
                  'soundPcmBytes': report['sounds']['decodedBytes'],
                  'suggestions': _memory_suggestions(report, budgets)}))
+        elif memory['bytes'] > budgets['memoryBudget']:
+            findings.append(_pf('error', 'memory-over-target',
+                f"estimated renderer memory ~{memory['bytes'] / 2 ** 30:.2f} GiB "
+                f"({memory['percent']}% of the {_budget_text(budgets['memoryBudget'])} smooth target); "
+                'above the smooth-play target, will stutter',
+                {'bitmapPx': memory['bitmapPx'], 'svgRasterPx': memory['svgRasterPx'],
+                 'soundPcmBytes': report['sounds']['decodedBytes']}))
+        if memory['pixelCost'] > hard_px:
+            findings.append(_pf('error', 'pixel-over-budget',
+                f"project-wide costume pixels ~{memory['pixelCost']:,} "
+                f"({memory['pixelPercent']}% of the {budgets['pixelBudget']:,} target; "
+                f"hard limit {hard_px:,}; bitmap + {budgets['svgPixelWeight']}x SVG raster)",
+                {'bitmapPx': memory['bitmapPx'], 'svgPx': int(memory['svgPx']),
+                 'svgPixelWeight': budgets['svgPixelWeight'],
+                 'deviceScale': budgets['deviceScale']}))
+        elif memory['pixelCost'] > budgets['pixelBudget']:
+            findings.append(_pf('error', 'pixel-over-target',
+                f"project-wide costume pixels ~{memory['pixelCost']:,} "
+                f"({memory['pixelPercent']}% of the {budgets['pixelBudget']:,} smooth target); "
+                'above the smooth-play target, will stutter',
+                {'bitmapPx': memory['bitmapPx'], 'svgRasterPx': memory['svgRasterPx'],
+                 'svgPixelWeight': budgets['svgPixelWeight'],
+                 'deviceScale': budgets['deviceScale']}))
         if memory['overDimension']:
             findings.append(_pf('warning', 'svg-over-dimension',
                                 f"{len(memory['overDimension'])} SVG(s) exceed "
                                 f"{budgets['svgMaxWidth']}x{budgets['svgMaxHeight']}",
                                 memory['overDimension'][:10]))
+        svg_bytes = memory['svgRasterPx'] * budgets['svgBytesPerPx']
+        if svg_bytes > budgets['memoryBudget']:
+            findings.append(_pf('warning', 'svg-hang-risk',
+                                f"SVG raster alone is {svg_bytes / 2**30:.1f} GiB (budget "
+                                f"{budgets['memoryBudget'] / 2**30:.2f} GiB); large SVG projects "
+                                'can hang a low-RAM device, not just crash the tab (count is '
+                                'irrelevant: 4096 4x4 skins are fine)',
+                                {'svgSkins': memory['svgSkins'],
+                                 'bitmapSkins': memory['bitmapSkins'],
+                                 'svgRasterBytes': svg_bytes}))
+        if memory['svgPx'] > budgets['svgStoredBudget']:
+            findings.append(_pf('warning', 'slow-load-risk',
+                                f"{memory['svgPx'] / 1e6:.0f}M stored SVG pixels; large SVG "
+                                'projects can take minutes to load and may be discarded by '
+                                'mobile tab management before they play',
+                                {'svgPx': memory['svgPx'], 'svgSkins': memory['svgSkins']}))
+        if memory['cssMathSkins']:
+            findings.append(_pf('warning', 'svg-css-math',
+                                f"{memory['cssMathSkins']} SVG skin(s) use CSS calc()/matrix3d()/"
+                                'variables; browser CSS math can dominate startup even when '
+                                'textures are small',
+                                {'cssMathSkins': memory['cssMathSkins']}))
+        if memory['svgElements'] > 50_000 or memory['maxSvgElements'] > 50_000:
+            findings.append(_pf('warning', 'svg-complexity',
+                                f"{memory['svgElements']:,} SVG elements across "
+                                f"{memory['svgSkins']} skins (max {memory['maxSvgElements']:,}); "
+                                'above ~50k elements, parsing/DOM can add tens of seconds to '
+                                'load even when pixels are low (10k is instant, 100k is ~30s)',
+                                {'svgElements': memory['svgElements'],
+                                 'maxSvgElements': memory['maxSvgElements']}))
         if report['coverage']['unresolved']:
             findings.append(_pf('warning', 'unresolved-assets',
                                 f"{report['coverage']['unresolved']} asset(s) had no measurable "
@@ -389,9 +542,14 @@ def print_preflight(report: dict) -> None:
           f" ({j.get('percent', 0.0)}%)" + ('  OVER' if j['over'] else ''))
     print(f"assets: {a['count']} unique, {a['totalBytes']:,} bytes total, "
           f"{len(a['over'])} over {report['budgets']['assetBudget']:,}")
-    print(f"memory (worst case): ~{m['bytes'] / 2 ** 30:.2f} GiB ({m['percent']}% of {_budget_text(m['budget'])})"
-          f"  = (bitmap {m['bitmapPx']:,} px + svg {int(m['svgPx']):,} px x{m['svgMemoryFactor']}) x4"
+    print(f"memory (estimated): ~{m['bytes'] / 2 ** 30:.2f} GiB ({m['percent']}% of {_budget_text(m['budget'])})")
+    print(f"  = bitmap {m['bitmapTexturePx']:,} tex px x{m['bitmapBytesPerPx']}"
+          f" + svg {m['svgRasterPx']:,} raster px x{m['svgBytesPerPx']}"
+          f" (viewBox {int(m['svgPx']):,} px, scale {m['deviceScale']}x)"
           f" + {report['sounds']['decodedBytes']:,} B sound PCM")
+    print(f"costume pixels: {m['pixelCost']:,} / {m['pixelBudget']:,}"
+          f" ({m['pixelPercent']}%; bitmap + {m['svgPixelWeight']}x SVG viewBox)"
+          + ('  OVER' if m['pixelCost'] > m['pixelBudget'] else ''))
     print(f"svg unresolved: {m['svgUnresolved']}")
     print(f"largest list: {l['max']:,} / {report['budgets']['listLimit']:,} items")
     s = report['sounds']
@@ -400,7 +558,8 @@ def print_preflight(report: dict) -> None:
     print(f"measurement gaps: {report['coverage']['unresolved']}")
     print(f"sha256: {report.get('sha256', '')[:16]}...")
     for item in report['memory']['largest'][:5]:
-        print(f"  largest: {item['sprite']}::{item['costume']} {item['pixels']:,} px ({item['kind']})")
+        print(f"  largest: {item['sprite']}::{item['costume']} {item['texturePx']:,} tex px"
+              f" (encoded {item['encodedPx']:,}, {item['kind']})")
     for finding in report['findings']:
         print(f"[{finding['level']:7}] {finding['code']}: {finding['message']}")
         detail = finding.get('detail')

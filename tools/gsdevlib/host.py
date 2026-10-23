@@ -433,10 +433,23 @@ def _detached_kwargs() -> dict:
 _HOST_STATE_APPS = ("gobo-agent", "kilo")
 
 
+def _host_state_root(app: str) -> Path:
+    """Stable state root shared across harness processes (temp is per DSH call)."""
+    override = os.environ.get("GSDEV_STATE_DIR")
+    if override:
+        base = Path(override).expanduser()
+    else:
+        base = Path(__file__).resolve().parents[2] / ".gsbridge" / "host"
+    try:
+        (base / app).mkdir(parents=True, exist_ok=True)
+    except OSError:
+        base = Path(os.environ.get("TEMP", tempfile.gettempdir())) / "gobo-agent"
+        (base / app).mkdir(parents=True, exist_ok=True)
+    return base / app
+
+
 def _host_state_path(app: str) -> Path:
-    return Path(os.environ.get("TEMP", tempfile.gettempdir())) / app / (
-        f"gsdev_host_{HOST_SERVER_PORT}.json"
-    )
+    return _host_state_root(app) / f"gsdev_host_{HOST_SERVER_PORT}.json"
 
 
 def _host_state_write_path() -> Path:
@@ -482,6 +495,48 @@ def clear_host_state() -> None:
             _host_state_path(app).unlink()
         except OSError:
             pass
+
+
+def host_state_records() -> list[tuple[Path, dict]]:
+    records: list[tuple[Path, dict]] = []
+    for app in _HOST_STATE_APPS:
+        for path in _host_state_root(app).glob("gsdev_host_*.json"):
+            try:
+                record = json.loads(path.read_text(encoding="utf-8"))
+            except (OSError, ValueError):
+                try:
+                    path.unlink()
+                except OSError:
+                    pass
+                continue
+            if isinstance(record, dict):
+                records.append((path, record))
+    return records
+
+
+def reap_host_orphans(kill_live: bool = False) -> list[int]:
+    """Drop records whose browser and server are gone; optionally kill live browsers.
+
+    Only processes whose executable name matches the launch record are touched.
+    """
+    killed: list[int] = []
+    for path, record in host_state_records():
+        browser_pid = record.get("hostPid")
+        browser_name = record.get("hostBrowser") or ""
+        live_browser = (isinstance(browser_pid, int) and browser_name
+                        and _name_matches(_pid_name(browser_pid), browser_name))
+        server_pid = record.get("pid")
+        live_server = isinstance(server_pid, int) and bool(_pid_name(server_pid))
+        if live_browser and kill_live:
+            terminate_pids([browser_pid])
+            killed.append(browser_pid)
+            live_browser = False
+        if not live_browser and not live_server:
+            try:
+                path.unlink()
+            except OSError:
+                pass
+    return killed
 
 
 def probe_host_server(token: str | None = None, timeout: float = 1.0) -> dict | None:
@@ -698,6 +753,27 @@ def dismiss_browser_dialogs(port: int) -> None:
         log(f"closed browser dialog: {url}")
 
 
+def _pid_name(pid: int) -> str:
+    if os.name != "nt":
+        try:
+            return subprocess.run(
+                ["ps", "-p", str(pid), "-o", "comm="],
+                capture_output=True, text=True, timeout=5,
+            ).stdout.strip().lower()
+        except Exception:
+            return ""
+    for candidate, _parent, name in _win32_process_table():
+        if candidate == pid:
+            return name.lower()
+    return ""
+
+
+def _name_matches(actual: str, expected: str) -> bool:
+    actual, expected = (actual or "").lower(), (expected or "").lower()
+    return bool(actual and expected and (
+        actual == expected or actual in expected or expected in actual))
+
+
 def close_host(port: int, keep_server: bool = False) -> None:
     """Close the browser on `port`.
 
@@ -705,8 +781,17 @@ def close_host(port: int, keep_server: bool = False) -> None:
     (restarting it immediately usually fails on Windows, where hostserver binds
     exclusively, so the just-closed port is still in TIME_WAIT).
     """
-    process_name = Path(find_browser() or "chrome.exe").name.lower()
+    state = read_host_state()
+    process_name = state.get("hostBrowser") or Path(find_browser() or "chrome.exe").name.lower()
     pids = find_editor_pids(port, process_name, host_profile_dir(port))
+    if not pids:
+        # The CDP port may already be closed (failed launch / crashed renderer),
+        # but the launch record still identifies the process by PID + profile.
+        pid = state.get("hostPid")
+        profile = state.get("hostProfile") or ""
+        if (isinstance(pid, int) and profile and Path(profile).is_dir()
+                and _name_matches(_pid_name(pid), process_name)):
+            pids = [pid]
     if pids:
         terminate_pids(pids)
         log(f"killed host browser (pid {', '.join(str(p) for p in pids)})")
@@ -716,9 +801,9 @@ def close_host(port: int, keep_server: bool = False) -> None:
         return
     # Only stop the host server if we started it (recorded token) and it is still
     # the same process -- never a foreign application that happens to hold the port.
-    state = read_host_state()
     token = state.get("token")
     if not token:
+        clear_host_state()
         return
     if not port_open(HOST_SERVER_PORT):
         clear_host_state()
@@ -982,8 +1067,10 @@ def ensure_host(port: int, headless: bool, software: bool) -> tuple[CDP, bool]:
             # endpoint below instead of declaring it here.
             log(f"{Path(browser).name} printed no DevTools line; probing for the endpoint")
         # Record the CDP port so a later `close` (with no --port) can find this
-        # browser instead of guessing the default.
-        update_host_state(cdpPort=port)
+        # browser instead of guessing the default. pid/profile are the crash record:
+        # close can kill it even when the page/port is no longer reachable.
+        update_host_state(cdpPort=port, hostPid=proc.pid, hostProfile=str(profile),
+                          hostBrowser=Path(browser).name.lower(), hostStarted=time.time())
         # Phase 1: a debuggable page (the DevTools event above, or probing if the
         # browser stayed silent). Phase 2: the page's own ready event below. A launcher
         # stub that handed off (exit 0, no line) leaves the browser coming up, which is a

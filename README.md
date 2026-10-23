@@ -331,6 +331,86 @@ The standalone `screenshot` command builds/reloads, captures, then stops the pro
 `--no-build` skips compilation but still reloads. It is not a state-preserving snapshot
 of a running scene. Failure-bundle screenshots use the standing host's stage capture.
 
+### Preflight memory model
+
+`preflight` is an offline *estimate*, not a measurement. It reports two budgets:
+
+- **estimated renderer memory** — bitmap costumes: the stored PNG pixels, ×4 when
+  `bitmapResolution` is 1 (the VM upscales it to 2× at load), at 8 bytes/px
+  (texture + silhouette); SVG costumes: viewBox area × MIP², where
+  `mip = 2^ceil(log2(min(deviceScale, 2048/maxDimension)))`, at 12 bytes/px
+  (texture + per-skin canvas + silhouette); plus decoded sound PCM. Default **smooth
+  target 0.85 GiB** with a separate **hard limit 1.6 GiB**: above the target is a
+  `*-over-target` error (will stutter), above the hard limit is a crash error. Evidence: 1056403018
+  0.65 and the cropped 957967074 0.80 play smoothly; 941463385 1.17, 1331442506 1.39 and
+  52 sheets 1.55 stutter; 57 sheets 1.70 and 1151108301 fail.
+- **project-wide costume pixels** — stored bitmap pixels + 2× SVG raster (draw-scale
+  aware), smooth target 110,000,000 and hard limit 300,000,000 (cropped 104M is smooth;
+  941463385 185M, 1331442506 249M and 52 sheets 277M stutter; 57 sheets 304M and
+  941195677 588M fail).
+
+`deviceScale` defaults to 2 (`canvas.width / 480`, the value the renderer uses for
+SVG MIPs). It is an integer setting: use 4 for a 3.5× phone (the MIP is a power of
+two, so 3.5 and 4 select the same 4× level) or 1 for a desktop-only scan. Every
+threshold is a `GSDEV_PREFLIGHT_*` environment variable or a `gobo-agent.json`
+`preflight*` key.
+
+`deviceMemoryMb` (0 = off) scales both budgets linearly from the 2 GB baseline
+(2048 → 0.85 GiB target / 110M). The matrix targets 2 GB and up; sub-2 GB hardware is
+out of scope.
+
+Device profiles (provisional, set with `GSDEV_PREFLIGHT_MEMORY_BUDGET` /
+`GSDEV_PREFLIGHT_PIXEL_BUDGET`):
+
+| profile | target | hard limit | evidence |
+| --- | --- | --- | --- |
+| Android/iPad, 2 GB | 0.85 GiB / 110M | 1.6 GiB / 300M | 1056403018 (0.65) and cropped 957967074 (0.80) smooth; 941463385 (1.17), 1331442506 (1.39) and 52 sheets (1.55) stutter; 57 sheets (1.70/304M) and 1151108301 fail |
+| Chromebook, 4 GB (single unit: 3.79 GiB usable, 5.5 GiB swap) | 5 GiB / 900M | 5 GiB / 900M | 941195677 (3.36/588), 951197417 (4.57/790) and 627583842 (3.17/568) pass/stutter; 117487433 (14.46/2.59G) fails |
+| Desktop, 16+ GB | 16 GiB / 3G | 16 GiB / 3G | 117487433 (14.46 GiB/2.59G) passes on a high-RAM desktop |
+
+Desktop is RAM/GPU-dependent: the 14.46 GiB Bad Apple passes on a high-RAM desktop
+(16 GiB / 3G budget), so the mobile and Chromebook lines are not desktop limits.
+
+`svg-hang-risk` warns when SVG raster alone exceeds the memory budget — count doesn't
+matter (4096 4×4 skins are ~65k px and fine). 117487433's 15 GiB of SVG raster drove a
+4 GB Chromebook into a full swap hang at ~25% (power cycle), not just a tab crash.
+
+`slow-load-risk` warns when stored SVG pixels exceed 100M — 1331442506's 124M predicts
+the ~4 min phone load. `svg-complexity` warns above ~50k elements — 1331442506's 61
+frames hold **472k elements** (max 7,873), the DOM/parse side of the same load; measured
+controls: 1k and 10k elements load instantly, 100k takes ~30 s on desktop and mobile.
+The 30 s is node-count-bound, not text-length-bound: ~4 MB of SVG text in one element
+loads in 136 ms, 10k padded nodes in 3.4 s, and 100k zero-size nodes in 19.4 s — paint
+accounts for the last ~10 s.
+`svg-css-math` warns when an SVG uses CSS `calc()`, `matrix3d()`
+or variables. A 1k-node control at 1000% loads in 367 ms static vs 278/291/432 ms for
+vars/calc/trig+pow — CSS math is not a major load driver at that scale; node count is.
+1041228311's own startup is its floor sheets at 1000%: only 5 of the 11 floor costumes
+are ever drawn, each becoming a 1536×1728 texture (31.85 MB with canvas + silhouette),
+~159 MB in total, generated on first draw in ~2.7 s and stuttery until cached; the
+other 6 costumes never rasterise. The site's ~5 s page load (embed DOM 4.48 s) is
+GUI/network on top of the ~2.7 s local VM load; the ~3 s after Play is this texture
+generation, not CSS.
+
+Large SVG sets sometimes **prewarm** on load (`switch_costume` + `stamp` in a green-flag
+loop) to avoid first-draw hitches; 1387738760 preloads 181 costumes this way. Prewarming
+doesn't change the retained total, only when it is paid — so it shows up as startup time,
+not a new memory cost.
+
+ChromeOS tolerates more than mobile because it swaps/zrams and has a desktop-class
+GPU; the Chromebook line is therefore between 4.57 and 14.46 GiB, and 5 GiB / 900M is
+the lowest known passing bound (951197417 uses ~4.6 GiB of a 9.3 GiB RAM+swap budget
+and stutters). This is a **4 GB** machine, not a 2 GB one; a true 2 GB Chromebook
+would need its own (lower) tier.
+
+It uses each target's initial size (`size/100`) and one cached MIP per costume; the full
+viewBox still costs texels, and scripts that change size aren't modelled. On a 1× canvas a
+37.5% sprite uses the 0.5× MIP (1331442506 measures 356 MB), but on 2×/3.5× the same size
+requests 0.75/1.31 and still rounds to the 1× MIP because the 1920-wide viewBox caps at
+1× — so the mobile estimate stays 1.39 GiB. The stage framebuffer, extra scale MIPs and
+driver overhead are not modelled, so treat a pass as "no detected texture risk", never as
+a guarantee of crash-free mobile playback.
+
 ## Debug and release builds
 
 `build`, `run`, `screenshot`, `test` and `profile` accept `--mode debug|release`
@@ -448,6 +528,23 @@ python tools/gsbridge.py expect_no_errors
 python tools/gsbridge.py profile --seconds 3
 python tools/gsbridge.py close
 ```
+
+`run --leave-running` records the port in `.gsbridge/current_<DSH_SESSION_ID>.json`;
+later commands with no `--port` use it (explicit `--port` and `GSBRIDGE_PORT` override).
+`GSBRIDGE_STATE_DIR` moves the state root. `close` clears the record and the per-port
+host state.
+
+Every launch also writes `.gsbridge/<app>/browser_<port>.json` (PID + profile)
+immediately after spawn. `close` uses the session token when present and that registry
+otherwise, killing only a PID whose command line/profile/start time matches the launch;
+`run` reaps dead records, and `close` reaps live ones for this DSH session. A ctypes
+`TerminateProcess` fallback covers sandboxes that deny `os.kill`. On POSIX, ownership
+uses `/proc/<pid>/cmdline` (or `ps`), termination uses `SIGTERM`/`SIGKILL`, and host
+records match `ps -o comm=` names.
+
+Maintainer-only cleanup scenarios (gitignored, not shipped):
+`tools/test_gsbridge_cleanup.py`, `tools/test_gsbridge_session.py`, and
+`tools/test_gsdev_cleanup.py` (Windows and POSIX).
 
 Targets are `localhost`, `github`, `editor`, `production` (`--project-id N`), and `url`.
 `production` runs the page's existing project; other loading paths accept a

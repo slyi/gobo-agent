@@ -546,6 +546,7 @@ read_host_state = gsdev_host.read_host_state
 write_host_state = gsdev_host.write_host_state
 update_host_state = gsdev_host.update_host_state
 clear_host_state = gsdev_host.clear_host_state
+reap_host_orphans = gsdev_host.reap_host_orphans
 probe_host_server = gsdev_host.probe_host_server
 ensure_host_server = gsdev_host.ensure_host_server
 host_target = gsdev_host.host_target
@@ -685,6 +686,7 @@ def cmd_run(args: argparse.Namespace) -> int:
         build_project(resolve_mode(args))
     artifact = artifact_path(args)
     t0 = time.monotonic()
+    reap_host_orphans(kill_live=False)
     cdp, launched = ensure_host(args.port, args.headless, args.software)
     dismiss_browser_dialogs(args.port)
     ready = time.monotonic() - t0
@@ -824,6 +826,7 @@ def cmd_close(args: argparse.Namespace) -> int:
     else:
         port = resolve_port(port)
     close_host(port)
+    reap_host_orphans(kill_live=False)
     return 0
 
 
