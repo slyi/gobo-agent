@@ -359,6 +359,23 @@ threshold is a `GSDEV_PREFLIGHT_*` environment variable or a `gobo-agent.json`
 (2048 → 0.85 GiB target / 110M). The matrix targets 2 GB and up; sub-2 GB hardware is
 out of scope.
 
+**Alpha does not change the texture estimate.** Scratch uploads every skin as RGBA
+(`Skin._setTexture` uses `gl.RGBA`; `SVGSkin` uploads `getImageData`), and the
+silhouette is maintained for opaque and transparent skins alike. An RGBA PNG may be
+larger on disk and cost more to download/decode, but an RGB PNG of the same dimensions
+uses the same renderer bytes; transparent SVG margins still cost the full viewBox. A
+paired 512×512 test measured 2,097,152 B for both RGB and RGBA PNGs (1.9 KB vs 2.2 KB
+encoded), and 12,582,912 B for both opaque and 50%-alpha SVG.
+
+Loading also has a **transient peak** above the retained total: decoded bitmap RGBA
+buffers coexist with the textures being uploaded and the compressed assets still held
+by the loader. `preflight` reports `load peak = retained + 4 bytes × bitmap raster +
+compressed assets`; above the hard limit it raises `load-peak-over-budget`. This is a
+worst-case all-bitmap-costumes model, not a measurement of how many decodes a browser
+runs at once; SVG already carries its per-skin canvas/ImageData in the retained 12 B/px.
+It catches the AVIF floor project `floor-avif-wasd-192`: 1.30 GiB retained, but
+~2.03 GiB peak, which fits the 2 GB Android run and the consistent iPad crash.
+
 Device profiles (provisional, set with `GSDEV_PREFLIGHT_MEMORY_BUDGET` /
 `GSDEV_PREFLIGHT_PIXEL_BUDGET`):
 

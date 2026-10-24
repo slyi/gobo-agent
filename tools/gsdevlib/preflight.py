@@ -35,6 +35,7 @@ _PREFLIGHT_DEFAULTS = {
     "pixelBudget": 110_000_000,         # smooth-play target (cropped build 104M is smooth)
     "hardMemoryBudget": 1638 * 1024 ** 2,  # 1.6 GiB: measured 2 GB Android crash line
     "hardPixelBudget": 300_000_000,        # measured crash line (52 sheets 277M stutter, 57 304M crash)
+    "peakMemoryBudget": 0,                 # 0 = hardMemoryBudget; retain + transient decode/upload
     "svgStoredBudget": 100_000_000,     # stored viewBox px; above this, load-time risk, not memory
     "deviceScale": 2,                   # canvas.width / 480; 2 = 2x tablet, raise for phones
     "bitmapBytesPerPx": _BITMAP_BYTES_PER_PIXEL,
@@ -327,6 +328,7 @@ def preflight_scan(sb3_path: Path, budgets: dict) -> dict:
             'effectivePx': 0, 'pixelCost': 0,
             'pixelBudget': budgets['pixelBudget'], 'pixelPercent': 0.0,
             'bytes': 0, 'budget': budgets['memoryBudget'], 'percent': 0.0,
+            'decodePeakBytes': 0, 'decodePeakBudget': 0, 'decodePeakPercent': 0.0,
             'overDimension': [], 'largest': [], 'targetSizes': [],
         },
         'sounds': {'count': 0, 'bytes': 0, 'decodedBytes': 0, 'unresolved': 0},
@@ -550,6 +552,30 @@ def preflight_scan(sb3_path: Path, budgets: dict) -> dict:
         memory['pixelPercent'] = round(memory['pixelCost'] / budgets['pixelBudget'] * 100, 1) if budgets['pixelBudget'] else 0.0
         hard_mem = max(budgets.get('hardMemoryBudget', 0), budgets['memoryBudget'])
         hard_px = max(budgets.get('hardPixelBudget', 0), budgets['pixelBudget'])
+        # Loading is not free: the retained texture/silhouette total coexists with
+        # the decoded RGBA buffers being uploaded and the compressed assets still
+        # held by the loader. This is deliberately an all-costumes peak: the VM
+        # creates a skin per costume at load, and Safari can decode several at once.
+        peak_budget = budgets.get('peakMemoryBudget') or hard_mem
+        memory['decodePeakBudget'] = peak_budget
+        memory['decodePeakBytes'] = int(
+            memory['bytes']
+            + memory['bitmapTexturePx'] * 4
+            + report['assets']['totalBytes'])
+        memory['decodePeakPercent'] = (
+            round(memory['decodePeakBytes'] / peak_budget * 100, 1) if peak_budget else 0.0)
+        if memory['decodePeakBytes'] > peak_budget:
+            findings.append(_pf('error', 'load-peak-over-budget',
+                f"transient load peak ~{memory['decodePeakBytes'] / 2 ** 30:.2f} GiB "
+                f"(retained {memory['bytes'] / 2 ** 30:.2f} GiB + bitmap decode/upload "
+                f"{memory['bitmapTexturePx'] * 4 / 2 ** 30:.2f} GiB + compressed assets "
+                f"{report['assets']['totalBytes'] / 2 ** 30:.2f} GiB); "
+                f"above the {_budget_text(peak_budget)} hard limit. Safari/iPad can crash "
+                'while decoding/uploading bitmaps even when retained memory fits',
+                {'retainedBytes': memory['bytes'],
+                 'decodePeakBytes': memory['decodePeakBytes'],
+                 'compressedBytes': report['assets']['totalBytes'],
+                 'suggestions': _memory_suggestions(report, budgets)}))
         if memory['bytes'] > hard_mem:
             findings.append(_pf('error', 'memory-over-budget',
                 f"estimated renderer memory (all costumes loaded) ~{memory['bytes'] / 2 ** 30:.2f} GiB "
@@ -650,6 +676,10 @@ def print_preflight(report: dict) -> None:
           f" + svg {m['svgRasterPx']:,} raster px x{m['svgBytesPerPx']}"
           f" (viewBox {int(m['svgPx']):,} px, scale {m['deviceScale']}x)"
           f" + {report['sounds']['decodedBytes']:,} B sound PCM")
+    print(f"load peak (transient): ~{m['decodePeakBytes'] / 2 ** 20:.1f} MiB "
+          f"({m['decodePeakBytes'] / 2 ** 30:.2f} GiB; {m['decodePeakPercent']}% of "
+          f"{_budget_text(m['decodePeakBudget'])})"
+          + ('  OVER' if m['decodePeakBytes'] > m['decodePeakBudget'] else ''))
     print(f"costume pixels: {m['pixelCost']:,} / {m['pixelBudget']:,}"
           f" ({m['pixelPercent']}%; bitmap + {m['svgPixelWeight']}x SVG raster)"
           + ('  OVER' if m['pixelCost'] > m['pixelBudget'] else ''))
