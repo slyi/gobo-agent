@@ -26,9 +26,10 @@ profiler the harness already provides instead of writing counters.
 | macOS/Linux | `./setup.sh` | `./tools/gsdev ...` |
 
 Windows resolves/downloads portable Python when needed; POSIX launchers require a
-Python 3.10+ (configured, portable, or on `PATH`). Prefer the launchers over assuming
-`python` is on `PATH`. Examples below use the Windows launcher (`tools\gsdev.ps1`); on
-macOS/Linux substitute `./tools/gsdev`, or use `python tools/gsdev.py` on any OS.
+Python 3.12+ (the setup baseline; sb2gs also needs 3.12). Prefer the launchers over
+assuming `python` is on `PATH`. Examples below use the Windows launcher
+(`tools\gsdev.ps1`); on macOS/Linux substitute `./tools/gsdev`, or use
+`python tools/gsdev.py` on any OS.
 
 ```powershell
 # Start once; keep project + browser for later commands.

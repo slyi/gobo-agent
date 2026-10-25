@@ -71,14 +71,14 @@ macOS/Linux launchers (mirror the PowerShell ones; a Chromium-based browser is
 expected to be installed):
 
 ```sh
-./setup.sh                        # find Python 3.10+, then install the tools
+./setup.sh                        # find Python 3.12+, then install the tools
 ./tools/gsdev doctor              # resolve Python and run the dev loop
 ./setup.sh --only vendor --force  # other bootstrap flags pass straight through
 ```
 
 `GSDEV_PYTHON` overrides the interpreter; otherwise the launchers check the tools
 root's `python/` (or `GSDEV_PYTHON_DIR`) and then `python3`/`python` on `PATH`,
-requiring 3.10+ in every case. The tools root is `GSDEV_TOOLS`, else `GSDEV_HOME`,
+requiring 3.12+ in every case. The tools root is `GSDEV_TOOLS`, else `GSDEV_HOME`,
 else a per-user cache (`%LOCALAPPDATA%\gobo-agent` on Windows,
 `~/.cache/gobo-agent` on macOS/Linux), so goboscript, sb2gs, the portable Python and
 the `@scratch/*` host bundles are downloaded once per machine and shared by every
@@ -94,7 +94,7 @@ copy (source commit + wheels) under the tools root's `sb2gs/`, with no pip/uv, a
 it through the interpreter (`python <tools-root>/sb2gs/run.py …`) after applying
 gobo-agent's patches; an `sb2gs` on `PATH` (or `GSDEV_SB2GS`) is only reported by
 `doctor`, never executed or patched. It needs Python 3.12+; the installer shims
-upstream’s 3.14-only type-parameter and annotation assumptions for 3.12. The bundled
+upstream’s newer type-parameter and annotation assumptions for 3.12. The bundled
 runner disables the optional Brotli decoders (`brotli`/`brotlicffi`) so httpx cannot
 negotiate `br` from a stale machine-wide copy; sb2gs only needs gzip/identity. This
 avoids CVE-2026-111497 ("HTTP2Shell"). A user-supplied sb2gs is not modified: if you

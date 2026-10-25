@@ -90,12 +90,11 @@ TIMEOUT = 120.0
 
 # --- sb2gs (Scratch -> goboscript importer), installed non-optionally ---------
 #
-# sb2gs is pure Python; it needs Python >=3.12 and four third-party packages. The
+# sb2gs is pure Python; it needs Python >=3.12 and three third-party packages. The
 # embeddable Python has no pip, so instead of installing a package manager we
 # fetch pinned wheels from PyPI, verify their SHA256, and unpack them (wheels are
 # zips) into .tools/sb2gs/site-packages alongside the pinned sb2gs source. No pip,
-# no uv, no admin. Pillow is the only compiled dependency, so it is the only
-# platform-specific wheel; everything else is ``py3-none-any``.
+# no uv, no admin. All pinned wheels are ``py3-none-any``.
 SB2GS_COMMIT = "8cb5dabdb5ffaa42209643469d1a53722ac762aa"
 SB2GS_ZIP_URL = f"https://github.com/aspizu/sb2gs/archive/{SB2GS_COMMIT}.zip"
 SB2GS_ZIP_SHA256 = "53a6e562244fbeae6cae4bf2f1c17b8c3ff9366e4c6a97769525db3084532d14"
@@ -104,7 +103,7 @@ SB2GS_ZIP_SHA256 = "53a6e562244fbeae6cae4bf2f1c17b8c3ff9366e4c6a97769525db308453
 # it, so an older checkout (an adopted project's runtime copy, say) cannot
 # silently downgrade a newer machine-wide install: install_sb2gs refuses unless
 # --force is given. The patcher hash still detects same-version drift.
-SB2GS_PATCH_VERSION = 4
+SB2GS_PATCH_VERSION = 5
 
 # name -> (filename, url, sha256); all universal (py3-none-any) wheels.
 SB2GS_WHEELS = {
@@ -144,28 +143,6 @@ SB2GS_WHEELS = {
     "tomlkit": ("tomlkit-0.15.1-py3-none-any.whl",
                 "https://files.pythonhosted.org/packages/13/bc/8c13eb66537dce1d2bd3a57132902f38d0e7f5bb46fa9f4daed9fe9d76ee/tomlkit-0.15.1-py3-none-any.whl",
                 "177a05aece5a8ca5266fd3c448abb47b8d352f09d477d3ca8332db4d89b24304"),
-}
-
-# pillow is compiled; one cp312 wheel per platform.
-SB2GS_PILLOW = {
-    "win_amd64": ("pillow-12.3.0-cp312-cp312-win_amd64.whl",
-                  "https://files.pythonhosted.org/packages/45/89/da2f7971a317f83d807fdd4065c0af40208e59e692cc43d315a71a0e96d1/pillow-12.3.0-cp312-cp312-win_amd64.whl",
-                  "a2b55dd6b2a4c4b7d87ffa56bdb33fdc5fdb9a462173861a7bc097f17d91cb09"),
-    "win_arm64": ("pillow-12.3.0-cp312-cp312-win_arm64.whl",
-                  "https://files.pythonhosted.org/packages/de/47/4845a0a6c0dbf1db8456bd9fc791f13c5ced7ced20606d08a0aacfd25b49/pillow-12.3.0-cp312-cp312-win_arm64.whl",
-                  "331b624368d4f1d069149002f25f44bc61c8919ce8ddb3c45bdad8f6e2d89510"),
-    "macosx_arm64": ("pillow-12.3.0-cp312-cp312-macosx_11_0_arm64.whl",
-                     "https://files.pythonhosted.org/packages/d8/66/9a386a92561f402389a4fc70c18838bf6d35eb5eb5c6850b4b2dc64f5048/pillow-12.3.0-cp312-cp312-macosx_11_0_arm64.whl",
-                     "ffd0c5368496f41b0944be820fcb7a838aa6e623d250b01acf2643939c3f99d7"),
-    "macosx_x86_64": ("pillow-12.3.0-cp312-cp312-macosx_10_13_x86_64.whl",
-                      "https://files.pythonhosted.org/packages/37/bf/fb3ebff8ddcb76aac5a01389251bbbb9519922a9b520d8247c1ca864a25d/pillow-12.3.0-cp312-cp312-macosx_10_13_x86_64.whl",
-                      "ba09209fbe443b4acccebe845d8a138b89a8f4fbaeedd44953490b5315d5e965"),
-    "manylinux_x86_64": ("pillow-12.3.0-cp312-cp312-manylinux_2_27_x86_64.manylinux_2_28_x86_64.whl",
-                         "https://files.pythonhosted.org/packages/84/21/a35af28dcc61f37ed850a2d64c65c701321dfbf25085e469d5559360cbbf/pillow-12.3.0-cp312-cp312-manylinux_2_27_x86_64.manylinux_2_28_x86_64.whl",
-                         "78cb2c6865a35ab8ff8b75fd122f6033b92a62c82801110e48ddd6c936a45d91"),
-    "manylinux_aarch64": ("pillow-12.3.0-cp312-cp312-manylinux_2_27_aarch64.manylinux_2_28_aarch64.whl",
-                          "https://files.pythonhosted.org/packages/25/27/ac8f99618ffd3dde21db0f4d4b1d2ab00c0880595bfd17df103f7f39fd0c/pillow-12.3.0-cp312-cp312-manylinux_2_27_aarch64.manylinux_2_28_aarch64.whl",
-                          "d9c7f76c0673154f044e9d78c8655fb4213f6ca31a836df48b40fe5d187717b9"),
 }
 
 
@@ -677,11 +654,23 @@ def _apply_py312_shim(source: Path) -> None:
     parameter defaults in json_object.py and PEP 649 deferred annotations for
     TYPE_CHECKING-only imports. Python 3.12 parses the former only after removing
     the defaults and evaluates annotations eagerly unless the module opts into
-    PEP 563. Also use the current goboscript `build -i` CLI rather than the
-    removed `b` alias.
+    PEP 563. Also run goboscript `build` in the project directory rather than
+    relying on the removed `b` alias or a platform-specific path argument.
     """
     package = source / "sb2gs"
     json_object = package / "json_object.py"
+    costumes = package / "costumes.py"
+    if costumes.is_file():
+        text = costumes.read_text(encoding="utf-8")
+        text = text.replace("from PIL import Image\n", "")
+        text = text.replace(
+            "def fix_bitmap_center(costume: JSONObject, path: Path) -> None:\n"
+            "    img = Image.open(path)",
+            "def fix_bitmap_center(costume: JSONObject, path: Path) -> None:\n"
+            "    from PIL import Image\n\n"
+            "    img = Image.open(path)",
+        )
+        costumes.write_text(text, encoding="utf-8")
     if json_object.is_file():
         text = json_object.read_text(encoding="utf-8")
         text = text.replace("[T = Any]", "[T]")
@@ -707,22 +696,11 @@ def _apply_py312_shim(source: Path) -> None:
         verify.write_text(text, encoding="utf-8")
 
 
-def _sb2gs_pillow_key() -> str | None:
-    machine = platform.machine().lower()
-    if os.name == "nt":
-        return "win_arm64" if machine in ("arm64", "aarch64") else "win_amd64"
-    if sys.platform == "darwin":
-        return "macosx_arm64" if machine in ("arm64", "aarch64") else "macosx_x86_64"
-    if sys.platform.startswith("linux"):
-        return "manylinux_aarch64" if machine in ("aarch64", "arm64") else "manylinux_x86_64"
-    return None
-
-
 def _sb2gs_system_packages_ok(source: Path) -> bool:
     """True when the running interpreter can import sb2gs with no bundled wheels.
 
     Tries the pinned sb2gs source with only its directory on sys.path; a full
-    Python that already has httpx/pillow/rich/tomlkit (and their deps) imports it,
+    Python that already has httpx/rich/tomlkit (and their deps) imports it,
     so the wheel download is skipped.
     """
     code = "import sys; sys.path.insert(0, sys.argv[1]); import sb2gs"
@@ -2122,7 +2100,7 @@ def install_sb2gs(force: bool = False, offline: bool = False) -> None:
             f"sb2gs is not installed and --offline was given; expected {sb2gs_root()}"
         )
     if sys.version_info[:2] < (3, 12):
-        # sb2gs is shimmed for 3.12 and uses cp312 pillow wheels. The core harness
+        # sb2gs is shimmed for 3.12 and uses universal wheels only. The core harness
         # still runs on 3.10+, so warn rather than failing setup on older Python.
         _log(f"sb2gs needs Python 3.12+; skipping (found {platform.python_version()})")
         return
@@ -2303,25 +2281,18 @@ def install_sb2gs(force: bool = False, offline: bool = False) -> None:
     _apply_py312_shim(source)
 
     site = sb2gs_site_dir()
-    key: str | None = None
     wheels: list[tuple[str, str, str]] = []
     if _sb2gs_system_packages_ok(source):
-        # A full interpreter already provides httpx/pillow/rich/tomlkit: skip the
+        # A full interpreter already provides httpx/rich/tomlkit: skip the
         # wheels and import them from its own site-packages.
         if site.exists():
             _remove_tree(site)
         mode = "system"
         _log("sb2gs: interpreter already has its packages (skipping wheels)")
     else:
-        key = _sb2gs_pillow_key()
-        if key is None or key not in SB2GS_PILLOW:
-            raise SetupError(
-                f"no pinned pillow wheel for {sys.platform}/{platform.machine()}; "
-                "sb2gs cannot be installed on this platform"
-            )
         if site.exists():
             _remove_tree(site)
-        wheels = [*SB2GS_WHEELS.values(), SB2GS_PILLOW[key]]
+        wheels = list(SB2GS_WHEELS.values())
         for filename, url, sha in wheels:
             data = _download(url, filename)
             if hashlib.sha256(data).hexdigest() != sha:
@@ -2336,7 +2307,7 @@ def install_sb2gs(force: bool = False, offline: bool = False) -> None:
         json.dumps(
             {"commit": SB2GS_COMMIT, "patcher": _patcher_id(),
              "patchVersion": SB2GS_PATCH_VERSION, "mode": mode,
-             "pillow": key, "packages": sorted(SB2GS_WHEELS)},
+             "packages": sorted(SB2GS_WHEELS)},
             indent=2,
         ) + "\n",
         encoding="utf-8",
