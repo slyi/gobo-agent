@@ -458,10 +458,10 @@ def ensure_dependencies(need_bundles: bool = True) -> None:
     """
     missing_tools = resolve_goboscript() is None
     missing_bundles = need_bundles and not host_bundles_present()
-    # sb2gs needs Python 3.14+; on an older interpreter it can never be present, so
+    # sb2gs needs Python 3.12+; on an older interpreter it can never be present, so
     # do not let that keep triggering setup. A user-installed sb2gs counts too.
     missing_sb2gs = (
-        sys.version_info[:2] >= (3, 14)
+        sys.version_info[:2] >= (3, 12)
         and bootstrap.system_sb2gs() is None
         and not bootstrap.sb2gs_present()
     )
@@ -2300,8 +2300,8 @@ def cmd_doctor(args: argparse.Namespace) -> int:
                           f"v{bootstrap.SB2GS_PATCH_VERSION}; update the checkout)")
         else:
             ok("sb2gs", str(source))
-    elif sys.version_info[:2] < (3, 14):
-        warn("sb2gs", f"needs Python 3.14+ (found {platform.python_version()})")
+    elif sys.version_info[:2] < (3, 12):
+        warn("sb2gs", f"needs Python 3.12+ (found {platform.python_version()})")
     else:
         fail("sb2gs", f"not installed; {_setup_hint()}")
 
@@ -2453,19 +2453,16 @@ def _run_sb2gs(argv: list[str]) -> int:
     except ValueError:
         raise SystemExit("GSDEV_SB2GS_TIMEOUT is not a number")
 
-    system = bootstrap.system_sb2gs()
+    # A system sb2gs is reported by doctor/status but never executed: it has its
+    # own interpreter and cannot receive the Brotli-blocking runner that ships
+    # with the bundled source. Always run the pinned copy.
     try:
-        if system:
-            code = subprocess.run(
-                [system, *argv], timeout=timeout, env=bootstrap.sb2gs_env()
-            ).returncode
-        else:
-            if not bootstrap.sb2gs_present():
-                if os.environ.get("GSDEV_NO_AUTO_SETUP", "").strip().lower() in ("1", "true", "yes"):
-                    raise SystemExit("sb2gs is not installed; run `gsdev setup --only sb2gs`")
-                log("sb2gs not installed; downloading it (no admin)")
-                bootstrap.run_setup(only="sb2gs")
-            code = bootstrap.run_sb2gs(argv)
+        if not bootstrap.sb2gs_present():
+            if os.environ.get("GSDEV_NO_AUTO_SETUP", "").strip().lower() in ("1", "true", "yes"):
+                raise SystemExit("sb2gs is not installed; run `gsdev setup --only sb2gs`")
+            log("sb2gs not installed; downloading it (no admin)")
+            bootstrap.run_setup(only="sb2gs")
+        code = bootstrap.run_sb2gs(argv)
     except subprocess.TimeoutExpired:
         _clean_sb2gs_failure(input_path, output_path, input_existed, output_existed, verify=verify)
         raise SystemExit(

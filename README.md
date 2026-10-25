@@ -93,8 +93,13 @@ Setup also provides **sb2gs** (the Scratch → GoboScript importer). It installs
 copy (source commit + wheels) under the tools root's `sb2gs/`, with no pip/uv, and runs
 it through the interpreter (`python <tools-root>/sb2gs/run.py …`) after applying
 gobo-agent's patches; an `sb2gs` on `PATH` (or `GSDEV_SB2GS`) is only reported by
-`doctor`, never executed or patched. It needs Python 3.14+. Decompile a Scratch project
-and adopt it in one flow:
+`doctor`, never executed or patched. It needs Python 3.12+; the installer shims
+upstream’s 3.14-only type-parameter and annotation assumptions for 3.12. The bundled
+runner disables the optional Brotli decoders (`brotli`/`brotlicffi`) so httpx cannot
+negotiate `br` from a stale machine-wide copy; sb2gs only needs gzip/identity. This
+avoids CVE-2026-111497 ("HTTP2Shell"). A user-supplied sb2gs is not modified: if you
+install it without uv, upgrade Brotli to >=1.2.1 or brotlicffi to >=1.2.1.0, or remove it.
+Decompile a Scratch project and adopt it in one flow:
 
 ```powershell
 tools\gsdev.ps1 sb2gs --id 12345678 my_project.sb3   # download + decompile

@@ -35,8 +35,8 @@ Build output (your `.sb3`, `debug/`) stays at the project root.
 ## Before you start
 
 - A Chromium-based browser. Windows already has Edge; on macOS install Chrome.
-- Python. On Windows you need none — `setup` fetches a portable Python 3.14. On
-  macOS/Linux you need Python 3.10+ (3.14+ if you want the Scratch importer).
+- Python. On Windows you need none — `setup` fetches a portable Python 3.12. On
+  macOS/Linux you need Python 3.12+ (the Scratch importer and setup baseline).
 - One gobo-agent checkout to run `init` from: `git clone <gobo-agent>` or
   download the repository ZIP. `init` copies or references the runtime; you do
   not edit the harness.
@@ -208,8 +208,8 @@ python <gobo>\tools\gsdev.py init --project .\scratch\my_project
 ```
 
 Conversion is best-effort: some projects do not decompile. Always `goboscript
-build` the result before trusting it. sb2gs needs Python 3.14+ (the Windows
-portable is 3.14).
+build` the result before trusting it. sb2gs needs Python 3.12+ (the Windows
+portable is 3.12).
 
 A project that was itself built by gobo-agent carries its `//` notes as calls to a
 carrier proc whose definition was stripped; sb2gs decompiles them back to `// note`

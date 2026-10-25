@@ -90,7 +90,7 @@ TIMEOUT = 120.0
 
 # --- sb2gs (Scratch -> goboscript importer), installed non-optionally ---------
 #
-# sb2gs is pure Python but needs >=3.14 and four third-party packages. The
+# sb2gs is pure Python; it needs Python >=3.12 and four third-party packages. The
 # embeddable Python has no pip, so instead of installing a package manager we
 # fetch pinned wheels from PyPI, verify their SHA256, and unpack them (wheels are
 # zips) into .tools/sb2gs/site-packages alongside the pinned sb2gs source. No pip,
@@ -104,7 +104,7 @@ SB2GS_ZIP_SHA256 = "53a6e562244fbeae6cae4bf2f1c17b8c3ff9366e4c6a97769525db308453
 # it, so an older checkout (an adopted project's runtime copy, say) cannot
 # silently downgrade a newer machine-wide install: install_sb2gs refuses unless
 # --force is given. The patcher hash still detects same-version drift.
-SB2GS_PATCH_VERSION = 1
+SB2GS_PATCH_VERSION = 4
 
 # name -> (filename, url, sha256); all universal (py3-none-any) wheels.
 SB2GS_WHEELS = {
@@ -146,26 +146,26 @@ SB2GS_WHEELS = {
                 "177a05aece5a8ca5266fd3c448abb47b8d352f09d477d3ca8332db4d89b24304"),
 }
 
-# pillow is compiled; one cp314 wheel per platform.
+# pillow is compiled; one cp312 wheel per platform.
 SB2GS_PILLOW = {
-    "win_amd64": ("pillow-12.3.0-cp314-cp314-win_amd64.whl",
-                  "https://files.pythonhosted.org/packages/f1/e0/492879f69d94f91f60fc8cd05ba03650e9520afebb2fb7aa12777d7c7f38/pillow-12.3.0-cp314-cp314-win_amd64.whl",
-                  "fdafc9cce40277e0f7a0feabce0ee50dd2fa1800f3b38015e51296b5e814048d"),
-    "win_arm64": ("pillow-12.3.0-cp314-cp314-win_arm64.whl",
-                  "https://files.pythonhosted.org/packages/c9/ac/6b11f2875f1c2ac040d84e1bbf9cf22a88038f901ca1037898b280b38365/pillow-12.3.0-cp314-cp314-win_arm64.whl",
-                  "e91206ee562682b51b98ef4b26a6ef48fd84e15fd4c4bc5ec768eb641d206838"),
-    "macosx_arm64": ("pillow-12.3.0-cp314-cp314-macosx_11_0_arm64.whl",
-                     "https://files.pythonhosted.org/packages/c7/da/32c752228ae345f489e3a42499d817b6c3996da7e8a3bc7a04fc806b243b/pillow-12.3.0-cp314-cp314-macosx_11_0_arm64.whl",
-                     "e158cb00350dc278f3b91551101aa7d12415a66ebf2c91d8d5ac14e56ddd3ad0"),
-    "macosx_x86_64": ("pillow-12.3.0-cp314-cp314-macosx_10_15_x86_64.whl",
-                      "https://files.pythonhosted.org/packages/85/e2/73c77d218410b14f5f2d565e8a998d5317b7b9c75368d29985139f7a46f0/pillow-12.3.0-cp314-cp314-macosx_10_15_x86_64.whl",
-                      "ba54cfebe86920a559a7c4d6b9050791c20513650a1952ebe3368c7dc70306f8"),
-    "manylinux_x86_64": ("pillow-12.3.0-cp314-cp314-manylinux_2_27_x86_64.manylinux_2_28_x86_64.whl",
-                         "https://files.pythonhosted.org/packages/5c/44/c85361f65dbe00eea8576ee467c768d25129989efb76e94f205e9ca9bb46/pillow-12.3.0-cp314-cp314-manylinux_2_27_x86_64.manylinux_2_28_x86_64.whl",
-                         "251bf95b67017e27b13d82f5b326234ca62d70f9cf4c2b9032de2358a3b12c7b"),
-    "manylinux_aarch64": ("pillow-12.3.0-cp314-cp314-manylinux_2_27_aarch64.manylinux_2_28_aarch64.whl",
-                          "https://files.pythonhosted.org/packages/b1/9d/8b2c807dbef61a5197c047afe99823787eb66f63daf9fb2432f91d6f0462/pillow-12.3.0-cp314-cp314-manylinux_2_27_aarch64.manylinux_2_28_aarch64.whl",
-                          "e9aeb04d6aef139de265b29683e119b638208f88cf73cdd1658aa07221165321"),
+    "win_amd64": ("pillow-12.3.0-cp312-cp312-win_amd64.whl",
+                  "https://files.pythonhosted.org/packages/45/89/da2f7971a317f83d807fdd4065c0af40208e59e692cc43d315a71a0e96d1/pillow-12.3.0-cp312-cp312-win_amd64.whl",
+                  "a2b55dd6b2a4c4b7d87ffa56bdb33fdc5fdb9a462173861a7bc097f17d91cb09"),
+    "win_arm64": ("pillow-12.3.0-cp312-cp312-win_arm64.whl",
+                  "https://files.pythonhosted.org/packages/de/47/4845a0a6c0dbf1db8456bd9fc791f13c5ced7ced20606d08a0aacfd25b49/pillow-12.3.0-cp312-cp312-win_arm64.whl",
+                  "331b624368d4f1d069149002f25f44bc61c8919ce8ddb3c45bdad8f6e2d89510"),
+    "macosx_arm64": ("pillow-12.3.0-cp312-cp312-macosx_11_0_arm64.whl",
+                     "https://files.pythonhosted.org/packages/d8/66/9a386a92561f402389a4fc70c18838bf6d35eb5eb5c6850b4b2dc64f5048/pillow-12.3.0-cp312-cp312-macosx_11_0_arm64.whl",
+                     "ffd0c5368496f41b0944be820fcb7a838aa6e623d250b01acf2643939c3f99d7"),
+    "macosx_x86_64": ("pillow-12.3.0-cp312-cp312-macosx_10_13_x86_64.whl",
+                      "https://files.pythonhosted.org/packages/37/bf/fb3ebff8ddcb76aac5a01389251bbbb9519922a9b520d8247c1ca864a25d/pillow-12.3.0-cp312-cp312-macosx_10_13_x86_64.whl",
+                      "ba09209fbe443b4acccebe845d8a138b89a8f4fbaeedd44953490b5315d5e965"),
+    "manylinux_x86_64": ("pillow-12.3.0-cp312-cp312-manylinux_2_27_x86_64.manylinux_2_28_x86_64.whl",
+                         "https://files.pythonhosted.org/packages/84/21/a35af28dcc61f37ed850a2d64c65c701321dfbf25085e469d5559360cbbf/pillow-12.3.0-cp312-cp312-manylinux_2_27_x86_64.manylinux_2_28_x86_64.whl",
+                         "78cb2c6865a35ab8ff8b75fd122f6033b92a62c82801110e48ddd6c936a45d91"),
+    "manylinux_aarch64": ("pillow-12.3.0-cp312-cp312-manylinux_2_27_aarch64.manylinux_2_28_aarch64.whl",
+                          "https://files.pythonhosted.org/packages/25/27/ac8f99618ffd3dde21db0f4d4b1d2ab00c0880595bfd17df103f7f39fd0c/pillow-12.3.0-cp312-cp312-manylinux_2_27_aarch64.manylinux_2_28_aarch64.whl",
+                          "d9c7f76c0673154f044e9d78c8655fb4213f6ca31a836df48b40fe5d187717b9"),
 }
 
 
@@ -314,6 +314,18 @@ def _download(url: str, label: str) -> bytes:
 
 def _sha256(data: bytes) -> str:
     return hashlib.sha256(data).hexdigest()
+
+
+def _remove_tree(path: Path) -> None:
+    """rmtree, clearing read-only bits first (Windows __pycache__/locked files)."""
+    def onexc(func, target, error):
+        os.chmod(target, stat.S_IWRITE)
+        func(target)
+
+    if sys.version_info >= (3, 12):
+        shutil.rmtree(path, onexc=onexc)
+    else:
+        shutil.rmtree(path, onerror=lambda func, target, info: onexc(func, target, info[1]))
 
 
 def _check_integrity(data: bytes, integrity: str, label: str) -> None:
@@ -497,7 +509,7 @@ def _extract_dist_web(data: bytes, package: str) -> int:
 
     destination = bundles_dir() / package
     if destination.exists():
-        shutil.rmtree(destination)
+        _remove_tree(destination)
     prefix = "package/"
     base = destination
     root = base.resolve()
@@ -658,6 +670,43 @@ def sb2gs_patch_version() -> int | None:
     return version if isinstance(version, int) else None
 
 
+def _apply_py312_shim(source: Path) -> None:
+    """Make the pinned sb2gs source parse and import on Python 3.12.
+
+    Upstream targets 3.14 and relies on two newer behaviours: PEP 696 type
+    parameter defaults in json_object.py and PEP 649 deferred annotations for
+    TYPE_CHECKING-only imports. Python 3.12 parses the former only after removing
+    the defaults and evaluates annotations eagerly unless the module opts into
+    PEP 563. Also use the current goboscript `build -i` CLI rather than the
+    removed `b` alias.
+    """
+    package = source / "sb2gs"
+    json_object = package / "json_object.py"
+    if json_object.is_file():
+        text = json_object.read_text(encoding="utf-8")
+        text = text.replace("[T = Any]", "[T]")
+        json_object.write_text(text, encoding="utf-8")
+    for path in package.glob("*.py"):
+        text = path.read_text(encoding="utf-8")
+        if "from __future__ import annotations" not in text:
+            path.write_text("from __future__ import annotations\n" + text, encoding="utf-8")
+    verify = package / "verify.py"
+    if verify.is_file():
+        text = verify.read_text(encoding="utf-8")
+        old = (
+            '    proc = subprocess.run(  # noqa: S603\n'
+            '        [goboscript, "b", project], check=False\n'
+            '    )'
+        )
+        new = (
+            '    proc = subprocess.run(  # noqa: S603\n'
+            '        [goboscript, "build"], check=False, cwd=project\n'
+            '    )'
+        )
+        text = text.replace(old, new)
+        verify.write_text(text, encoding="utf-8")
+
+
 def _sb2gs_pillow_key() -> str | None:
     machine = platform.machine().lower()
     if os.name == "nt":
@@ -696,6 +745,13 @@ from pathlib import Path
 _here = Path(__file__).resolve().parent
 sys.path.insert(0, str(_here / "source"))
 sys.path.insert(0, str(_here / "site-packages"))
+
+# CVE-2026-111497 ("HTTP2Shell"): httpx enables Brotli (`br`) whenever
+# `brotli`/`brotlicffi` is importable, including a stale machine-wide copy.
+# sb2gs only downloads project JSON/assets and does not need br, so make the
+# optional decoders unavailable and let httpx use gzip/identity instead.
+sys.modules["brotli"] = None
+sys.modules["brotlicffi"] = None
 
 from sb2gs import main
 
@@ -2065,10 +2121,10 @@ def install_sb2gs(force: bool = False, offline: bool = False) -> None:
         raise SetupError(
             f"sb2gs is not installed and --offline was given; expected {sb2gs_root()}"
         )
-    if sys.version_info[:2] < (3, 14):
-        # sb2gs uses 3.13+/3.14 syntax and cp314 pillow wheels. The core harness
+    if sys.version_info[:2] < (3, 12):
+        # sb2gs is shimmed for 3.12 and uses cp312 pillow wheels. The core harness
         # still runs on 3.10+, so warn rather than failing setup on older Python.
-        _log(f"sb2gs needs Python 3.14+; skipping (found {platform.python_version()})")
+        _log(f"sb2gs needs Python 3.12+; skipping (found {platform.python_version()})")
         return
     source = sb2gs_source_dir()
     if _is_foreign_sb2gs_tree():
@@ -2078,7 +2134,7 @@ def install_sb2gs(force: bool = False, offline: bool = False) -> None:
             "tools root, or point them at a fresh directory."
         )
     if source.exists():
-        shutil.rmtree(source)
+        _remove_tree(source)
     source.mkdir(parents=True, exist_ok=True)
     zip_bytes = _download(SB2GS_ZIP_URL, f"sb2gs {SB2GS_COMMIT[:8]}")
     if hashlib.sha256(zip_bytes).hexdigest() != SB2GS_ZIP_SHA256:
@@ -2244,6 +2300,8 @@ def install_sb2gs(force: bool = False, offline: bool = False) -> None:
                 text = text.replace(old, new, 1)
         syn.write_text(text, encoding="utf-8")
 
+    _apply_py312_shim(source)
+
     site = sb2gs_site_dir()
     key: str | None = None
     wheels: list[tuple[str, str, str]] = []
@@ -2251,7 +2309,7 @@ def install_sb2gs(force: bool = False, offline: bool = False) -> None:
         # A full interpreter already provides httpx/pillow/rich/tomlkit: skip the
         # wheels and import them from its own site-packages.
         if site.exists():
-            shutil.rmtree(site)
+            _remove_tree(site)
         mode = "system"
         _log("sb2gs: interpreter already has its packages (skipping wheels)")
     else:
@@ -2262,7 +2320,7 @@ def install_sb2gs(force: bool = False, offline: bool = False) -> None:
                 "sb2gs cannot be installed on this platform"
             )
         if site.exists():
-            shutil.rmtree(site)
+            _remove_tree(site)
         wheels = [*SB2GS_WHEELS.values(), SB2GS_PILLOW[key]]
         for filename, url, sha in wheels:
             data = _download(url, filename)
@@ -2305,10 +2363,10 @@ def run_sb2gs(argv: list[str]) -> int:
         system = system_sb2gs()
         extra = f"; a user install at {system} is left untouched" if system else ""
         raise SetupError(f"sb2gs is not installed; run `gsdev setup` first{extra}")
-    if sys.version_info[:2] < (3, 14):
+    if sys.version_info[:2] < (3, 12):
         raise SetupError(
-            f"sb2gs needs Python 3.14+ (found {platform.python_version()}); run gsdev "
-            "with the portable Python or a 3.14+ interpreter"
+            f"sb2gs needs Python 3.12+ (found {platform.python_version()}); run gsdev "
+            "with the portable Python or a 3.12+ interpreter"
         )
     raw = os.environ.get("GSDEV_SB2GS_TIMEOUT", "1800")
     try:
