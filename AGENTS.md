@@ -149,6 +149,17 @@ holds the real reporter again. A converted `.gs` therefore reads
 round-trips exactly; built with plain `goboscript` the marker is just a false condition
 (in a value position, the marker text).
 
+Compound assignment lowering (goboscript 3.2.1):
+
+- `x += 1` → `change x by 1`
+- `x -= 1` → `set x to (x - 1)` (a `data_setvariableto` plus `operator_subtract`)
+- `x += -1` → `change x by -1`
+- `x = x - 1` / `x = x + 1` → `set x to (...)`; they do not become `change`
+
+Only `+=` is special-cased to `data_changevariableby`. In hot loops where the extra
+reporter blocks matter, prefer `x += -1`; otherwise `x -= 1` is the clearer form.
+Do not assume `-=` is optimized to `change by -1`.
+
 ## Ground rules
 
 - Run browsers **headless** unless a visible investigation is requested.
