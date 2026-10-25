@@ -2535,9 +2535,9 @@ def cmd_selftest(args: argparse.Namespace) -> int:
     check(
         "sb2gs pins",
         len(bootstrap.SB2GS_WHEELS) >= 10
-        and "win_amd64" in bootstrap.SB2GS_PILLOW
+        and all("py3-none-any.whl" in wheel[0] for wheel in bootstrap.SB2GS_WHEELS.values())
         and bool(bootstrap.SB2GS_ZIP_SHA256),
-        f"{len(bootstrap.SB2GS_WHEELS)} wheels + pillow per platform",
+        f"{len(bootstrap.SB2GS_WHEELS)} universal wheels",
     )
     host_html = (HOST_DIR / "host.html")
     html_text = host_html.read_text(encoding="utf-8") if host_html.exists() else ""
