@@ -231,240 +231,20 @@ variable/list name clash, e.g. `x` → `x_list`) — but the author's **casing i
 (goboscript is case-sensitive and preserves what is written), so `camelCase` names and
 `xOrigin: %s` argument names stay as written. So Scratch `Render._stickman` is
 `Render.stickman` after import, while `gridY2` stays `gridY2`. When poking live values (`set`/`set_batch`) or reading with `get`, use
-the compiled name — find it with `inspect`/`props` or from the decompiled `.gs`
-(the "gobo-agent patches" list below is where such renames are explained).
+the compiled name — find it with `inspect`/`props` or from the decompiled `.gs`.
 
 ## Known upstream limitations (sb2gs / goboscript)
 
-Recorded here so adopters know what to expect. These are upstream behaviours; we
-don't fix them and don't file bugs for them. Issue links are for reference.
-Conversion is not guaranteed pixel-identical: always `goboscript build`, then run
-and compare (e.g. `gsdev run` + `screenshot`) rather than assuming equivalence.
+Conversion is best-effort and not guaranteed pixel-identical: always build, run, and compare (`gsdev run` + `screenshot`) rather than assuming equivalence. These are toolchain limits, not project bugs.
 
-**Tool installs.** `setup` downloads the pinned sb2gs into the shared tools root
-(`%LOCALAPPDATA%\gobo-agent`, overridable via `GSDEV_HOME`/`GSDEV_TOOLS`) and applies
-the patches there; the upstream tree is never vendored, so the working copy only ever
-holds the recipe. A user-installed `sb2gs` (`GSDEV_SB2GS` or on `PATH`) is detected and
-reported by `doctor` but **never executed or modified** — the harness always runs its
-own pinned, patched copy. The install records a patcher id, so a plain `gsdev setup`
-re-applies the patches after a commit that changes them (`--force` re-downloads even
-when they match), and `setup` refuses to write into a tools root that does not look
-like a gobo-agent install (which is what a mis-set `GSDEV_TOOLS`/`GSDEV_HOME` pointing
-at someone else's checkout would produce). It also records a **patch-set version**
-(`SB2GS_PATCH_VERSION`): `setup` refuses to let an older checkout — an adopted project's
-runtime copy, say — replace a newer shared install unless `--force` is given, and
-`doctor` warns when the install and the running checkout disagree. The patcher hash
-still detects drift within one version.
+- **Invalid sprite filenames** — sb2gs writes `<sprite>.gs` without sanitising; `/`, Windows-reserved characters, and trailing dots/spaces fail. Rename those sprites in Scratch first.
+- **Unsupported opcodes/inputs** — some blocks (for example backdrop-switch hats and color input fields) have no decompiler. sb2gs reports them and may leave blank expressions or invalid source.
+- **Off-center costume pivots** — sb2gs re-canvases SVG and bitmap costumes to move the pivot to the image center, changing costume bytes/md5 and sometimes scale. goboscript has no rotation-center syntax, so projects that rely on an off-center pivot or Scratch's rotated-bounds behaviour may build but render blank even with the original assets preserved.
+- **Comments** — line-leading `//` notes survive only through `gsdev build`; plain `goboscript build` rejects them, and `#` comments are compile-time only.
+- **Compiler version** — the last upstream goboscript release rejects negative literals. `setup` installs a pinned prebuilt of upstream `main`; use `gsdev build` rather than another `goboscript` on `PATH`.
+- **Large or complex projects** — prefer a local `.sb3` (`gsdev sb2gs <file.sb3>`). The `--id` downloader is bounded and cleans partial output on failure.
 
-**sb2gs**
-
-- **Sprite names that aren't valid filenames** — each sprite is written as
-  `<name>.gs` (`decompile.py:64`), unsanitized. `/` fails on every OS; on Windows
-  `* : < > ? |` (and a trailing `.`/space) fail too. Costume/sound names are
-  handled (renamed, or hash-named on Windows) by `get_asset_filename`. Upstream:
-  [#23](https://github.com/aspizu/sb2gs/issues/23) (sprites, closed not-planned),
-  [#4](https://github.com/aspizu/sb2gs/issues/4) (assets). There is no upstream
-  fix; use a project without such names, or rename them there.
-- **Misc unsupported opcodes/inputs** — e.g. `event_whenbackdropswitchesto`
-  ([#25](https://github.com/aspizu/sb2gs/issues/25)), color input fields
-  ([#5](https://github.com/aspizu/sb2gs/issues/5)), float→int
-  ([#13](https://github.com/aspizu/sb2gs/issues/13)).
-- **Vector costumes with an off-center rotation center are rewritten** —
-  `fix_vector_center` (`costumes.py`) replaces such an SVG with a 480×360
-  stage-sized SVG and drops its `<g transform>`, so the costume's bytes (and md5)
-  change and any layout that relied on the transform is lost. This is sb2gs's
-  workaround for goboscript having no rotation-center syntax (below), so the md5
-  will not match the source project's costume. gobo-agent patches the check to a
-  0.5-unit tolerance, so a merely rounded "centre" (e.g. 1015495507's Cat, 0.41
-  off) is left alone; a genuinely off-centre pivot (e.g. RBMP) is still rewritten.
-- **Bitmap costumes with an off-center rotation center are rewritten** —
-  `fix_bitmap_center` (`costumes.py`) pastes the image onto a 960×720 canvas so
-  the original pivot lands at the canvas centre, changing the costume's bytes
-  (and md5). It **ignores `bitmapResolution`** (and goboscript compiles costumes
-  without it), so 2× bitmaps are re-canvased at the wrong scale — on the
-  texture-atlas project 1047137851 the tiles survived while the font text
-  rendered scrambled. Only genuinely off-centre pivots are affected (the
-  0.5-unit/±1-pixel tolerance above leaves rounded centres alone).
-
-**goboscript** (handled by gobo-agent's bundled build)
-
-- **Costume rotation centers can't be set** — the `costumes` statement takes only
-  file paths/`as`/globs (no rotation-center option), and the compiled costume
-  omits `rotationCenterX`/`rotationCenterY`/`bitmapResolution`; the Scratch VM
-  then falls back to the rendered skin's center (`scratch-vm` `loadCostume`), so
-  every costume rotates about its image center. This is upstream
-  [#269](https://github.com/aspizu/goboscript/issues/269) (closed *not planned*:
-  the maintainer's answer is to convert costumes with sb2gs — i.e. the
-  `fix_vector_center` step above). Projects that depend on an off-center pivot or
-  on Scratch's rotated-bounding-box quirk (e.g. RBMP packing,
-  [project 1387642307](https://scratch.mit.edu/projects/1387642307)) cannot be
-  reproduced — the decompiled project builds but renders blank, even if the
-  original SVGs are preserved.
-- Negative number literals are rejected by the last *release* (3.2.1; upstream
-  #158 fixed only on `main`) — gobo-agent installs a pinned prebuilt of `main`.
-- The standard-library update calls the GitHub API when its cache is stale;
-  gobo-agent's prebuilt is patched to fall back offline.
-
-**gobo-agent patches to the installed sb2gs** (applied by `setup`):
-
-- **`--id` downloader** — one pooled HTTP connection (`GSDEV_SB2GS_WORKERS`,
-  default 16), a content-addressed asset cache
-  (`%LOCALAPPDATA%\gobo-agent\asset-cache`; `GSDEV_SB2GS_CACHE` to relocate,
-  `GSDEV_SB2GS_NO_CACHE=1` to disable), retries with backoff, the endpoint's
-  zip-wrapped/raw project data, and the sb2gs-required defaults a sparse save
-  omits. Large imports are ~20× faster and re-imports are offline.
-- **Pen color-parameter menu** — sb2gs read the `COLOR_PARAM` menu as a block
-  field, so every `pen_setPenColorParamTo`/`...By` collapsed to the default
-  `*_hue` block and brightness/saturation/transparency were lost (e.g. 1127053411
-  rendered inverted). The patch flattens the menu so the right block is emitted.
-- **Missing costume pivot** — newer saves omit `rotationCenterX`/`rotationCenterY`
-  (the VM then uses the skin centre), which sb2gs dereferenced directly, so the
-  import failed with `AttributeError`. The patch treats a missing pivot as
-  centred, so those projects import (verified: 1307268012).
-- **Initial costume** — sb2gs ignored `currentCostume`, so a sprite started on the
-  first listed costume instead of the saved one (wrong for a static costume, e.g.
-  1015495507's `cat-chess`, whose first listed costume is empty). The patch emits
-  `onflag { switch_costume "<name>"; }` for the saved costume — a bare
-  `switch_costume` isn't a valid top-level sprite-init statement. Verified: the
-  cat-chess floor returns.
-- **Drag mode** — sb2gs emitted a nonexistent `set_draggable;`
-  (`decompile_sprite.py:81`) for a draggable sprite, which goboscript rejects. The
-  patch emits `onflag { set_drag_mode_draggable; }` instead. Verified: 1047137851's
-  atlas builds.
-- **`control_for_each`** — sb2gs had no decompiler and dropped the loop body
-  (upstream [#15](https://github.com/aspizu/sb2gs/issues/15)). The VM treats it as
-  a counted loop (variable = 1-based index, run `Number(VALUE)` times), so the
-  patch lowers it to `<var> = 0; repeat <VALUE> { <var> += 1; <body> }`. Verified:
-  1291298236 now builds (347 vs 72 blocks) and runs its scanner. Caveat: the
-  counter *is* the loop variable, so a body that writes that variable diverges
-  (the VM re-assigns it each iteration; the lowered loop would be disturbed).
-- **Same-named variables/lists** — sb2gs emitted both `var x` and `list x`, or a
-  duplicate `var x`/`list x`, on one target, which goboscript rejects ("already
-  defined"); its identifier cache maps two identical source names to one
-  identifier. The patch renames the colliding entries before decompiling (in the
-  variable/list tables and every block field/input that references their id).
-  Verified: 1193224850 now builds (2041 blocks).
-- **Monitors** — sb2gs ignored the project's `monitors` array, so on-stage
-  variable/list readouts lost their positions and slider modes. sb2gs now records
-  each monitor (with its compiled variable/list name) in a **`monitors.json`**
-  sidecar at the project root, and `build`/`run`/`screenshot`/`test` re-inject the
-  full `monitors` array into the **built sb3** (`inject_monitors` in
-  `tools/gsdevlib/build.py`),
-  mapping each by name to the compiled id — restoring positions, slider
-  mode/min-max and visibility. Verified: 1113180719's positioned readouts and the
-  `Render: stickman` slider return. Labels show the compiled identifier (`camz`,
-  not `@camZ`), since that is the runtime name. A per-target
-  `onflag { show/hide }` script is still emitted as a visibility fallback for a
-  build made without the injection. Note the monitors are **not** visible in
-  `gsdev` screenshots: the local host renders only the `scratch-render` canvas,
-  and Scratch draws variable/list monitors in the GUI layer. They *do* render on
-  full scratch-gui — verified live on the `gsbridge` `editor` and `github`
-  targets (`fps`/`drawcount`/`frame`) and in the Scratch editor. The conversion
-  preserves them regardless.
-- **Numeric inputs and constant costume/backdrop switches** — goboscript rejects
-  string arithmetic, and its `switch_costume`/`switch_backdrop` accept a *name*
-  only, while Scratch coerces arithmetic operands (non-numeric → 0) and allows a
-  numeric costume index (0 or ≤0 → last). The patch installs a
-  `syntax.scratch_number` helper, coerces the operands of the arithmetic operators
-  (`operator_add`/`subtract`/`multiply`/`divide`/`mod`/`round`/`mathop`/`random`,
-  so `1 / ""` → `1 / 0`), and folds a *constant* switch index to the
-  costume/backdrop name (`"last" + ""` → last costume). It is **not** applied to
-  other numeric-typed inputs: sb2gs packs menu values and list specials
-  (`"last"`/`"random"`/`"any"`) into `MATH_NUM` inputs, so coercing those would
-  blank `key_pressed("w")`, `start_sound "x"`, `distance_to(...)` and
-  `x_list["last"]` to `0` (1193224850 rendered correctly only with that
-  restriction). Verified: 941195677 builds and runs, 1193224850 renders. A
-  runtime-computed switch index still cannot be reproduced.
-- **Non-finite numbers (`Infinity`/`NaN`)** — Python's `json.dumps` emits a
-  non-finite float as the bare words `Infinity`/`NaN`, which `is_goboscript_literal`
-  then treats as a literal — but goboscript has no such literal, so the build fails
-  on an unknown identifier (a common source is the `set size to (Infinity)` hack).
-  The patch makes `syntax.number` emit the runtime expression Scratch's `/`
-  produces (`(1 / 0)` / `(-1 / 0)` / `(0 / 0)`) and routes numeric literals through
-  it, so a numeric input holding `"Infinity"`/`"-Infinity"`/`"NaN"` is handled too.
-  Checked at the helper: `number(float("inf"))` → `(1 / 0)`, `value("Infinity")` →
-  `(1 / 0)`, finite numbers unchanged.
-- **Procedure names (block labels)** — goboscript has no display label for a custom
-  block: the proc *name* **is** the compiled block label, so a Scratch label has to become
-  an identifier. `custom_blocks.get_name` drops each argument placeholder together with the
-  label text that announces it (`x: %s`, `worldX2: %s`) — and only that — so the name is the
-  block's own words; `syntax.identifier` then maps runs of `[\s.\-:]` to `_`, removes
-  anything outside `[A-Za-z0-9_]`, strips outer underscores and keeps the author's case.
-  Arguments are emitted from the mutation's **argumentnames**, so they keep their spelling
-  too. So the label `go to x: %s y: %s dir: %s xOrigin: %s yOrigin: %s` with argumentnames
-  `x, y, dir, xO, yO` becomes `proc go_to x2, y2, dir, xO, yO {` — the `2` suffixes are
-  collision numbering (`x`/`y` are already identifiers elsewhere in that project, since a
-  parameter cannot shadow one), and its argument names really are `xO`/`yO` even though the
-  label prose says `xOrigin:` — i.e. selector `Render.go_to` (1110356115). The patch notes
-  the original label as a `//` comment above the definition, but only when the *name* itself
-  was mangled — dropped punctuation or non-ASCII, `refresh (special) %s` → `refresh_special`
-  — and a label that is only words (`DrawQuad %s` → `DrawQuad`) needs no note. The build
-  moves the note inside the body, so the compiled proc's first block is that `//` text.
-  This is **idempotent**: the built project's label is regenerated as `go_to x: %s y: %s …`,
-  and re-importing that sb3 yields `go_to` again (the extra `x: `/`y: ` labels are dropped
-  on the way in).
-- **Comments that must stay visible in the editor** — `#` comments are compile-time
-  only, so they never reach the Scratch editor, and a comment carrier cannot be
-  *named* `//` or `#`: goboscript needs an identifier, `#` starts a comment and `/` is
-  dropped. The **label** is free text though — the VM matches a call to its definition
-  by the proccode string and does not care (verified: labels restyled to `# …` and
-  `// …` load and run in scratch-gui at 30 fps, 0 errors). `build`/`run`/`screenshot`/
-  `test` therefore accept a line-leading `//` in a `.gs` as a comment that survives:
-  `rewrite_comments` turns it into a call to a stub proc for the duration of the
-  compile (restoring the sources byte-for-byte afterwards, like the mode include) and
-  `inject_comments` then strips that proc's definition — an undefined call is inert —
-  and relabels the calls to the free text `// %s`, so the editor shows `// note` and
-  nothing runs. Rules: a `//` inside a body (brace depth > 0, tracked ignoring braces
-  inside strings) stays where it is, whatever its indentation — including above a
-  `local` declaration; a flush-left `//` directly above a proc/hat moves *inside* that
-  body (so it follows the definition in the built project); any other top-level `//` —
-  above `costumes`, a `var`/`list` declaration, or the end of file — is ignored,
-  because there is no script for it to live in.
-  Verified: 1329541958 (280 comments, whose calls were already dangling in the source
-  and so made the build fail with `unrecognized procedure`) now builds — 280 `// %s`
-  blocks, 0 leftover carrier definitions, runs at 30 fps with 0 errors. Cost: only the
-  caller's own block dispatch, so keep comment calls out of hot loops; real sticky
-  notes (`target.comments`) would be the zero-cost form if that ever matters. This is a
-  gobo-agent build feature: `//` is not goboscript syntax, so a `.gs` containing it
-  builds only through `gsdev` — plain `goboscript build` and the upstream VS Code
-  extension flag it (the compiler itself is left alone).
-
-- **TurboWarp / forkphorus runtime detection** (`turbowarp_isCompiled`,
-  `turbowarp_isTurboWarp`, `forkphorus_is*`) — goboscript has no spelling for these
-  reporters (its `tw_is_compiled`/`tw_is_turbowarp` names are in the binary's table but
-  are rejected in source, and the docs list no TurboWarp reporter), and sb2gs used to
-  drop the block, leaving an empty condition that would not compile. sb2gs now writes a
-  marker string (`"__gsdev_tw_op_<opcode>__"`) and `gsdev build` rewrites the compiled
-  comparison back into the opcode (`inject_tw_blocks` in
-  `tools/gsdevlib/build.py`), so it survives the round
-  trip; in a value position the input is repointed at the re-created block. Through the
-  harness the built project holds the original opcode; a build without gobo-agent sees
-  only the marker (a false condition).
-
-- **Dangling custom-block argument reporters** — an `argument_reporter_boolean` /
-  `argument_reporter_string_number` whose name no enclosing definition declares (a
-  leftover after its custom block was deleted or renamed) is tolerated by Scratch, which
-  reads it as empty — false in a boolean input. sb2gs emitted `$name` for every argument
-  reporter, and goboscript rejects an unknown local (`unrecognized argument`), so the
-  import built nothing (project 723763681). sb2gs now tracks the definition's parameter
-  names while decompiling its body and emits `0` (boolean) or `""` (string/number) when
-  the name is out of scope; names that are in scope still become `$name`, and the
-  arithmetic coercion above turns the empty value into 0. Verified: 723763681 imports and
-  builds, keeps `REPEAT = 200000`, and its timings match the original; a synthetic
-  `argument_reporter_string_number` variant builds too.
-
-- **Variable/list references vs stale field text** — Scratch resolves a variable or list
-  by the **id** in a block's `[name, id]` field, but sb2gs emitted the field's *text*. When
-  that text is stale (a variable renamed in the editor, or prefixed by the author's own
-  compiler, as in `@deltaTime`), the declaration and the references disagreed and the
-  identifier cache renamed one side (`deltaTime` vs `deltaTime2`), so the build failed
-  with "unrecognized variable" (project 1103811570). gobo-agent records every declared
-  name by id (`syntax.NAMES_BY_ID`) and resolves references through it, falling back to
-  the text only for an id that is in no table.
-
-**gobo-agent mitigations:** for large or known-problematic projects, download the
-`.sb3` in a browser and pass the local file (`gsdev sb2gs <file.sb3>`);
-`gsdev sb2gs` bounds the run and cleans partial `.sb3`/output on failure.
+The harness always runs its pinned, patched sb2gs; a user `sb2gs` on `PATH` is only reported by `doctor`, never executed. Compatibility patches cover common failures such as the pen color menu, missing pivots, monitors, numeric coercion, and comments.
 
 ## Everyday loop, builds, profiling
 
@@ -475,100 +255,21 @@ path: `gobo-agent/runtime/tools/gsdev.*` instead of `tools/gsdev.*`.
 
 `preflight` checks the built artifact (or `--sb3 FILE`) offline against Scratch's
 project.json/asset/list limits and the mobile **memory** budget — no browser needed.
-See the **Preflight** section below for the budget model, findings and suggestions.
+See the **Preflight** section below for the budget model and overrides.
 
 ## Preflight (memory + size budgets)
 
-`preflight` scans a built `.sb3` **offline** (no browser) against Scratch's hard
-limits and a mobile memory budget. Default output is a short report; `--json`
-writes the full machine-readable report to stdout. It exits non-zero when an
-**error** finding is present, and, with `--strict`, when a **warning** is present.
+`preflight` scans a built `.sb3` offline (no browser). It exits non-zero on error findings, and with `--strict` on warnings; use `--sb3 FILE` to scan an artifact and `--json` for the full report. Without `--sb3` it builds first.
 
-```powershell
-<gobo>\tools\gsdev.ps1 preflight [--sb3 FILE] [--json] [--strict]
-```
+The estimate covers renderer memory (bitmap and SVG textures plus decoded audio), project-wide costume pixels, and a transient load peak. Defaults are a **0.85 GiB / 110M pixel smooth target** and a separate **1.6 GiB / 300M hard limit**; `deviceScale` defaults to 2, `deviceMemoryMb` scales from the 2 GB baseline, and thresholds are overridable through `GSDEV_PREFLIGHT_*` or `gobo-agent.json`. Alpha does not change the estimate.
 
-Without `--sb3` it builds the project first and scans the build output.
-
-### Budgets (defaults; all overridable)
-
-| key | default | meaning |
-| --- | --- | --- |
-| `jsonBudget` | 5 MiB = 5,242,880 | Scratch's `project.json` ceiling (binary MB) |
-| `assetBudget` | 10 MiB = 10,485,760 | per-asset ceiling |
-| `listLimit` | 200,000 | Scratch's per-list item cap |
-| `memoryBudget` | 512 MiB | worst-case decoded memory (mobile-safe) |
-| `svgMemoryFactor` | 4 | SVG needs **4× the pixels** of its nominal size (before ×4 bytes) |
-| `svgMaxWidth` / `svgMaxHeight` | 2400 / 1800 | per-SVG dimension ceiling (Android) |
-
-Override any key with `GSDEV_PREFLIGHT_<KEY>` (e.g.
-`GSDEV_PREFLIGHT_MEMORY_BUDGET=2147483648`) or `gobo-agent.json`
-`preflight<Key>` (e.g. `"preflightMemoryBudget": 2147483648`,
-`"preflightListLimit": 300000`). Raise `memoryBudget` for desktop; lower it for a
-specific phone class.
-
-### Memory model (worst case)
-
-The estimate is deliberately **worst case = every costume loaded**, because the VM
-creates a texture per costume and never unloads it:
-
-```text
-bytes = (bitmapPx + svgMemoryFactor * svgPx) * 4 + soundDecodedBytes
-```
-
-- Dimensions come from the **asset bytes by magic number** (PNG/JPEG/GIF/BMP/WebP/
-  AVIF/SVG), not the file extension, so AVIF stored as `.png` and base64-wrapped SVG
-  are still measured. `svgPx`/`bitmapPx` sum every costume's `width*height`.
-- Bitmap pixels are divided by `bitmapResolution²` (SC3 stores 2× bitmaps; the
-  texture is the logical size). SVG uses `svgMemoryFactor` — **4**, because an SVG
-  costume needs 4× the pixels of its nominal size (then ×4 bytes for RGBA).
-- `soundDecodedBytes` decodes each sound to whole-file PCM from its real header.
-- Assets that can't be measured are counted as **unresolved** and reported under
-  `measurement gaps`, so a pass can't hide them.
-
-Peak ~= that total plus the browser's own footprint. On a phone the tab dies when
-the sum exceeds the device's budget; on desktop it may pass and still OOM on mobile,
-so the default `memoryBudget` is set for mobile, not desktop.
-
-### Findings
-
-**Errors:** `json-over-budget`, `memory-over-budget`, `asset-over-budget`,
-`list-over-capacity`, `invalid-archive`, `duplicate-zip-entries`,
-`missing-project-json`, `scan-incomplete`.
-**Warnings:** `json-near-budget` (>=90%), `list-at-capacity`, `svg-over-dimension`
-(>2400×1800), `unresolved-assets`, `sounds-decoded-large`.
-
-Error findings carry `detail.suggestions` (printed under the finding, and in the
-JSON):
-
-- `json-over-budget` — clean up lists (drop duplicate/unused list data and
-  list-monitor entries); remove redundant shadow blocks; shorten large list
-  literals/long strings; remove unused blocks, variables and lists; move big data
-  into assets.
-- `memory-over-budget` — **convert SVG costumes to bitmap** (primary fix for an
-  SVG-heavy project); pack frames into a spritesheet with fewer, smaller frames
-  (keeps crisp SVG); downscale costumes/frames; shorten or drop large sounds;
-  remove unused costumes and sounds.
-- `asset-over-budget` — compress or downscale the asset below 10 MiB; split a long
-  sound into shorter pieces.
-
-**Why SVG crashes on mobile:** the driver is the **rasterised SVG pixels**, which the
-memory model already tracks (`svgPx × svgMemoryFactor × 4`). Measured on-device,
-working projects sit ≤ ~0.33 GiB (e.g. 1382435697: **284** SVG costumes but only
-7.4M px → 0.11 GiB), while crashers sit ≥ ~0.97 GiB (945139239 at 65M px;
-957967074 at 70M px). A costume *count* is therefore not a useful signal — 284 small
-SVGs are fine, 156 large ones are not. Bitmaps don't add a per-costume canvas, which
-is why bitmap-heavy projects (e.g. 1056403018, 503 AVIFs) pass.
-
-`--json` also carries `assets` (count/bytes/over/largest), `memory` (`svgPx`,
-`bitmapPx`, `overDimension`, `largest`), `lists`, `sounds`, `coverage`, `sha256`
-and every finding.
+This is a worst-case offline model, not a measurement: it counts every costume and retained MIP, infers size from saved and literal `set size to` values, and does not model the framebuffer or driver overhead. See the README's preflight section for the memory model and warning classes.
 
 ## SVG spritesheets for mobile memory
 
 **Converting SVG costumes to bitmap is the primary fix** for an SVG-heavy project
 (it removes the per-costume SVG canvas and the 4× pixel cost — see the preflight
-suggestions). Spritesheets are the alternative when you want to keep the **crisp
+output). Spritesheets are the alternative when you want to keep the **crisp
 vector** look instead of a pixelated bitmap: packing many frames into one costume
 cuts the costume/texture count while preserving the SVG art.
 
