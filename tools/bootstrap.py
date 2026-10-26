@@ -103,7 +103,7 @@ SB2GS_ZIP_SHA256 = "53a6e562244fbeae6cae4bf2f1c17b8c3ff9366e4c6a97769525db308453
 # it, so an older checkout (an adopted project's runtime copy, say) cannot
 # silently downgrade a newer machine-wide install: install_sb2gs refuses unless
 # --force is given. The patcher hash still detects same-version drift.
-SB2GS_PATCH_VERSION = 5
+SB2GS_PATCH_VERSION = 6
 
 # name -> (filename, url, sha256); all universal (py3-none-any) wheels.
 SB2GS_WHEELS = {
@@ -1400,10 +1400,10 @@ def get_name(block: Block) -> str:
 
 
 # gobo-agent carries a source `// note` into the built project as a call to a carrier
-# proc (proccode "// %s") whose definition it strips, leaving the note inert (see
-# AGENTS.md, "// comments"). sb2gs renders such a call as `_ "note"` -- `//` collapses to
-# `_` -- and with the definition gone the call points at a proc that does not exist, so
-# the result cannot build.
+# proc (proccode " // %s"; newer saves may include a leading space) whose definition it
+# strips, leaving the note inert (see AGENTS.md, "// comments"). sb2gs renders such a
+# call as `_ "note"` -- `//` collapses to `_` -- and with the definition gone the call
+# points at a proc that does not exist, so the result cannot build.
 # Emit goboscript's comment form instead, which gobo-agent's own `//` support then
 # carries back into the rebuilt project. Applied to installed sb2gs (decompile_stmt.py).
 SB2GS_COMMENT_PATCHES = (
@@ -1412,7 +1412,8 @@ SB2GS_COMMENT_PATCHES = (
     ctx.iprint(syntax.identifier(custom_blocks.get_name(block)))
     args = json.loads(block.mutation.argumentids)""",
         """def decompile_procedures_call(ctx: Ctx, block: Block) -> None:
-    if getattr(block.mutation, "proccode", "").startswith("//"):
+    proccode = getattr(block.mutation, "proccode", "") or ""
+    if proccode.lstrip().startswith("//"):
         ids = json.loads(block.mutation.argumentids)
         text = inputs.block_value(block.inputs._.get(ids[0])) if ids else None
         note = " ".join(str("" if text is None else text).splitlines())
