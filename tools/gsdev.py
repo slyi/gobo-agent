@@ -73,7 +73,8 @@ poked freely, but structural script changes still need a rebuild + reload.
 
 Pass --cpu RATE to emulate a slower CPU (e.g. --cpu 4 ~ a phone) via CDP, or
 --port 0 (GSDEV_CDP_PORT=0) to auto-pick a free CDP port recorded in the state
-root's .gsdev-port for parallel A/B runs.
+root's .gsdev-port. One host session is allowed at a time; close it before
+starting another.
 """
 
 from __future__ import annotations
@@ -363,7 +364,22 @@ DEBUG_DIR = PROJECT_ROOT / "debug"
 DEFAULT_PORT = _int_setting("GSDEV_CDP_PORT", "cdpPort", _DEFAULT_CDP_PORT)
 PORT_FILE = STATE_ROOT / ".gsdev-port"
 HOST_DIR = TOOLS_DIR / "scratchhost"
-HOST_PROFILE_ROOT = STATE_ROOT / "scratchvm-profiles"
+
+
+def _shared_root() -> Path:
+    """User-level root for browser profiles and the single-session lock."""
+    for name in ("GSDEV_SESSION_DIR", "GSDEV_STATE_DIR"):
+        value = os.environ.get(name)
+        if value:
+            return Path(value).expanduser().resolve()
+    return bootstrap.default_home()
+
+
+SHARED_ROOT = _shared_root()
+HOST_PROFILE_ROOT = Path(
+    os.environ.get("GSDEV_PROFILE_ROOT") or (SHARED_ROOT / "profiles")
+).expanduser().resolve()
+SESSION_ROOT = SHARED_ROOT
 
 
 def _harness_fingerprint() -> str:
@@ -515,6 +531,7 @@ gsdev_host.configure(
     DEFAULT_PORT=DEFAULT_PORT,
     PORT_FILE=PORT_FILE,
     STATE_ROOT=STATE_ROOT,
+    SESSION_ROOT=SESSION_ROOT,
     HOST_DIR=HOST_DIR,
     HOST_PROFILE_ROOT=HOST_PROFILE_ROOT,
     HOST_SERVER_PORT=HOST_SERVER_PORT,
@@ -819,13 +836,17 @@ def cmd_stop(args: argparse.Namespace) -> int:
 def cmd_close(args: argparse.Namespace) -> int:
     port = args.port
     if port is None:
-        # Prefer the CDP port the running host recorded; fall back to the
-        # remembered auto port (or a fresh one) when there is no recorded host.
+        # Prefer the running host's recorded CDP port, then the session lock, then
+        # the remembered auto port.
         recorded = read_host_state().get("cdpPort")
-        port = recorded if isinstance(recorded, int) and recorded > 0 else resolve_port(0)
+        session = gsdev_host.read_session().get("port")
+        port = (recorded if isinstance(recorded, int) and recorded > 0
+                else session if isinstance(session, int) and session > 0
+                else resolve_port(0))
     else:
         port = resolve_port(port)
     close_host(port)
+    gsdev_host.release_session()
     reap_host_orphans(kill_live=False)
     return 0
 
@@ -2553,8 +2574,8 @@ def cmd_selftest(args: argparse.Namespace) -> int:
     )
     check("host port", isinstance(HOST_SERVER_PORT, int) and HOST_SERVER_PORT > 0, str(HOST_SERVER_PORT))
     check(
-        "per-port host profile",
-        host_profile_dir(9240) != host_profile_dir(9241)
+        "session profile",
+        host_profile_dir(9240) == host_profile_dir(9241)
         and host_profile_dir(9240).parent == HOST_PROFILE_ROOT,
         str(HOST_PROFILE_ROOT),
     )

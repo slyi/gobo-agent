@@ -3,6 +3,9 @@
 debug/
 tools/scratchvm-profile/
 tools/scratchvm-profiles/
+tools/profiles/
+tools/session.json
+session.mutex
 tools/scratchhost/node_modules/
 tools/scratchhost/vendor/
 /.tools/

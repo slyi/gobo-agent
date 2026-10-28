@@ -142,10 +142,10 @@ discovered from `GSDEV_CONFIG`, else `<project>/gobo-agent.json`, else
 | `cdpPort` | `GSDEV_CDP_PORT` | derived | CDP port (`--port` overrides) |
 
 In an adopted project, `hostPort`/`cdpPort` default to a stable pair derived from
-the project path, so two adopted projects do not collide. Other useful
-environment overrides: `GSDEV_PYTHON` (interpreter), `GSDEV_GOBOSCRIPT`
-(compiler), `GSDEV_TOOLS`/`GSDEV_HOME` (tools root / shared per-user home),
-`GSDEV_SB2GS` (use a specific sb2gs), `GSDEV_BROWSER`, `GSDEV_MODE`.
+the project path. Only one host session runs at a time; `close` it before starting
+another. Other useful environment overrides: `GSDEV_PYTHON` (interpreter),
+`GSDEV_GOBOSCRIPT` (compiler), `GSDEV_TOOLS`/`GSDEV_HOME` (tools root / shared
+per-user home), `GSDEV_SB2GS` (use a specific sb2gs), `GSDEV_BROWSER`, `GSDEV_MODE`.
 
 ## Pre-build codegen (`prebuild`)
 
@@ -343,13 +343,13 @@ Three things, often confused:
 - **A command says the host is headless but you asked for headed (or vice
   versa).** A warm host keeps its mode. Pass the matching flag
   (`screenshot`/`profile` default to headed) or `close` it and start again.
-- **"host belongs to project …" / "different gobo-agent build".** A host is never
-  reused across projects or harness versions. Use `--port 0` (or another
-  `--port`), or `close --port N`.
+- **"another host session is running".** Only one host is allowed. `close` the
+  existing session; `--port` selects the port, it does not create a second host.
 - **Wrong compiler version.** A `goboscript` on `PATH` wins over the pinned
   bundle. Set `GSDEV_GOBOSCRIPT` to force one; `doctor` reports which is used.
 - **Port already in use.** `GSDEV_HOST_PORT`/`GSDEV_CDP_PORT` (or config
-  `hostPort`/`cdpPort`) choose others; `--port 0` auto-picks a CDP port.
+  `hostPort`/`cdpPort`) choose others; `--port 0` auto-picks a CDP port. Close the
+  current session first if it is ours.
 - **"host page did not finish loading" / "no debuggable page appeared".** The browser or
   its host server did not come up. A launch that yields no debuggable page is retried
   (`GSDEV_LAUNCH_ATTEMPTS`, default 2), and a retry keeps the host server alive; the failure

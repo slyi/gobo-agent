@@ -74,10 +74,11 @@ mode, or `close` it first rather than starting a second browser.
 preserves loaded code/state. `run`/`screenshot --sb3 PATH` load a given artifact
 instead of building (an imported or externally built `.sb3`). Live data edits never
 replace code. Cold starts are justified for initial setup, a deliberate browser-mode
-change, or a lifecycle test; otherwise use warm iteration. Keep independent hosts on
-explicit ports;
-`--port 0` remembers its choice. A warm host in the wrong headed/headless mode must be
-closed or moved; inspect conflicts, never kill unrelated listeners.
+change, or a lifecycle test; otherwise use warm iteration. Run one host session at a
+time; `--port` selects its port, not concurrency. `--port 0` remembers its choice. A
+warm host in the wrong headed/headless mode must be closed or moved; inspect conflicts,
+never kill unrelated listeners. Browser profiles are user-level
+(`%LOCALAPPDATA%\gobo-agent\profiles\{local,live}` on Windows), not per project.
 
 `screenshot --no-reload` is the live counterpart to the default: it captures the warm
 host's current canvas and touches nothing (the default path builds, loads, then stops the
@@ -397,7 +398,8 @@ python tools/gsbridge.py close
 
 Targets are `localhost`, `github`, `editor`, `production` (`--project-id N`), and `url`.
 `--project DIR`/`--sb3 FILE` load a build; production loads what is already on the page.
-The bridge uses fresh isolated profiles (CDP 9400 default). It is **not** a subset: gsdev and
+The bridge uses the same role profiles and session lock as gsdev (CDP 9400 default).
+It is **not** a subset: gsdev and
 gsbridge expose the **same 39 verbs** with identical syntax *and* result shapes, and that is
 enforced rather than assumed — `tools/verb_parity.py` (run by `gsdev selftest`) fails on any
 usage drift, and `tools/test_ready_events.py --with-shapes` diffs the live JSON key sets per

@@ -247,13 +247,9 @@ def target_url(args) -> str:
 _BRIDGE_STATE_APPS = ("gobo-agent", "kilo")
 
 
-def _bridge_temp_dir(app: str) -> Path:
-    return Path(os.environ.get("TEMP", ".")) / app / "gsbridge"
-
-
 def profile_dir(port: int, tag: str) -> Path:
-    base = _bridge_temp_dir(_BRIDGE_STATE_APPS[0])
-    return base / f"{tag}_{port}_{int(time.time() * 1000)}"
+    """Stable profile by role: production gets `live`, everything else `local`."""
+    return bridge_host.profile_dir_for("live" if tag == "production" else "local")
 
 
 def match_for(url: str, target: str) -> str:
@@ -396,11 +392,7 @@ def clear_registry(port: int) -> None:
 
 
 def pid_alive(pid: int) -> bool:
-    try:
-        os.kill(pid, 0)
-        return True
-    except OSError:
-        return False
+    return bridge_host._pid_alive(pid)
 
 
 def reap_orphans(session_only: bool = True, kill_live: bool = False) -> list[int]:
@@ -478,7 +470,7 @@ def clear_state(port: int) -> None:
 
 
 def terminate_pid(pid: int) -> bool:
-    """Best-effort terminate; the sandbox can deny os.kill even for our child."""
+    """Best-effort terminate; the sandbox can deny termination even for our child."""
     if os.name != "nt":
         for sig in (15, 9):
             try:
@@ -487,11 +479,6 @@ def terminate_pid(pid: int) -> bool:
             except OSError:
                 continue
         return False
-    try:
-        os.kill(pid, 15)
-        return True
-    except OSError:
-        pass
     try:
         import ctypes
         handle = ctypes.windll.kernel32.OpenProcess(0x0001, False, pid)
@@ -607,6 +594,9 @@ def stop_own_browser(port: int) -> None:
         terminate_pid(pid)
     clear_state(port)
     clear_registry(port)
+    bridge_host.release_session(port)
+    if not (isinstance(pid, int) and pid_alive(pid)) and profile:
+        bridge_host.clean_profile_path(Path(profile))
     if not token and not reg:
         log(f"no bridge session record on port {port}; nothing to close")
 
@@ -627,38 +617,49 @@ def cmd_run(args) -> int:
         existing = []   # nothing listening = free
     if existing:
         raise SystemExit(
-            f"port {port} already has a host; close it (gsbridge close --port {port}) "
-            f"or use another --port"
+            f"port {port} already has a host; close it first "
+            f"(gsbridge close --port {port})"
         )
     match = match_for(url, args.target)
+    # One browser per session; the role profile is reused across launches. The
+    # session lock rejects another gsdev/gsbridge host that is still running.
+    profile = profile_dir(port, args.target)
+    bridge_host.acquire_session(port, profile, "gsbridge")
     # Launch blank and navigate over CDP: the navigation then happens after
     # Page.enable, so Page.loadEventFired is a deterministic event. Launching at the
     # URL races that event and can evaluate in the pre-navigation context.
     #
     # A launch that yields no CDP endpoint at all gets retried (same knob as gsdev):
-    # the usual cause is a browser that died during startup. Each attempt uses a fresh
-    # timestamped profile, so a stale instance cannot be holding ours.
+    # the usual cause is a browser that died during startup.
     proc = None
     cdp = None
-    profile = None
-    for attempt in range(1, bridge_host.LAUNCH_ATTEMPTS + 1):
-        profile = profile_dir(port, args.target)
-        profile.mkdir(parents=True, exist_ok=True)
-        proc, _marks = launch_browser(args, "about:blank", port, profile)
-        write_registry(port, proc.pid, profile, url, args.target)
-        cdp = open_target_page(port, timeout=args.ready_timeout)
-        if cdp is not None:
-            break
-        proc.terminate()
-        if attempt >= bridge_host.LAUNCH_ATTEMPTS:
+    try:
+        for attempt in range(1, bridge_host.LAUNCH_ATTEMPTS + 1):
+            profile.mkdir(parents=True, exist_ok=True)
+            proc, _marks = launch_browser(args, "about:blank", port, profile)
+            bridge_host.update_session(pid=proc.pid, hostPid=proc.pid)
+            write_registry(port, proc.pid, profile, url, args.target)
+            cdp = open_target_page(port, timeout=args.ready_timeout)
+            if cdp is not None:
+                break
+            proc.terminate()
+            if attempt >= bridge_host.LAUNCH_ATTEMPTS:
+                stop_own_browser(port)
+                raise SystemExit(
+                    f"no page attached on port {port} after {bridge_host.LAUNCH_ATTEMPTS} "
+                    "attempt(s); is the browser blocked by policy? (raise --ready-timeout or "
+                    "GSDEV_LAUNCH_ATTEMPTS for more tries)"
+                )
+            log(f"no page attached on port {port}; relaunching "
+                f"(attempt {attempt + 1}/{bridge_host.LAUNCH_ATTEMPTS})")
+    except BaseException:
+        try:
             stop_own_browser(port)
-            raise SystemExit(
-                f"no page attached on port {port} after {bridge_host.LAUNCH_ATTEMPTS} "
-                "attempt(s); is the browser blocked by policy? (raise --ready-timeout or "
-                "GSDEV_LAUNCH_ATTEMPTS for more tries)"
-            )
-        log(f"no page attached on port {port}; relaunching "
-            f"(attempt {attempt + 1}/{bridge_host.LAUNCH_ATTEMPTS})")
+        except Exception:
+            pass
+        bridge_host.release_session(port)
+        bridge_host.clean_profile_path(profile)
+        raise
     try:
         cdp.call("Page.enable", timeout=10)
         cdp.call("Page.navigate", {"url": url}, timeout=10)

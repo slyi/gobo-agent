@@ -472,16 +472,14 @@ python tools/gsbridge.py close
 
 `run --leave-running` records the port in `.gsbridge/current_<DSH_SESSION_ID>.json`;
 later commands with no `--port` use it (explicit `--port` and `GSBRIDGE_PORT` override).
-`GSBRIDGE_STATE_DIR` moves the state root. `close` clears the record and the per-port
-host state.
+`GSBRIDGE_STATE_DIR` moves the state root. One host session is allowed at a time; `close`
+clears the session record and trims the role profile's caches.
 
-Every launch also writes `.gsbridge/<app>/browser_<port>.json` (PID + profile)
-immediately after spawn. `close` uses the session token when present and that registry
-otherwise, killing only a PID whose command line/profile/start time matches the launch;
-`run` reaps dead records, and `close` reaps live ones for this DSH session. A ctypes
-`TerminateProcess` fallback covers sandboxes that deny `os.kill`. On POSIX, ownership
-uses `/proc/<pid>/cmdline` (or `ps`), termination uses `SIGTERM`/`SIGKILL`, and host
-records match `ps -o comm=` names.
+The launch also records the browser PID and profile for crash cleanup. `close` kills
+only a matching, owned process and ignores stale records. Browser profiles live in the
+shared tools root (`%LOCALAPPDATA%\gobo-agent\profiles\…` on Windows), are reused by role
+(`local` for gsdev/bridge development, `live` for production), and are cache-trimmed on
+close; stale profiles from a dead session are discarded on the next launch.
 
 Maintainer-only cleanup scenarios (gitignored, not shipped):
 `tools/test_gsbridge_cleanup.py`, `tools/test_gsbridge_session.py`, and

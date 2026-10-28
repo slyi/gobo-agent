@@ -6,6 +6,7 @@ the project config directly. Everything else is host-local.
 
 from __future__ import annotations
 
+import contextlib
 import json
 import os
 import shutil
@@ -26,6 +27,7 @@ from cdp import CDP, CDPError, connect, list_targets
 DEFAULT_PORT = 9223
 PORT_FILE = Path(".gsdev-port")
 STATE_ROOT = Path(".")
+SESSION_ROOT = Path(".")
 HOST_DIR = Path(".")
 HOST_PROFILE_ROOT = Path(".")
 HOST_SERVER_PORT = 8077
@@ -58,14 +60,272 @@ def configure(**settings) -> None:
     globals().update(settings)
 
 
-def host_profile_dir(port: int) -> Path:
-    """Browser profile directory for a CDP port.
+def host_profile_dir(port: int, role: str = "local") -> Path:
+    """Browser profile directory for a session role.
 
-    One profile per port, so two hosts (A/B) can run at once: a shared
-    ``--user-data-dir`` makes the second Chromium launch hand off to the first
-    and exit, and then no second debug port ever appears.
+    A profile cannot be shared by two live Chromium instances: the second launch
+    hands off to the first and no second debug port appears. The harness is
+    single-session, so ``port`` is accepted for compatibility but profiles are
+    keyed by role (``local`` for gsdev/bridge development, ``live`` for the
+    production Scratch embed).
     """
-    return HOST_PROFILE_ROOT / str(port)
+    return HOST_PROFILE_ROOT / role
+
+
+def profile_dir_for(role: str) -> Path:
+    return HOST_PROFILE_ROOT / role
+
+
+_SESSION_FILE = "session.json"
+_SESSION_THREAD_LOCK = threading.Lock()
+_LEGACY_PRUNED = False
+_CACHE_DIRS = (
+    "Default/Cache",
+    "Default/Code Cache",
+    "Default/GPUCache",
+    "Default/DawnCache",
+    "Default/Service Worker/CacheStorage",
+    "GrShaderCache",
+    "ShaderCache",
+)
+
+
+def session_path() -> Path:
+    return SESSION_ROOT / _SESSION_FILE
+
+
+def read_session() -> dict:
+    try:
+        record = json.loads(session_path().read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return {}
+    return record if isinstance(record, dict) else {}
+
+
+def _pid_alive(pid: int) -> bool:
+    if not isinstance(pid, int) or pid <= 0:
+        return False
+    if os.name == "nt":
+        try:
+            import ctypes
+            handle = ctypes.windll.kernel32.OpenProcess(0x1000, False, pid)
+            if not handle:
+                return any(p == pid for p, _parent, _name in _win32_process_table())
+            try:
+                code = ctypes.c_ulong()
+                ok = ctypes.windll.kernel32.GetExitCodeProcess(
+                    handle, ctypes.byref(code))
+                return bool(ok) and code.value == 259  # STILL_ACTIVE
+            finally:
+                ctypes.windll.kernel32.CloseHandle(handle)
+        except Exception:
+            return False
+    try:
+        os.kill(pid, 0)
+        return True
+    except OSError:
+        return False
+
+
+def _profile_size(path: Path) -> int:
+    total = 0
+    for dirpath, _dirnames, filenames in os.walk(path):
+        for name in filenames:
+            try:
+                total += os.path.getsize(os.path.join(dirpath, name))
+            except OSError:
+                pass
+    return total
+
+
+def clean_profile_path(profile: Path, full: bool = False) -> None:
+    """Trim cache directories, or remove the profile when it is ours and stale."""
+    try:
+        profile = profile.resolve()
+        root = HOST_PROFILE_ROOT.resolve()
+        if not profile.is_relative_to(root) or not profile.is_dir():
+            return
+        if full or _profile_size(profile) > 1024 ** 3:
+            shutil.rmtree(profile, ignore_errors=True)
+            return
+        for relative in _CACHE_DIRS:
+            shutil.rmtree(profile / relative, ignore_errors=True)
+    except OSError:
+        pass
+
+
+def prune_legacy_profiles() -> None:
+    """Remove old pre-single-session profile trees once per process."""
+    global _LEGACY_PRUNED
+    if _LEGACY_PRUNED:
+        return
+    _LEGACY_PRUNED = True
+    cutoff = time.time() - 86400
+    roots = [
+        STATE_ROOT / "scratchvm-profiles",
+        SESSION_ROOT / "scratchvm-profiles",
+        Path(tempfile.gettempdir()) / "gobo-agent" / "gsbridge",
+    ]
+    for root in roots:
+        try:
+            children = list(root.iterdir())
+        except OSError:
+            continue
+        for child in children:
+            try:
+                if child.is_dir() and child.stat().st_mtime < cutoff:
+                    shutil.rmtree(child, ignore_errors=True)
+                elif child.is_file() and child.suffix == ".json" and child.stat().st_mtime < cutoff:
+                    child.unlink()
+            except OSError:
+                pass
+
+
+@contextlib.contextmanager
+def _session_mutex():
+    """Cross-process mutex around lock-file read/modify/write.
+
+    The session file itself is persistent; this byte-range lock is held only
+    during the claim/release/update critical section and is released by the OS if
+    the process dies.
+    """
+    path = session_path().with_suffix(".mutex")
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with _SESSION_THREAD_LOCK:
+        handle = open(path, "a+b")
+        try:
+            if os.name == "nt":
+                import msvcrt
+                deadline = time.monotonic() + 5.0
+                while True:
+                    try:
+                        handle.seek(0)
+                        msvcrt.locking(handle.fileno(), msvcrt.LK_NBLCK, 1)
+                        break
+                    except OSError:
+                        if time.monotonic() >= deadline:
+                            raise SystemExit("timed out waiting for the session lock")
+                        time.sleep(0.02)
+            else:
+                import fcntl
+                deadline = time.monotonic() + 5.0
+                while True:
+                    try:
+                        fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+                        break
+                    except OSError:
+                        if time.monotonic() >= deadline:
+                            raise SystemExit("timed out waiting for the session lock")
+                        time.sleep(0.02)
+            yield
+        finally:
+            try:
+                if os.name == "nt":
+                    import msvcrt
+                    handle.seek(0)
+                    msvcrt.locking(handle.fileno(), msvcrt.LK_UNLCK, 1)
+                else:
+                    import fcntl
+                    fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+            except OSError:
+                pass
+            handle.close()
+
+
+def acquire_session(port: int, profile: Path, tool: str, attach: bool = False) -> None:
+    with _session_mutex():
+        _acquire_session_locked(port, profile, tool, attach)
+
+
+def _acquire_session_locked(port: int, profile: Path, tool: str, attach: bool = False) -> None:
+    """Claim the single browser session, rejecting a live owner.
+
+    ``attach=True`` is for commands reusing an existing warm host; only then may
+    another process share the same port/profile/tool record. A launch must never
+    treat a live lock as its own, or two simultaneous launches would both pass.
+    The lock is a create-exclusive JSON file. A stale record (dead PID) is
+    discarded together with its profile so a crashed launch cannot poison the
+    next run.
+    """
+    prune_legacy_profiles()
+    path = session_path()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    payload = json.dumps({
+        "pid": os.getpid(), "port": int(port), "profile": str(profile),
+        "tool": tool, "started": time.time(),
+    })
+    for _attempt in range(2):
+        try:
+            fd = os.open(path, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
+        except FileExistsError:
+            record = read_session()
+            pid = record.get("pid")
+            same = (record.get("port") == int(port)
+                    and record.get("profile") == str(profile)
+                    and record.get("tool") == tool)
+            if _pid_alive(pid):
+                if attach and same:
+                    return
+                raise SystemExit(
+                    f"another host session is running (pid {pid}, port "
+                    f"{record.get('port')}, tool {record.get('tool')}); close it first"
+                )
+            # Chromium launchers can exit and leave the real browser under a
+            # different PID. If the recorded port is still live and the profile
+            # matches, the session is active even when the recorded PID is dead.
+            recorded_port = record.get("port")
+            if (record.get("profile") == str(profile)
+                    and record.get("tool") == tool
+                    and isinstance(recorded_port, int)
+                    and port_open(recorded_port)):
+                if attach and same:
+                    owners = _port_owner_pids(recorded_port)
+                    if owners:
+                        record.update(pid=owners[0], hostPid=owners[0])
+                        path.write_text(json.dumps(record), encoding="utf-8")
+                    return
+                raise SystemExit(
+                    f"another host session is running on port {recorded_port} "
+                    f"({tool}); close it first"
+                )
+            old_profile = record.get("profile")
+            if isinstance(old_profile, str):
+                clean_profile_path(Path(old_profile), full=True)
+            try:
+                path.unlink()
+            except OSError:
+                pass
+            continue
+        try:
+            os.write(fd, payload.encode("utf-8"))
+        finally:
+            os.close(fd)
+        return
+    raise SystemExit("could not acquire the host session lock")
+
+
+def release_session(port: int | None = None) -> None:
+    with _session_mutex():
+        record = read_session()
+        if port is not None and record.get("port") != int(port):
+            return
+        try:
+            session_path().unlink()
+        except OSError:
+            pass
+
+
+def update_session(**fields) -> None:
+    """Merge fields into the session lock (e.g. replace the command PID with the browser PID)."""
+    with _session_mutex():
+        record = read_session()
+        if not record:
+            return
+        record.update(fields)
+        try:
+            session_path().write_text(json.dumps(record), encoding="utf-8")
+        except OSError:
+            pass
 
 
 def port_open(port: int, timeout: float = 0.3) -> bool:
@@ -90,8 +350,7 @@ def resolve_port(requested: int) -> int:
     A port of 0 means "auto": reuse this project's last auto port while a
     listener is still there, otherwise pick a fresh free one and remember it in
     the state root's .gsdev-port so later commands (status/stop/close) find the
-    same editor. The file is per state root, so parallel runs in separate
-    projects/worktrees stay independent.
+    same host. The session lock still allows only one host per state root.
     """
     if requested and requested > 0:
         return requested
@@ -799,6 +1058,10 @@ def close_host(port: int, keep_server: bool = False) -> None:
         log("no host browser to close")
     if keep_server:
         return
+    release_session(port)
+    profile = state.get("hostProfile") or str(host_profile_dir(port))
+    if not any(_pid_alive(p) for p in pids):
+        clean_profile_path(Path(profile))
     # Only stop the host server if we started it (recorded token) and it is still
     # the same process -- never a foreign application that happens to hold the port.
     token = state.get("token")
@@ -915,7 +1178,7 @@ def _assert_host_identity(conn: CDP, port: int) -> None:
     if host_project != PROJECT_ROOT:
         raise SystemExit(
             f"host on port {port} belongs to project {host_project}, not {PROJECT_ROOT}; "
-            f"use another --port or `close --port {port}`."
+            f"close it with `close --port {port}` before starting another."
         )
     host_fp = identity.get("fp")
     if host_fp and host_fp != HARNESS_FINGERPRINT:
@@ -1015,9 +1278,17 @@ def ensure_host(port: int, headless: bool, software: bool) -> tuple[CDP, bool]:
                 wanted = "headless" if headless else "headed"
                 raise SystemExit(
                     f"host on port {port} is {actual}, but this command requests {wanted}; "
-                    f"run `close --port {port}` first, or choose another --port"
+                    f"run `close --port {port}` first, then start it again"
                 )
             _assert_host_identity(conn, port)
+            acquire_session(port, host_profile_dir(port), "gsdev", attach=True)
+            state = read_host_state()
+            process_name = state.get("hostBrowser") or Path(
+                find_browser() or "chrome.exe").name.lower()
+            owners = find_editor_pids(port, process_name, host_profile_dir(port))
+            host_pid = (owners[0] if owners else state.get("hostPid"))
+            if isinstance(host_pid, int):
+                update_session(pid=host_pid, hostPid=host_pid)
             dismiss_browser_dialogs(port)
             return conn, False
         except BaseException:
@@ -1026,8 +1297,9 @@ def ensure_host(port: int, headless: bool, software: bool) -> tuple[CDP, bool]:
     browser = find_browser()
     if browser is None:
         raise SystemExit("no Chrome/Edge found; set GSDEV_BROWSER to the executable")
-    ensure_host_server()
     profile = host_profile_dir(port)
+    acquire_session(port, profile, "gsdev")
+    ensure_host_server()
     profile.mkdir(parents=True, exist_ok=True)
     prepare_host_profile(profile)
     flags = browser_flags(browser, port, profile)
@@ -1051,6 +1323,7 @@ def ensure_host(port: int, headless: bool, software: bool) -> tuple[CDP, bool]:
         log(f"launching {Path(browser).name}{' headless' if headless else ''}"
             f"{'' if attempt == 1 else f' (attempt {attempt}/{LAUNCH_ATTEMPTS})'}")
         proc, marks = spawn_browser(flags)
+        update_session(pid=proc.pid, hostPid=proc.pid)
         devtools = marks["devtools"]
         if devtools.is_set():
             log(f"{Path(browser).name} devtools ready")
@@ -1194,6 +1467,9 @@ def ensure_host(port: int, headless: bool, software: bool) -> tuple[CDP, bool]:
                 )
     except (CDPError, TimeoutError, OSError):
         pass
+    owners = find_editor_pids(port, Path(browser).name.lower(), profile)
+    if owners:
+        update_session(pid=owners[0], hostPid=owners[0])
     return conn, True
 
 
