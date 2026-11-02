@@ -12,7 +12,8 @@ Command reference: [README.md](README.md). On macOS/Linux, `./tools/gsdev` and
 `./setup.sh` mirror the PowerShell launchers. Putting gobo-agent into an existing
 project (rather than using this repo as the template)? See the
 [integration guide](docs/integration.md) — `gsdev init` adopts a project into a single
-`gobo-agent/` folder.
+`gobo-agent/` folder. GoboScript writing, refactoring and debugging conventions are in
+the [code style guide](docs/codeStyleGuide.md).
 
 ## Default working loop
 
@@ -160,6 +161,39 @@ Compound assignment lowering (goboscript 3.2.1):
 Only `+=` is special-cased to `data_changevariableby`. In hot loops where the extra
 reporter blocks matter, prefer `x += -1`; otherwise `x -= 1` is the clearer form.
 Do not assume `-=` is optimized to `change by -1`.
+
+## Working with the developer
+
+- Treat requests such as "can we fix" or "could you change" as requests to do the
+  work. Carry the requested change through source, build and relevant checks.
+- Identify the desired behavior, visual reference and constraints before choosing
+  an implementation. A request to slow a movement may mean changing its speed,
+  not starting it earlier. A timing problem may need a longer hold, not new geometry.
+- Keep a compact record of approved poses, timing, controls and performance
+  baselines. Preserve those decisions while addressing the next issue.
+- Treat later messages as refinements to the active work unless the developer
+  clearly replaces or cancels it. Include accepted corrections in the result.
+- Ask a focused question when a missing detail changes the diagnosis or outcome.
+  Offer concrete choices when helpful and continue independent work while waiting.
+- Separate observations, hypotheses and verified causes in updates. A user's
+  screenshot or FPS reading is evidence to reproduce; it need not identify the
+  underlying cause.
+- **Independently verify technical claims.** Check the user's measurements,
+  assumptions, comparisons and proposed diagnosis, even when stated confidently.
+  Ask whether the comparison actually isolates the suspected cause. Push back early
+  when evidence is inconsistent or important conditions are missing.
+- Distinguish desired outcomes and aesthetic preferences from technical claims.
+  Preserve the requested outcome while testing whether the proposed explanation or
+  implementation achieves it.
+- Explain findings in terms of the developer's goal: what changed, how it looks,
+  what it costs and what was checked. Use implementation details to support that.
+- Label intermediate experiments clearly. Show a verified current build when
+  presenting a fix, and identify which build a screenshot or GIF came from.
+- If evidence changes the diagnosis, update it plainly. Own assumptions made by the
+  agent instead of attributing a misleading conclusion to the user's report.
+- Avoid repeated confirmation requests for work already authorized. Complete
+  reversible investigation and preparation before asking about a consequential
+  action that actually needs a decision.
 
 ## Ground rules
 
@@ -386,6 +420,46 @@ block agentic work: read the same values live with `get`/`inspect`/`record`. Mon
 only matter to a human viewing real Scratch, where they do render (also on the
 gsbridge `editor`/`github` targets).
 
+## Debugging workflow
+
+Use one owned warm headless session for related reproduction, edits and verification.
+Keep a visible browser only for tasks that need one.
+
+1. Reproduce at a known source frame, pose, camera, model and detail level. Record the
+   exact SB3 hash and browser/headless conditions.
+2. Inspect the relevant inputs, visibility, cached values, list sizes and prepared
+   command ranges. Check for stale state and duplicate planner execution.
+3. Use a focused session file with assertions and failure captures. Capture state at
+   the assertion; a later screenshot may show a different frame.
+4. For performance issues, profile the loaded scene to locate expensive procedures
+   and their children before changing algorithms. Compare frame opcodes, draws and
+   call counts; do not infer runtime cost from stored block counts.
+5. Change one cause at a time. Reuse live controls to isolate features, then
+   rebuild/reload after code edits and rerun the reproduction.
+6. Check the fix and relevant neighboring cases. Inspect VM/log errors, then compare
+   against the baseline rather than relying on a pleasing screenshot.
+
+When comparing performance:
+
+- Establish **where** each build runs: editor, standalone player or embed; browser
+  and version; headed or headless; hardware rendering; stage size and visible sprites.
+- Establish **what** runs: exact SB3/hash, selected model, source frame, active
+  controls, animation state and warmup. Include the reported problem window; a
+  smooth opening does not verify a slowdown reported later.
+- Verify the project is actually playing and its frame value advances. Discard runs
+  obscured by dialogs, inactive tabs, loading or other interruptions.
+- Reproduce the user's scenario first, then compare production and development under
+  the same conditions, including the player view actual end users use.
+- Record FPS with profiling off and matched-frame opcodes/draws with profiling on.
+  These answer different questions; equal draws alone do not establish equal cost.
+- Use controlled feature/planner substitutions and keep assets and unrelated code
+  fixed. Check for duplicate planners, repeated sorts, waits, list scans and
+  recalculated geometry.
+- Asset/costume count can affect memory; measure its contribution before assigning it
+  as a timing cause. Memory growth alone is not an FPS regression.
+- Report the tested build, scenario, environment and metric. Do not generalize one
+  matched comparison to every editor/player setup.
+
 ## Live-site checks
 
 ```powershell
@@ -454,6 +528,7 @@ from before editing it.
 ## References and completion
 
 - [README and setup](README.md)
+- [GoboScript code style, refactoring and debugging](docs/codeStyleGuide.md)
 - [Integrating gobo-agent into an existing project](docs/integration.md)
 - [GoboScript language documentation](https://aspiz.uk/goboscript/docs/language/syntax.html)
 - [Scratch block opcodes](https://en.scratch-wiki.info/wiki/List_of_Block_Opcodes)

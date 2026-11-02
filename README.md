@@ -41,7 +41,9 @@ or a coding agent.
 Host internals (the static host page) live in `tools/scratchhost/`; the pinned
 `@scratch/*` bundles are shared under the tools root's `bundles/` and mounted at
 `/vendor/` by the host server, so they are downloaded once per machine. Iteration
-guidance is in [AGENTS.md](AGENTS.md).
+guidance is in [AGENTS.md](AGENTS.md). GoboScript coding conventions,
+refactoring guidelines and debugging practice are in the
+[code style guide](docs/codeStyleGuide.md).
 
 ## Requirements
 
@@ -560,6 +562,7 @@ sound-dependent behaviour needs review.
 ## References
 
 - [Agent iteration guide](AGENTS.md)
+- [GoboScript code style, refactoring and debugging](docs/codeStyleGuide.md)
 - [Integrating gobo-agent into an existing project](docs/integration.md)
 - [GoboScript syntax and language documentation](https://aspiz.uk/goboscript/docs/language/syntax.html)
 - [Scratch opcode reference](https://en.scratch-wiki.info/wiki/List_of_Block_Opcodes)
