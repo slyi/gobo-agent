@@ -1133,6 +1133,10 @@ def browser_flags(browser: str, port: int, profile) -> list[str]:
         # Disable Chromium's field-trial testing config where supported. This
         # does not disable all Finch experiments in branded Chrome/Edge.
         "--disable-field-trial-config",
+        # The host attaches scratch-audio's AudioEngine before the project loads;
+        # without this the AudioContext stays suspended until a user gesture, so
+        # sound blocks decode but never advance (the harness never clicks first).
+        "--autoplay-policy=no-user-gesture-required",
     ]
     mem_mb = os.environ.get("GSDEV_MAX_OLD_SPACE_MB", "").strip()
     if mem_mb:

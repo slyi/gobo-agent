@@ -257,12 +257,14 @@ tools\gsdev.ps1 errors
 tools\gsdev.ps1 profile --seconds 2 --headless --json debug/profile.json  # see Profiling
 ```
 
-**5. Screenshot and pixel**
+**5. Screenshot, pixel and audio**
 
 ```powershell
 tools\gsdev.ps1 screenshot --headless --out debug/frame.png
 tools\gsdev.ps1 screenshot --no-reload --out debug/live.png   # capture the warm host, keep it running
 tools\gsdev.ps1 pixel 0 0
+tools\gsdev.ps1 audio --seconds 1 --restart --out debug/beep.wav   # peak/rms + WAV of the window
+tools\gsdev.ps1 audio --seconds 2 --threshold 0.01                 # fail when peak < threshold
 ```
 
 **6. Check it on real Scratch**
@@ -323,6 +325,7 @@ Useful inspection commands:
 | Wait for behaviour | `wait_frame`, `wait_until`, `wait_pixel` (session forms `waitframe`, `waituntil`, `waitpixel`) |
 | Capture changes | `record`, `trace`, `until … --pause` |
 | Check rendering | `screenshot`, `pixel`, session pixel assertions |
+| Check sound | `audio` (peak/rms over a window, `--out FILE.wav` to record, `--restart` to fire one-shot sounds), `@audiostate`, `@audioplayback` |
 | Check errors | `errors`, `expect_no_errors` |
 | Lifecycle | `run` (build + green flag; returns when the VM goes idle), `restart` (re-run the green flag, warm host), `wait_stopped` (event-driven wait for the VM stop), `stop`, `close` |
 | Check Scratch fit before publishing | `preflight` (offline; `--sb3 FILE` to scan an artifact, `--json`, `--strict`) |
@@ -490,7 +493,7 @@ Maintainer-only cleanup scenarios (gitignored, not shipped):
 Targets are `localhost`, `github`, `editor`, `production` (`--project-id N`), and `url`.
 `production` runs the page's existing project; other loading paths accept a
 project/`.sb3`. Confirm replacement with `targets` (entry: re-load, never delete
-sprites). The bridge shares gsdev's whole verb surface — 39 verbs with identical syntax
+sprites). The bridge shares gsdev's whole verb surface — 40 verbs with identical syntax
 and result shapes (only the build verbs stay gsdev-only) — and that parity is checked by
 `tools/verb_parity.py` via `gsdev selftest`, so the same commands and asserts work against a
 live site. Key input can depend on page focus; verify with `get`.
@@ -556,8 +559,9 @@ checks VS Code tasks. Functional coverage starts with the root project and `smok
 `examples/` and `tests/` are local-only, gitignored material and may be absent on
 another machine. Broad Windows/macOS CI smoke is not proof for every machine policy or
 locale — the strictest check is a clean, non-elevated standard-user install on Japanese
-Windows. The local host uses 30-Hz compatibility and has no attached audio engine, so
-sound-dependent behaviour needs review.
+Windows. The local host attaches scratch-audio's engine before the project loads, so
+`music`'s extension and sound blocks decode and start (`@audiostate`, `@audioplayback`);
+headless has no audible output, so verify sound events rather than what you hear.
 
 ## References
 

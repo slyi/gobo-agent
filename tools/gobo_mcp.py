@@ -45,7 +45,7 @@ ALLOWED_VERBS = {
     "run", "screenshot", "preflight",
     "stop", "close", "restart", "wait_stopped",
     "get", "set", "set_batch", "watch", "session", "test",
-    "mouse", "click", "key", "pixel",
+    "mouse", "click", "key", "pixel", "audio",
     "frame", "wait_frame", "step", "pause", "resume",
     "render", "record", "trace", "stop_record", "until",
     "broadcast", "broadcast_wait",
@@ -65,7 +65,7 @@ BRIDGE_VERBS = {
     "step", "pause", "resume", "restart", "stop",
     "render", "record", "trace", "stop_record", "until", "watch", "logs",
     "broadcast", "broadcast_wait",
-    "mouse", "click", "key", "pixel",
+    "mouse", "click", "key", "pixel", "audio",
     "errors", "expect_no_errors", "gpu", "perf",
     "setprofiling", "profilereset", "profiling", "profile",
 }

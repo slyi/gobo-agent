@@ -74,6 +74,12 @@ PACKAGES = {
     "@scratch/scratch-render": "15.1.1",
     "@scratch/scratch-storage": "15.1.1",
     "@scratch/scratch-svg-renderer": "15.1.1",
+    # Sound: scratch-vm only plays audio once an AudioEngine is attached (the GUI
+    # does this), so the host needs scratch-audio and its three runtime deps.
+    "scratch-audio": "2.0.268",
+    "minilog": "3.1.0",
+    "startaudiocontext": "1.2.1",
+    "audio-context": "1.0.3",
 }
 # The host page loads these; used both as the "is it installed" probe and to keep
 # the node_modules layout and the vendored layout in sync (host.html prefers
@@ -83,6 +89,10 @@ ENTRY_FILES = {
     "@scratch/scratch-render": "dist/web/scratch-render.min.js",
     "@scratch/scratch-storage": "dist/web/scratch-storage.min.js",
     "@scratch/scratch-svg-renderer": "dist/web/scratch-svg-renderer.js",
+    "scratch-audio": "dist.js",
+    "minilog": "dist/minilog.js",
+    "startaudiocontext": "StartAudioContext.js",
+    "audio-context": "index.js",
 }
 
 USER_AGENT = f"gobo-agent-setup/{GOBOSCRIPT_VERSION}"
@@ -103,7 +113,7 @@ SB2GS_ZIP_SHA256 = "53a6e562244fbeae6cae4bf2f1c17b8c3ff9366e4c6a97769525db308453
 # it, so an older checkout (an adopted project's runtime copy, say) cannot
 # silently downgrade a newer machine-wide install: install_sb2gs refuses unless
 # --force is given. The patcher hash still detects same-version drift.
-SB2GS_PATCH_VERSION = 6
+SB2GS_PATCH_VERSION = 9
 
 # name -> (filename, url, sha256); all universal (py3-none-any) wheels.
 SB2GS_WHEELS = {
@@ -239,6 +249,40 @@ def node_modules_dir() -> Path:
 
 def _entry_ok(base: Path) -> bool:
     return all((base / pkg / rel).exists() for pkg, rel in ENTRY_FILES.items())
+
+
+# Packages the host page evaluates for sound; scratch-audio's dist.js requires
+# exactly these three (scratch-vm needs none — the host hands it the engine).
+HOST_AUDIO_PACKAGES = ("scratch-audio", "minilog", "startaudiocontext", "audio-context")
+HOST_GRAPHICS_PACKAGES = ("@scratch/scratch-vm", "@scratch/scratch-render",
+                          "@scratch/scratch-storage", "@scratch/scratch-svg-renderer")
+
+
+def _audio_ok(base: Path) -> bool:
+    return all((base / pkg / ENTRY_FILES[pkg]).exists() for pkg in HOST_AUDIO_PACKAGES)
+
+
+def _graphics_ok(base: Path) -> bool:
+    return all((base / pkg / ENTRY_FILES[pkg]).exists() for pkg in HOST_GRAPHICS_PACKAGES)
+
+
+def host_audio_present() -> bool:
+    """True when the sound packages are installed in the vendored or npm layout."""
+    return _audio_ok(bundles_dir()) or _audio_ok(node_modules_dir())
+
+
+def host_graphics_present() -> bool:
+    """True when the renderer/VM bundles are installed (sound is reported apart)."""
+    return _graphics_ok(bundles_dir()) or _graphics_ok(node_modules_dir())
+
+
+def host_graphics_dir() -> Path | None:
+    """The layout the renderer/VM bundles load from, vendored first."""
+    if _graphics_ok(bundles_dir()):
+        return bundles_dir()
+    if _graphics_ok(node_modules_dir()):
+        return node_modules_dir()
+    return None
 
 
 def vendor_present() -> bool:
@@ -490,6 +534,7 @@ def _extract_dist_web(data: bytes, package: str) -> int:
     prefix = "package/"
     base = destination
     root = base.resolve()
+    entry = ENTRY_FILES.get(package, "")
     written = 0
     with tarfile.open(fileobj=io.BytesIO(data), mode="r:gz") as archive:
         for member in archive.getmembers():
@@ -499,7 +544,10 @@ def _extract_dist_web(data: bytes, package: str) -> int:
             if not name.startswith(prefix):
                 continue
             relative = name[len(prefix):]
-            if not relative.startswith("dist/web/"):
+            # The @scratch bundles ship a web build under dist/web/; the audio
+            # packages (scratch-audio, minilog, ...) have their entry at the
+            # package root, so keep their declared entry file as well.
+            if not relative.startswith("dist/web/") and relative != entry:
                 continue
             # Confine extraction to the package dir: a member such as
             # `package/dist/web/../../../evil.js` satisfies the prefixes above but
@@ -517,7 +565,7 @@ def _extract_dist_web(data: bytes, package: str) -> int:
                 out.write_bytes(extracted.read())
                 written += 1
     if not written:
-        raise SetupError(f"{package} tarball has no dist/web files")
+        raise SetupError(f"{package} tarball has no dist/web or entry files")
     return written
 
 
@@ -556,7 +604,7 @@ def install_vendor(force: bool = False, offline: bool = False) -> None:
             )
         _check_integrity(data, integrity, f"{package} {version}")
         count = _extract_dist_web(data, package)
-        _log(f"{package} {version}: {count} dist/web files")
+        _log(f"{package} {version}: {count} dist/web or entry files")
 
     _ensure_dir(bundles_dir())
     _versions_path().write_text(
@@ -1129,6 +1177,13 @@ SB2GS_CLASH_PATCHES = (
                 new_name += " x"
             used.add(new_name)
             entry[0] = new_name
+            # Declarations are emitted from the renamed table entry, but every
+            # reference resolves through this id -> name map, which remember_names
+            # builds before the rename. The rename has to land there too, or a
+            # reference keeps the old spelling: a sprite reading a stage list that
+            # was renamed to avoid a variable clash used the variable's identifier,
+            # and the build failed with "unrecognized list".
+            syntax.NAMES_BY_ID[eid] = new_name
             for block in target.blocks._.values():
                 fields = getattr(block, "fields", None)
                 if fields is not None:
@@ -1144,6 +1199,69 @@ SB2GS_CLASH_PATCHES = (
 
 def decompile(input: Path, output: Path) -> None:
     shutil.rmtree(output, ignore_errors=True)""",
+    ),
+)
+
+
+# A sprite is written as `<name>.gs`, and a name the platform cannot represent does
+# not fail loudly on Windows: `blank :).gs` becomes a write into the alternate data
+# stream of `blank `, leaving an empty file with the source hidden, so the sprite is
+# silently lost. Warn about a name that cannot be a file, and skip that sprite, so
+# the missing file (and the build error that follows) is visible instead.
+# Applied to the installed sb2gs (decompile.py).
+SB2GS_SPRITE_NAME_PATCHES = (
+    (
+        "def get_asset_filename(name: str, md5ext: str) -> str:",
+        """import logging
+
+_WINDOWS_RESERVED_NAMES = {"CON", "PRN", "AUX", "NUL"} | {
+    f"{prefix}{index}" for prefix in ("COM", "LPT") for index in range(1, 10)}
+_WINDOWS_RESERVED_CHARS = set('<>:"/|?*') | {chr(92)}
+
+logger = logging.getLogger(__name__)
+
+
+def invalid_filename_reason(name: str) -> str | None:
+    \"\"\"Why `name` cannot name a `<sprite>.gs` file here, or None when it can.
+
+    Windows does not reject every unusable name: a `:` splits the path into a
+    file and an alternate data stream, and a trailing space is quietly dropped,
+    so the write "succeeds" into a file nobody will find. POSIX only rejects `/`.
+    \"\"\"
+    if not name or not name.strip():
+        return "the sprite name is blank"
+    if sys.platform == "win32":
+        for char in name:
+            if char in _WINDOWS_RESERVED_CHARS:
+                return f"{char!r} is reserved on Windows"
+            if ord(char) < 32:
+                return "it contains a control character"
+        if name.split(".")[0].upper() in _WINDOWS_RESERVED_NAMES:
+            return "it is a reserved device name"
+        if name != name.rstrip(" ."):
+            return "a trailing space or dot is stripped on Windows"
+        return None
+    if "/" in name:
+        return "'/' would create a subdirectory"
+    return None
+
+
+def get_asset_filename(name: str, md5ext: str) -> str:""",
+    ),
+    (
+        """    fixed = set()
+    for target in sprites:
+        ctx = Ctx(target, assets)""",
+        """    fixed = set()
+    for target in sprites:
+        reason = invalid_filename_reason(target.name)
+        if reason is not None:
+            logger.warning(
+                "sprite %r cannot be written as %r here (%s); it was skipped. "
+                "Rename the sprite in Scratch and import the project again.",
+                target.name, f"{target.name}.gs", reason)
+            continue
+        ctx = Ctx(target, assets)""",
     ),
 )
 
@@ -1945,7 +2063,11 @@ SB2GS_NONFINITE_PATCHES = (
 
 # goboscript's switch_costume/switch_backdrop accept a costume/backdrop *name* only
 # (there is no index or relative form). When a project switches by a constant number
-# (e.g. `("last" + "")` -> 0 -> last costume), fold it to the name. Applied to the
+# (e.g. `("last" + "")` -> 0 -> last costume), fold it to the name. The selection
+# arrives either inline or, as most saves store it, through a shadow menu block
+# (`looks_costume`/`looks_backdrops`) that the switch's input points at; older saves
+# write the menu text as a *number* ("11"), which scratch-vm resolves as a name first
+# and as a 1-based index second, so both forms are resolved here. Applied to the
 # installed sb2gs (decompile_stmt.py).
 SB2GS_SWITCH_FOLD_PATCHES = (
     (
@@ -2054,6 +2176,132 @@ def decompile_block(ctx: Ctx, block: Block) -> None:
         # and emitting the number fails goboscript's "costume 'N' does not exist"
         # check (projects use 255 to mean "no costume").
         return True
+    ctx.iprintln(keyword, " ", syntax.string(name), ";")
+    return True""",
+    ),
+    (
+        """def _indexed_name(costumes, index):
+    if not costumes:
+        return None
+    total = len(costumes)
+    position = math.floor(index)
+    if position < 1:
+        position += total
+    if 1 <= position <= total:
+        return costumes[position - 1].name
+    return None""",
+        """_MENU_FIELDS = {"looks_costume": "COSTUME", "looks_backdrops": "BACKDROP"}
+
+
+def _finite_number(value):
+    \"\"\"A finite float for a number-ish value, else None (names fall through).\"\"\"
+    try:
+        number = float(str(value).strip())
+    except (TypeError, ValueError):
+        return None
+    return number if math.isfinite(number) else None
+
+
+def _menu_value(ctx: Ctx, block: Block):
+    \"\"\"`(kind, value)` for a constant costume/backdrop menu block, else None.
+
+    A switch's input usually points at a shadow menu block (`looks_costume` /
+    `looks_backdrops`) rather than at an inline literal, and older saves store that
+    menu's text as a *number* ("11") instead of a costume name. The text is kept
+    verbatim: scratch-vm resolves a selection as a name first and as a 1-based
+    index second, and only the costume list can tell the two apart.
+    \"\"\"
+    field = _MENU_FIELDS.get(block.opcode)
+    if field is None:
+        return None
+    value = block.fields._.get(field)
+    if isinstance(value, list) and value:
+        value = value[0]
+    if isinstance(value, bool) or not isinstance(value, (str, int, float)):
+        return None
+    return ("text", str(value))
+
+
+def _fold_selector(ctx: Ctx, block: Block, name: str):
+    \"\"\"A constant switch selector as `(kind, value)`, or None when it is dynamic.
+
+    `kind` is "text" for a costume/backdrop title (a name, or a number typed into
+    the dropdown) and "number" for a genuinely numeric 1-based index: a number
+    primitive or a folded constant expression.
+    \"\"\"
+    raw = block.inputs._.get(name)
+    if not isinstance(raw, list) or len(raw) < 2:
+        return None
+    value = raw[1]
+    if isinstance(value, str) and value in ctx.blocks:
+        menu = _menu_value(ctx, ctx.blocks[value])
+        if menu is not None:
+            return menu
+        index = _fold_block_number(ctx, ctx.blocks[value])
+        return ("number", index) if index is not None else None
+    if isinstance(value, list) and value and value[0] in (4, 5, 6, 7, 8):
+        return ("number", syntax.scratch_number(value[1]))
+    if isinstance(value, list) and value and value[0] == 10:
+        return ("text", str(value[1]))
+    return None
+
+
+def _named_costume(costumes, text):
+    for costume in costumes:
+        if costume.name == text:
+            return costume.name
+    return None
+
+
+def _indexed_name(costumes, number):
+    \"\"\"The costume scratch-vm selects for a 1-based number, or None.
+
+    Mirrors `setCostumeByIndex`: subtract one, round, and a negative result means
+    the last costume, while an out-of-range one leaves the costume unchanged.
+    \"\"\"
+    total = len(costumes)
+    position = math.floor(number - 0.5)
+    if position < 0:
+        position = total - 1
+    if 0 <= position < total:
+        return costumes[position].name
+    return None""",
+    ),
+    (
+        """    index = _fold_input_number(ctx, block, input_name)
+    if index is None:
+        return False
+    name = _indexed_name(getattr(ctx, "costumes", None), index)
+    if name is None:
+        # A constant index no costume matches: scratch-vm leaves the costume alone,
+        # and emitting the number fails goboscript's "costume 'N' does not exist"
+        # check (projects use 255 to mean "no costume").
+        return True
+    ctx.iprintln(keyword, " ", syntax.string(name), ";")
+    return True""",
+        """    selector = _fold_selector(ctx, block, input_name)
+    costumes = getattr(ctx, "costumes", None)
+    if selector is None or not costumes:
+        return False
+    kind, value = selector
+    if kind == "text":
+        name = _named_costume(costumes, value)
+        if name is None:
+            index = _finite_number(value)
+            if index is None:
+                # Not a costume title or a number: let the block's own dispatch
+                # handle the relative forms (`next backdrop`, ...).
+                return False
+            name = _indexed_name(costumes, index)
+        if name is None:
+            # A constant index no costume matches: scratch-vm leaves the costume
+            # alone, and emitting the number fails goboscript's "costume 'N' does
+            # not exist" check (projects use 255 to mean "no costume").
+            return True
+    else:
+        name = _indexed_name(costumes, value)
+        if name is None:
+            return True
     ctx.iprintln(keyword, " ", syntax.string(name), ";")
     return True""",
     ),
@@ -2239,6 +2487,7 @@ def install_sb2gs(force: bool = False, offline: bool = False) -> None:
     for filename, patches in (("decompile_input.py", SB2GS_NUMBER_PATCHES),
                               ("decompile_stmt.py", SB2GS_SWITCH_FOLD_PATCHES),
                               ("decompile_stmt.py", SB2GS_COMMENT_PATCHES),
+                              ("decompile.py", SB2GS_SPRITE_NAME_PATCHES),
                               ("decompile_expr.py", SB2GS_TW_DETECTION_PATCHES),
                               ("decompile_expr.py", SB2GS_ARG_REPORTER_PATCHES["decompile_expr.py"]),
                               ("decompile_events.py", SB2GS_ARG_REPORTER_PATCHES["decompile_events.py"]),

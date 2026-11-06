@@ -46,6 +46,14 @@
       "/scratch-storage/dist/web/scratch-storage.min.js",
       "/scratch-svg-renderer/dist/web/scratch-svg-renderer.js",
     ];
+    // Audio bundles: scratch-audio and its runtime deps are CommonJS, evaluated by
+    // ./audio.js with a require shim, so they are probed here rather than loaded as
+    // scripts. They live beside the @scratch bundles, not inside that folder.
+    const audioFiles = [
+      "/scratch-audio/dist.js",
+      "/minilog/dist/minilog.js",
+      "/startaudiocontext/StartAudioContext.js",
+    ];
 
     const load = (src) => new Promise((resolve, reject) => {
       const script = document.createElement('script');
@@ -57,6 +65,13 @@
 
     const loadAll = async (base) => {
       for (const file of files) await load(base + file);
+    };
+
+    const probeAudio = async (base) => {
+      for (const file of audioFiles) {
+        const response = await fetch(base + file, { method: 'HEAD', cache: 'no-store' });
+        if (!response.ok) throw new Error(`${base}${file}: HTTP ${response.status}`);
+      }
     };
 
     (async () => {
@@ -80,6 +95,21 @@
         hud(window.__hostBundlesError, true);
         throw new Error(window.__hostBundlesError);
       }
+      // Audio assets are optional: an install that predates them still runs the
+      // host (visuals only) instead of failing to start.
+      let audioBase = null;
+      for (const base of ['./vendor', './node_modules']) {
+        try {
+          await probeAudio(base);
+          audioBase = base;
+          break;
+        } catch (error) {
+          errors.push(`${base} (audio): ${error.message}`);
+        }
+      }
+      window.__hostAssetBase = audioBase;
+      await load('./audio.js');
+      if (window.__gsdevAudio) await window.__gsdevAudio.prepare(audioBase || './vendor');
       await load('./profiler.js');
       await load('./host.js');
     })();

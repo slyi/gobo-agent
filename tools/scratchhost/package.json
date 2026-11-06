@@ -7,6 +7,10 @@
     "@scratch/scratch-render": "15.1.1",
     "@scratch/scratch-storage": "15.1.1",
     "@scratch/scratch-svg-renderer": "15.1.1",
-    "@scratch/scratch-vm": "15.1.1"
+    "@scratch/scratch-vm": "15.1.1",
+    "audio-context": "1.0.3",
+    "minilog": "3.1.0",
+    "scratch-audio": "2.0.268",
+    "startaudiocontext": "1.2.1"
   }
 }

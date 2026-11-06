@@ -24,6 +24,7 @@ Commands:
     build       Compile the project to <project>.sb3
     run         Build, load into the host, and start the project
     screenshot  Build, load briefly, and capture the stage to a PNG
+    audio       Measure (peak/rms) and optionally record the host's audio as WAV
     stop        Stop the running project, leaving the host open
     close       Close the host browser and static server
     status      Print the sprites and run state
@@ -1583,6 +1584,52 @@ def cmd_pixel(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_audio(args: argparse.Namespace) -> int:
+    """Measure the host's audio output and optionally record it as WAV.
+
+    Taps the attached AudioEngine's master gain over a wall-clock window, so this
+    is the sound counterpart of `screenshot --no-reload`: it observes the running
+    project without rebuilding. `--restart` re-runs the green flag first, which is
+    how a one-shot sound (a beep on flag) lands inside the capture window.
+    """
+    cdp = open_live_cdp(args.port)
+    if cdp is None:
+        return 1
+    try:
+        if args.restart:
+            cdp.evaluate("window.__host.restart()")
+        seconds = max(0.05, float(args.seconds))
+        options = json.dumps({"seconds": seconds, "record": bool(args.out)})
+        raw = cdp.evaluate(f"window.__host.audioCapture({options})",
+                           await_promise=True, timeout=int(seconds * 1000) + 30000)
+        # Runtime.evaluate returns the resolved value by value: an object arrives as a
+        # dict, a JSON string as str (other verbs JSON.stringify in the page).
+        result = raw if isinstance(raw, dict) else json.loads(raw)
+        if result.get("error"):
+            log(f"audio failed: {result['error']}")
+            return 1
+        wav = result.pop("wav", None)
+        if args.out:
+            data = base64.b64decode(wav or "")
+            out = Path(args.out).expanduser()
+            out.parent.mkdir(parents=True, exist_ok=True)
+            out.write_bytes(data)
+            result["out"] = str(out)
+            result["bytes"] = len(data)
+        for key in ("peak", "rms"):
+            if isinstance(result.get(key), (int, float)):
+                result[key] = round(float(result[key]), 6)
+        log(json.dumps(result))
+        if args.threshold is not None:
+            peak = float(result.get("peak") or 0.0)
+            if peak < float(args.threshold):
+                log(f"audio peak {peak:.6f} is below threshold {float(args.threshold):.6f}")
+                return 1
+    finally:
+        cdp.close()
+    return 0
+
+
 # --- Deterministic time -------------------------------------------------------
 #
 # The host wraps runtime._step to count frames, so tests can wait for frames or
@@ -2255,15 +2302,24 @@ def cmd_doctor(args: argparse.Namespace) -> int:
     else:
         fail("goboscript", f"not found; {_setup_hint()} (or install from github.com/aspizu/goboscript)")
 
-    if host_bundles_present():
-        where = BUNDLES_DIR if bootstrap.vendor_present() else (HOST_DIR / "node_modules")
-        ok("host bundles", str(where))
+    graphics_dir = bootstrap.host_graphics_dir()
+    if graphics_dir is not None:
+        ok("host bundles", str(graphics_dir))
     else:
         fail("host bundles", f"not installed; {_setup_hint()}")
 
+    # Sound is optional: without scratch-audio the host still runs visuals, it just
+    # cannot decode or play anything (the music extension reports "No Audio Context
+    # Detected"). Report it separately so a partial install is not read as a broken
+    # renderer bundle.
+    if bootstrap.host_audio_present():
+        ok("audio engine", "scratch-audio + deps")
+    else:
+        warn("audio engine", f"not installed (sound is disabled); {_setup_hint()}")
+
     # node/npm are only the advanced way to fetch the host bundles; once the
     # bundles are present (vendored by setup, or via npm) they are optional.
-    if host_bundles_present():
+    if graphics_dir is not None:
         if shutil.which("node") or shutil.which("npm"):
             ok("node/npm", "present (optional)")
     else:
@@ -3467,6 +3523,18 @@ def build_parser() -> argparse.ArgumentParser:
     pixel.add_argument("x", type=float)
     pixel.add_argument("y", type=float)
     pixel.set_defaults(func=cmd_pixel)
+
+    audio = subparsers.add_parser(
+        "audio", help="measure peak/rms of the host audio and optionally record WAV")
+    add_port(audio)
+    audio.add_argument("--seconds", type=float, default=1.0,
+                       help="capture window in seconds (default 1, max 30)")
+    audio.add_argument("--out", help="write the captured window as a 16-bit stereo WAV")
+    audio.add_argument("--threshold", type=float,
+                       help="exit non-zero when peak amplitude is below this (0-1)")
+    audio.add_argument("--restart", action="store_true",
+                       help="re-run the green-flag scripts before capturing")
+    audio.set_defaults(func=cmd_audio)
 
     frame = subparsers.add_parser("frame", help="print the runtime frame counter")
     add_port(frame)

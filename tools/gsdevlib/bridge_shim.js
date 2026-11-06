@@ -35,7 +35,7 @@
                projectLoaded: 0,
                lastStepAt: 0, stepInterval: 0, lastRenderAt: 0, renderInterval: 0, stepAt: 0,
                rendertime: 0, rendertimeAvg: 0, steptime: 0, steptimeAvg: 0,
-                rendered: 0, marks: [], logSeq: 0, logErrors: 0 };
+                rendered: 0, marks: [], logSeq: 0, logErrors: 0, audioStarted: 0 };
 
   // --- goboscript log/warn/error capture (same proccode trick as host.js) ---
   try {
@@ -228,7 +228,9 @@
              rendertime: st.rendertime, rendertimeAvg: st.rendertimeAvg,
              steptime: st.steptime, steptimeAvg: st.steptimeAvg,
              frame: st.frame, rendered: st.rendered,
-             gpu, gpuVendor, software };
+             gpu, gpuVendor, software,
+             audioState: audioContext() ? audioContext().state : 'none',
+             audioStarted: st.audioStarted || 0 };
   };
 
   // Same property/variable descriptions as host.js (props/getProp/setProp + inspect).
@@ -267,8 +269,124 @@
     return out;
   };
 
+  // --- Audio (mirrors host.js's audio support) --------------------------------
+  // A scratch-gui page attaches its own AudioEngine, so the bridge does not create
+  // one; it counts buffer starts and can tap the engine's master gain for peak/rms
+  // and WAV capture, so `@audiostate`, `@audioplayback` and the `audio` verb mean
+  // the same thing here as on the local host.
+  const audioContext = () => (rt.audioEngine && rt.audioEngine.audioContext) || null;
+  let audioTapped = false;
+  const audioEnsureTap = () => {
+    const context = audioContext();
+    if (!context || audioTapped) return context;
+    audioTapped = true;
+    const create = context.createBufferSource.bind(context);
+    context.createBufferSource = () => {
+      const node = create();
+      const start = node.start.bind(node);
+      node.start = (...args) => { st.audioStarted += 1; return start(...args); };
+      return node;
+    };
+    return context;
+  };
+  const audioStatus = () => {
+    const context = audioEnsureTap();
+    return {
+      available: !!context,
+      context: context ? context.state : 'none',
+      sampleRate: context ? context.sampleRate : 0,
+      started: st.audioStarted || 0,
+    };
+  };
+  const wavFromChannels = (left, right, sampleRate) => {
+    const frames = left.length;
+    const bytes = 44 + frames * 4;
+    const buffer = new ArrayBuffer(bytes);
+    const view = new DataView(buffer);
+    const text = (offset, value) => {
+      for (let i = 0; i < value.length; i++) view.setUint8(offset + i, value.charCodeAt(i));
+    };
+    text(0, 'RIFF'); view.setUint32(4, bytes - 8, true); text(8, 'WAVE');
+    text(12, 'fmt '); view.setUint32(16, 16, true); view.setUint16(20, 1, true);
+    view.setUint16(22, 2, true); view.setUint32(24, sampleRate, true);
+    view.setUint32(28, sampleRate * 4, true); view.setUint16(32, 4, true);
+    view.setUint16(34, 16, true); text(36, 'data'); view.setUint32(40, frames * 4, true);
+    let offset = 44;
+    for (let i = 0; i < frames; i++) {
+      for (const channel of [left, right]) {
+        const sample = Math.max(-1, Math.min(1, channel[i] || 0));
+        view.setInt16(offset, sample < 0 ? sample * 0x8000 : sample * 0x7fff, true);
+        offset += 2;
+      }
+    }
+    return buffer;
+  };
+  const base64Bytes = buffer => {
+    const bytes = new Uint8Array(buffer);
+    let binary = '';
+    for (let i = 0; i < bytes.length; i += 0x8000) {
+      binary += String.fromCharCode.apply(null, bytes.subarray(i, i + 0x8000));
+    }
+    return btoa(binary);
+  };
+  const audioCapture = (options = {}) => new Promise(resolve => {
+    const engine = rt.audioEngine;
+    const context = audioEnsureTap();
+    const seconds = Math.max(0.05, Math.min(30, Number(options.seconds) || 1));
+    const record = !!options.record;
+    if (!context || !engine || !engine.inputNode) {
+      resolve({ error: 'audio engine unavailable (this page has no AudioEngine)', seconds });
+      return;
+    }
+    const sampleRate = context.sampleRate;
+    const tap = context.createScriptProcessor(4096, 2, 1);
+    const sink = context.createGain();
+    sink.gain.value = 0;
+    engine.inputNode.connect(tap);
+    tap.connect(sink);
+    sink.connect(context.destination);
+    const left = record ? [] : null;
+    const right = record ? [] : null;
+    const startedBefore = st.audioStarted || 0;
+    let peak = 0, squares = 0, count = 0, buffers = 0;
+    tap.onaudioprocess = event => {
+      const l = event.inputBuffer.getChannelData(0);
+      const r = event.inputBuffer.numberOfChannels > 1 ? event.inputBuffer.getChannelData(1) : l;
+      buffers += 1;
+      for (let i = 0; i < l.length; i++) {
+        const sample = (l[i] + r[i]) / 2;
+        peak = Math.max(peak, Math.abs(sample));
+        squares += sample * sample;
+        count += 1;
+      }
+      if (record) {
+        left.push(...l);
+        right.push(...r);
+      }
+    };
+    const finish = () => {
+      tap.onaudioprocess = null;
+      try { engine.inputNode.disconnect(tap); } catch (error) {}
+      try { tap.disconnect(); sink.disconnect(); } catch (error) {}
+      const result = {
+        seconds, sampleRate, context: context.state, buffers, peak,
+        rms: Math.sqrt(squares / Math.max(1, count)),
+        playback: (st.audioStarted || 0) - startedBefore
+      };
+      if (record) result.wav = base64Bytes(wavFromChannels(left, right, sampleRate));
+      resolve(result);
+    };
+    setTimeout(finish, seconds * 1000);
+    if (context.resume) context.resume().catch(() => {});
+  });
+
   window.__bridge = {
     __installed: true, vm, rt,
+    // Audio: status, capture (peak/rms + optional WAV) and the per-project counter
+    // reset, mirroring host.js so the shared `audio` verb needs no second version.
+    audio: audioStatus,
+    audioCapture,
+    resetAudio: () => { st.audioStarted = 0; },
     frame: () => st.frame, rendered: () => st.rendered, stopped: () => st.stopped,
     stopSeq: () => st.stopSeq,
     // Frame and pixel waits mirror host.js: promise-based, driven by the per-step
@@ -382,6 +500,8 @@
       case 'gpu': case 'gpurenderer': return p.gpu;
       case 'gpuvendor': return p.gpuVendor;
       case 'software': return p.software;
+      case 'audiostate': case 'audio': return p.audioState;
+      case 'audioplayback': return p.audioStarted;
       default: return undefined;
       }
     },

@@ -65,6 +65,7 @@ mode, or `close` it first rather than starting a second browser.
 | Find expensive procedures, keep execution | `profile --no-reload --no-restart --seconds 2 --no-follow --leave-running`, then `setprofiling off` |
 | Capture a freshly loaded image | `screenshot --no-build` (skips compile but reloads/stops the project) |
 | Capture what is on screen now | `screenshot --no-reload` — no build, no load, project keeps running |
+| Measure or record sound | `audio --seconds N [--out FILE.wav] [--restart]` — peak/rms of the warm host, `--threshold` to fail |
 | Check Scratch size/memory fit | `preflight` — offline scan (no browser); `--sb3 FILE`, `--json`, `--strict` |
 | End project execution | `stop` — host stays available |
 | Re-run the green flag after it went idle | `restart` — warm host, no reload |
@@ -269,7 +270,9 @@ Interpret carefully:
 Plain runs already expose basic `@fps`, `@renderfps`, `@stepfps`, `@rendertime`,
 `@steptime`, `@frame`, `@rendered`, `@gpu` (and `@software`) — profiling is unnecessary
 just to obtain them. `@fps`/`@renderfps` are renderer-call rates, not physical display
-FPS; `@stepfps` is the VM step rate.
+FPS; `@stepfps` is the VM step rate. `@audiostate` is the host AudioContext state
+(`running`/`suspended`/`none`) and `@audioplayback` counts buffer sources started since
+the project loaded — the way to prove a sound block actually ran.
 
 ## Reviewing the profile JSON
 
@@ -474,7 +477,7 @@ Targets are `localhost`, `github`, `editor`, `production` (`--project-id N`), an
 `--project DIR`/`--sb3 FILE` load a build; production loads what is already on the page.
 The bridge uses the same role profiles and session lock as gsdev (CDP 9400 default).
 It is **not** a subset: gsdev and
-gsbridge expose the **same 39 verbs** with identical syntax *and* result shapes, and that is
+gsbridge expose the **same 40 verbs** with identical syntax *and* result shapes, and that is
 enforced rather than assumed — `tools/verb_parity.py` (run by `gsdev selftest`) fails on any
 usage drift, and `tools/test_ready_events.py --with-shapes` diffs the live JSON key sets per
 verb. Everything is shared except:
@@ -504,8 +507,10 @@ window and whether profiling was on when reporting numbers.
 Scratch 3 commonly stores bitmaps at **2×** with `bitmap_resolution = 2`; do not
 "fix" a rendering discrepancy by downsampling assets — check the project. TurboWarp-only
 options (`high_quality_pen`, `frame_interpolation`, custom clone limits) must not be
-assumed on production Scratch. The local host uses 30-Hz compatibility and has no
-attached audio engine, so sound-dependent behaviour needs review. The root project and
+assumed on production Scratch. The local host attaches scratch-audio's engine before the
+project loads, so `music` and sound blocks decode and start; there is no audible output
+and no audio-clock guarantee in headless, so verify sound *events* (`@audioplayback`,
+`@audiostate`) rather than what you hear. The root project and
 `smoke.txt` are the portable baseline; `examples/` and `tests/` are local gitignored
 fixtures that may be absent on another machine.
 

@@ -95,18 +95,19 @@ partially-finished adoption is visible.
 Created (project-owned; never overwritten without `--force-owned`):
 `gobo-agent.json`, `gobo-tests.json`, `smoke.txt`, `gsdev_mode.gs`.
 
-Created (generated; refreshed with `--force`): the `runtime/` copy, `VERSION`,
-`.install.json`.
+Created (generated; refreshed by re-running `init` — `--force` overwrites a copy
+you edited): the `runtime/` copy, `VERSION`, `.install.json`.
 
 Merged (existing content preserved): `.gitignore` gains gobo-agent rules;
 `.vscode/tasks.json` gains `gobo-agent:` tasks. Namespaced tasks are replaced on
 re-run; unrelated tasks are left alone. (A merge rewrites the file as JSON, so
 JSONC comments in an existing tasks file are not preserved.)
 
-Re-running `init` is safe: unchanged files are reported and skipped, files you
-edited are reported as conflicts and left untouched. An existing `gobo-agent/`
-that is not a recognized install (missing/invalid `VERSION` + `.install.json`) is
-refused rather than merged into.
+Re-running `init` is safe and is the update path: files identical to the harness
+are skipped, untouched generated files are refreshed to the new harness content,
+and files you edited are reported as conflicts and left untouched. An existing
+`gobo-agent/` that is not a recognized install (missing/invalid `VERSION` +
+`.install.json`) is refused rather than merged into.
 
 Flags: `--project DIR`, `--harness DIR`, `--layout copy|submodule`,
 `--harness-url URL`, `--dry-run`, `--force` (generated files),
@@ -196,9 +197,10 @@ auto port.
 
 ## Importing a Scratch project (sb2gs)
 
-Setup provides **sb2gs** (the Scratch → GoboScript importer), preferring an
-`sb2gs` already on `PATH` (or `GSDEV_SB2GS`). Decompile a project id, then adopt
-the result:
+Setup provides **sb2gs** (the Scratch → GoboScript importer) as a pinned, patched
+copy under the tools root; an `sb2gs` on `PATH` (or `GSDEV_SB2GS`) is only
+reported by `doctor`, never executed. Decompile a project id, then adopt the
+result:
 
 ```powershell
 # The parent directory must already exist for sb2gs.
@@ -207,9 +209,9 @@ New-Item -ItemType Directory -Force .\scratch | Out-Null
 python <gobo>\tools\gsdev.py init --project .\scratch\my_project
 ```
 
-Conversion is best-effort: some projects do not decompile. Always `goboscript
-build` the result before trusting it. sb2gs needs Python 3.12+ (the Windows
-portable is 3.12).
+Conversion is best-effort: some projects do not decompile. Always `gsdev build`
+the result before trusting it. sb2gs needs Python 3.12+ (the Windows portable is
+3.12).
 
 A project that was itself built by gobo-agent carries its `//` notes as calls to a
 carrier proc whose definition was stripped; sb2gs decompiles them back to `// note`
@@ -237,14 +239,14 @@ the compiled name — find it with `inspect`/`props` or from the decompiled `.gs
 
 Conversion is best-effort and not guaranteed pixel-identical: always build, run, and compare (`gsdev run` + `screenshot`) rather than assuming equivalence. These are toolchain limits, not project bugs.
 
-- **Invalid sprite filenames** — sb2gs writes `<sprite>.gs` without sanitising; `/`, Windows-reserved characters, and trailing dots/spaces fail. Rename those sprites in Scratch first.
+- **Invalid sprite filenames** — a sprite is written as `<sprite>.gs`, so a name containing `/`, a Windows-reserved character (`:`, `"`, `?`, `*`, …), a reserved device name, or a trailing dot/space cannot be a file. Windows would otherwise write into an alternate data stream and lose the sprite silently; the patched sb2gs prints a warning naming the offending character and skips that sprite, and the build then reports the missing layer. Rename the sprite in Scratch and import again.
 - **Unsupported opcodes/inputs** — some blocks (for example backdrop-switch hats and color input fields) have no decompiler. sb2gs reports them and may leave blank expressions or invalid source.
-- **Off-center costume pivots** — sb2gs re-canvases SVG and bitmap costumes to move the pivot to the image center, changing costume bytes/md5 and sometimes scale. goboscript has no rotation-center syntax, so projects that rely on an off-center pivot or Scratch's rotated-bounds behaviour may build but render blank even with the original assets preserved.
+- **Off-center costume pivots** — goboscript has no rotation-center syntax, so a plain `goboscript build` has no way to reproduce a Scratch pivot. `gsdev build` keeps the `costumes.json` sb2gs writes next to the sources and re-injects each costume's `rotationCenterX/Y` and `bitmapResolution` into the built project (the lossy 480×360 re-canvas of upstream sb2gs is disabled), so off-center pivots survive. Scratch's rotated-bounds behaviour for bitmaps is still not modelled; verify such sprites by eye.
 - **Comments** — line-leading `//` notes survive only through `gsdev build`; plain `goboscript build` rejects them, and `#` comments are compile-time only.
 - **Compiler version** — the last upstream goboscript release rejects negative literals. `setup` installs a pinned prebuilt of upstream `main`; use `gsdev build` rather than another `goboscript` on `PATH`.
 - **Large or complex projects** — prefer a local `.sb3` (`gsdev sb2gs <file.sb3>`). The `--id` downloader is bounded and cleans partial output on failure.
 
-The harness always runs its pinned, patched sb2gs; a user `sb2gs` on `PATH` is only reported by `doctor`, never executed. Compatibility patches cover common failures such as the pen color menu, missing pivots, monitors, numeric coercion, and comments.
+The harness always runs its pinned, patched sb2gs; a user `sb2gs` on `PATH` is only reported by `doctor`, never executed. Compatibility patches cover common failures such as the pen color menu, missing pivots, monitors, numeric coercion, constant costume/backdrop switches (a numeric dropdown value is resolved to the costume name scratch-vm would pick, since goboscript has no index form), variable/list name clashes (the renamed entry keeps its references consistent, including from other sprites), and comments.
 
 ## Everyday loop, builds, profiling
 
@@ -368,10 +370,18 @@ Three things, often confused:
 
 ## Updating the runtime
 
-There is no in-place upgrade command yet. For the **copy** layout, re-run
-`init --force` from an updated checkout to refresh the generated runtime files
-(your config/manifest/smoke are preserved). For the **submodule** layout, bump
-the submodule and commit the new pointer.
+For the **copy** layout, re-run `init --project DIR` from the updated checkout:
+generated files whose copies still match the recorded manifest are refreshed,
+identical files are skipped, and anything you edited is reported as a conflict
+and kept (`--force` overwrites those, `--force-owned` the owned templates in
+`gobo-agent/`). Your config, manifest and smoke file are preserved. For the
+**submodule** layout, bump the submodule and commit the new pointer.
+
+That refresh also matters for sb2gs: its patch set is versioned, so a project
+whose runtime copy predates the checkout reports
+`[warn] sb2gs - ... (patch vN, newer than this checkout's vM)` from `doctor`.
+Refresh the copy; running `setup` from the stale copy would instead refuse to
+downgrade the shared machine-wide install (it only proceeds with `--force`).
 
 ## Verification checklist
 

@@ -32,6 +32,7 @@ REPO = TOOLS.parent
 
 # Verbs both tools must accept with the same usage string.
 SHARED = (
+    "audio",
     "click",
     "close",
     "broadcast",
@@ -84,6 +85,9 @@ INTENTIONAL = {
 }
 
 # Verbs gsdev has that the bridge does not yet (Phase 3 worklist).
+# Verbs one tool still lacks. `audio` used to be pending in the bridge; it is now
+# shared (the bridge taps the page's own AudioEngine, gsdev its attached one), so
+# this list is empty again.
 PENDING_IN_BRIDGE = ()
 
 # Verbs the bridge has that gsdev does not yet.

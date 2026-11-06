@@ -109,6 +109,7 @@ def load_project_script(encoded: str) -> str:
     return ("(async () => { const b = atob('" + encoded + "');"
             " const a = new Uint8Array(b.length); for (let i=0;i<b.length;i++) a[i]=b.charCodeAt(i);"
             " const t0 = performance.now(); await window.__bridge.vm.loadProject(a.buffer);"
+            " window.__bridge.resetAudio();"
             " window.__bridge.vm.start(); return Math.round((performance.now()-t0)*10)/10; })()")
 
 
@@ -1226,6 +1227,47 @@ def cmd_pixel(args) -> int:
     return 0
 
 
+def cmd_audio(args) -> int:
+    """Measure the page's audio and optionally record it, same contract as gsdev.
+
+    The bridge does not attach an AudioEngine (the page owns one); it taps whatever
+    engine the page has. A page without one (or a suspended context) reports that
+    explicitly instead of pretending silence means a quiet project.
+    """
+    cdp, _ = attach(args)
+    try:
+        if args.restart:
+            cdp.evaluate("window.__bridge.greenFlag()")
+        seconds = max(0.05, float(args.seconds))
+        options = json.dumps({"seconds": seconds, "record": bool(args.out)})
+        raw = cdp.evaluate(f"window.__bridge.audioCapture({options})",
+                           await_promise=True, timeout=int(seconds * 1000) + 30000)
+        result = raw if isinstance(raw, dict) else json.loads(raw)
+        if result.get("error"):
+            log(f"audio failed: {result['error']}")
+            return 1
+        wav = result.pop("wav", None)
+        if args.out:
+            data = base64.b64decode(wav or "")
+            out = Path(args.out).expanduser()
+            out.parent.mkdir(parents=True, exist_ok=True)
+            out.write_bytes(data)
+            result["out"] = str(out)
+            result["bytes"] = len(data)
+        for key in ("peak", "rms"):
+            if isinstance(result.get(key), (int, float)):
+                result[key] = round(float(result[key]), 6)
+        log(json.dumps(result))
+        if args.threshold is not None:
+            peak = float(result.get("peak") or 0.0)
+            if peak < float(args.threshold):
+                log(f"audio peak {peak:.6f} is below threshold {float(args.threshold):.6f}")
+                return 1
+    finally:
+        cdp.close()
+    return 0
+
+
 def cmd_screenshot(args) -> int:
     cdp, _ = attach(args)
     try:
@@ -1816,6 +1858,18 @@ def build_parser() -> argparse.ArgumentParser:
     pixel = sub.add_parser("pixel", help="read a stage pixel")
     pixel.add_argument("x", type=float); pixel.add_argument("y", type=float)
     add_port(pixel); pixel.set_defaults(func=cmd_pixel)
+
+    audio = sub.add_parser(
+        "audio", help="measure peak/rms of the host audio and optionally record WAV")
+    add_port(audio)
+    audio.add_argument("--seconds", type=float, default=1.0,
+                       help="capture window in seconds (default 1, max 30)")
+    audio.add_argument("--out", help="write the captured window as a 16-bit stereo WAV")
+    audio.add_argument("--threshold", type=float,
+                       help="exit non-zero when peak amplitude is below this (0-1)")
+    audio.add_argument("--restart", action="store_true",
+                       help="re-run the green-flag scripts before capturing")
+    audio.set_defaults(func=cmd_audio)
 
     shot = sub.add_parser("screenshot", help="save a PNG of the stage")
     shot.add_argument("--out", default="debug/gsbridge.png")

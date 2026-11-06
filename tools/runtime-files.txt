@@ -27,6 +27,7 @@ tools/gsdev
 tools/gsdev_mode.gs
 tools/scratchhost/host.html
 tools/scratchhost/host.js
+tools/scratchhost/audio.js
 tools/scratchhost/profiler.js
 tools/scratchhost/package.json
 tools/scratchhost/package-lock.json

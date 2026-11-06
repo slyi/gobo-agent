@@ -29,9 +29,25 @@
       marks.bitmapAdapterError = String(error);
     }
 
+    // Audio: scratch-vm plays nothing until an engine is attached (the Scratch GUI
+    // does this). Attach before any project load so the music extension can decode
+    // its samples and sound blocks play. Best-effort: without the audio bundles the
+    // host still runs visuals, exactly as before.
+    if (window.__gsdevAudio) {
+      marks.audioEngine = window.__gsdevAudio.state.ready
+        ? (window.__gsdevAudio.attach(vm) ? 'attached' : 'failed')
+        : 'unavailable';
+      if (window.__gsdevAudio.state.error) marks.audioError = window.__gsdevAudio.state.error;
+    } else {
+      marks.audioEngine = 'loader-missing';
+    }
+
     window.__host = {
       vm,
       renderer,
+      audio: () => (window.__gsdevAudio
+        ? window.__gsdevAudio.status()
+        : { ready: false, attached: false, context: 'none', error: 'audio loader missing' }),
       // Page-side seam for the shared mouse math: gsbridge's shim exposes the same
       // `stageRect()` (its canvas lookup differs: scratch-gui, not `#stage`), so
       // gsdev's mouse_js can be reused verbatim against either page.
@@ -41,6 +57,10 @@
       },
       identity: window.__gsdevIdentity || { project: '', fingerprint: '' },
       load: bytes => {
+        // `@audioplayback` counts buffer sources for the project being loaded; clear
+        // the previous project's count *before* loading, not after, so nothing that
+        // starts during the load/start window is dropped by a late reset.
+        if (window.__gsdevAudio && window.__gsdevAudio.reset) window.__gsdevAudio.reset();
         const promise = vm.loadProject(bytes);
         // A fresh project starts from a clean slate. Without clearing `stopped`
         // and `logs`, a warm host that saw a project stop would report
@@ -246,6 +266,9 @@
     });
 
     const perfFresh = t => t && performance.now() - t < 1500;
+    const audioStatus = () => (window.__gsdevAudio
+      ? window.__gsdevAudio.status()
+      : { attached: false, context: 'none', started: 0 });
     window.__host.perf = () => ({
       stepFps: perfFresh(gs.perf.lastStepAt) ? gs.perf.stepFps : 0,
       renderFps: perfFresh(gs.perf.lastRenderAt) ? gs.perf.renderFps : 0,
@@ -257,7 +280,9 @@
       rendered: gs.rendered,
       gpu: gpuInfo.renderer,
       gpuVendor: gpuInfo.vendor,
-      software: softwareGL()
+      software: softwareGL(),
+      audioState: audioStatus().context,
+      audioStarted: audioStatus().started
     });
     window.__host.perfValue = name => {
       const p = window.__host.perf();
@@ -273,9 +298,104 @@
       case 'gpu': case 'gpurenderer': return p.gpu;
       case 'gpuvendor': return p.gpuVendor;
       case 'software': return p.software ? 1 : 0;
+      case 'audiostate': case 'audio': return p.audioState;
+      case 'audioplayback': return p.audioStarted;
       default: return undefined;
       }
     };
+
+    // --- Audio capture (the sound counterpart of `screenshot`) -----------------
+    // Tap the engine's master gain (after per-sprite volume and effects) with a
+    // ScriptProcessor, measure peak/rms over a wall-clock window, and optionally
+    // record the same window as 16-bit stereo WAV. The tap is a parallel branch
+    // into a muted sink so the project's own output is unchanged.
+    const wavFromChannels = (left, right, sampleRate) => {
+      const frames = left.length;
+      const bytes = 44 + frames * 4;
+      const buffer = new ArrayBuffer(bytes);
+      const view = new DataView(buffer);
+      const text = (offset, value) => {
+        for (let i = 0; i < value.length; i++) view.setUint8(offset + i, value.charCodeAt(i));
+      };
+      text(0, 'RIFF'); view.setUint32(4, bytes - 8, true); text(8, 'WAVE');
+      text(12, 'fmt '); view.setUint32(16, 16, true); view.setUint16(20, 1, true);
+      view.setUint16(22, 2, true); view.setUint32(24, sampleRate, true);
+      view.setUint32(28, sampleRate * 4, true); view.setUint16(32, 4, true);
+      view.setUint16(34, 16, true); text(36, 'data'); view.setUint32(40, frames * 4, true);
+      let offset = 44;
+      for (let i = 0; i < frames; i++) {
+        for (const channel of [left, right]) {
+          const sample = Math.max(-1, Math.min(1, channel[i] || 0));
+          view.setInt16(offset, sample < 0 ? sample * 0x8000 : sample * 0x7fff, true);
+          offset += 2;
+        }
+      }
+      return buffer;
+    };
+    const base64Bytes = buffer => {
+      const bytes = new Uint8Array(buffer);
+      let binary = '';
+      for (let i = 0; i < bytes.length; i += 0x8000) {
+        binary += String.fromCharCode.apply(null, bytes.subarray(i, i + 0x8000));
+      }
+      return btoa(binary);
+    };
+    window.__host.audioCapture = (options = {}) => new Promise(resolve => {
+      const audio = window.__gsdevAudio;
+      const engine = audio && audio.state && audio.state.engine;
+      const seconds = Math.max(0.05, Math.min(30, Number(options.seconds) || 1));
+      const record = !!options.record;
+      if (!engine || !engine.audioContext) {
+        resolve({
+          error: (audio && audio.state && audio.state.error)
+            ? `audio engine unavailable: ${audio.state.error}` : 'audio engine unavailable',
+          seconds
+        });
+        return;
+      }
+      const context = engine.audioContext;
+      const sampleRate = context.sampleRate;
+      const tap = context.createScriptProcessor(4096, 2, 1);
+      const sink = context.createGain();
+      sink.gain.value = 0;
+      engine.inputNode.connect(tap);
+      tap.connect(sink);
+      sink.connect(context.destination);
+      const left = record ? [] : null;
+      const right = record ? [] : null;
+      const startedBefore = audio.status().started;
+      let peak = 0, squares = 0, count = 0, buffers = 0;
+      tap.onaudioprocess = event => {
+        const l = event.inputBuffer.getChannelData(0);
+        const r = event.inputBuffer.numberOfChannels > 1 ? event.inputBuffer.getChannelData(1) : l;
+        buffers += 1;
+        for (let i = 0; i < l.length; i++) {
+          const sample = (l[i] + r[i]) / 2;
+          peak = Math.max(peak, Math.abs(sample));
+          squares += sample * sample;
+          count += 1;
+        }
+        if (record) {
+          left.push(...l);
+          right.push(...r);
+        }
+      };
+      const finish = () => {
+        tap.onaudioprocess = null;
+        try { engine.inputNode.disconnect(tap); } catch (error) {}
+        try { tap.disconnect(); sink.disconnect(); } catch (error) {}
+        const result = {
+          seconds, sampleRate, context: context.state, buffers, peak,
+          rms: Math.sqrt(squares / Math.max(1, count)),
+          // Sounds started *in this window*, not since the project loaded.
+          playback: audio.status().started - startedBefore
+        };
+        if (record) result.wav = base64Bytes(wavFromChannels(left, right, sampleRate));
+        resolve(result);
+      };
+      setTimeout(finish, seconds * 1000);
+      if (context.resume) context.resume().catch(() => {});
+    });
 
     window.__host.frame = () => gs.frame;
     window.__host.rendered = () => gs.rendered;
